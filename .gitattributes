@@ -1,0 +1,8 @@
+# Zeilenenden normalisieren: im Repo immer LF.
+* text=auto
+
+# Shell-Skripte + Makefile MÜSSEN LF behalten — auch bei core.autocrlf=true.
+# Sonst bekommt der Shebang ein CRLF und der Kernel sucht `/bin/bash\r`
+# → "No such file or directory" beim Ausführen (obwohl die Datei da ist).
+*.sh   text eol=lf
+Makefile text eol=lf

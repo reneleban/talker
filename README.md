@@ -63,7 +63,14 @@ make install  # baut talker.app und installiert nach ~/Applications
 
 ## Quickstart
 
-1. **Voraussetzungen:** macOS 13+, Apple Silicon, Rust-Toolchain.
+1. **Voraussetzungen** (frischer Mac):
+   - macOS 13+, Apple Silicon.
+   - **Xcode Command Line Tools**: `xcode-select --install` (liefert `clang`, `git`).
+   - **Rust via rustup**: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` —
+     installiert `cargo`. `rust-toolchain.toml` zieht dann automatisch die gepinnte
+     Version (1.94.1) inkl. `rustfmt`/`clippy`.
+   - **cmake**: `brew install cmake` — baut das eingebettete llama.cpp (`llama-cpp-2`).
+   - **Netzwerk beim ersten Build**: `sherpa-rs` lädt vorgebaute onnxruntime-/sherpa-Dylibs.
 2. **Modelle laden** nach `~/Library/Application Support/talker/models/`
    (talker bundlet keine Modelle; sie stehen unter eigenen Lizenz-Terms —
    siehe [`docs/licensing.md`](docs/licensing.md)):

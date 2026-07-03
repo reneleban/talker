@@ -35,7 +35,9 @@ jobs:
 
   cargo-deny:
     name: cargo-deny
-    runs-on: macos-latest
+    # Reine Analyse (Cargo.lock + deny.toml, Target dort gepinnt) → Linux-Runner.
+    # cargo-deny-action ist eine Docker-Container-Action und läuft NUR auf Linux.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
