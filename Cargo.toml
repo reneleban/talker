@@ -16,7 +16,7 @@ encoding_rs = "0.8.35"
 llama-cpp-2 = "0.1.150"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSPasteboard", "NSPasteboardItem", "NSApplication", "NSButton", "NSControl", "NSView", "NSResponder", "NSRunningApplication", "NSScreen", "NSWindow", "NSColor", "NSGraphics", "NSWorkspace"] }
-objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-core-image = { version = "0.3.2", features = ["CIFilter"] }
