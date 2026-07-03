@@ -253,7 +253,7 @@ fn main() -> ExitCode {
                             // PTT gesperrt bis Parakeet ready (Ticket-0029):
                             // kurzer Hinweis mit Fortschritt statt Aufnahme.
                             if let Some(hint) =
-                                ui::setup_hint(&models_press.get(models::ModelId::Parakeet))
+                                models_press.get(models::ModelId::Parakeet).setup_hint()
                             {
                                 eprintln!("talker: PTT gesperrt — {hint}");
                                 if let Ok(mut ind) = ind_press.lock() {

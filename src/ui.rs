@@ -352,7 +352,7 @@ impl SettingsApp {
                 (ModelId::Gemma, "Cleanup-LLM (gemma4:e2b)"),
             ] {
                 let state = self.models_state.get(id);
-                let (text, action) = model_status_line(&state);
+                let (text, action) = state.status_line();
                 Self::row(ui, label, "", |ui| {
                     if let Some(button_label) = action
                         && ui.button(button_label).clicked()
@@ -366,7 +366,7 @@ impl SettingsApp {
                     }
                     ui.label(RichText::new(text).small());
                 });
-                if let Some(frac) = progress_fraction(&state) {
+                if let Some(frac) = state.progress_fraction() {
                     ui.add(egui::ProgressBar::new(frac).show_percentage());
                 }
                 Self::hairline(ui);
@@ -843,10 +843,10 @@ impl SettingsApp {
                     "Die Spracherkennung wird eingerichtet — danach ist talker \
                      sofort nutzbar (Modus Roh).",
                 );
-                let (text, _) = model_status_line(&state);
+                let (text, _) = state.status_line();
                 ui.label(RichText::new(text).small().weak());
                 ui.add(
-                    egui::ProgressBar::new(progress_fraction(&state).unwrap_or(0.0))
+                    egui::ProgressBar::new(state.progress_fraction().unwrap_or(0.0))
                         .show_percentage(),
                 );
                 ui.label(
@@ -1031,45 +1031,6 @@ pub(crate) fn setup_stage(consent: bool, parakeet: &ModelState) -> SetupStage {
     }
 }
 
-/// Statuszeile eines Modells im „Modelle"-Bereich: (Text, Aktions-Button?).
-/// Button-Beschriftung: „Neu laden" (fehlt) bzw. „Reparieren" (kaputt/Fehler).
-pub(crate) fn model_status_line(state: &ModelState) -> (String, Option<&'static str>) {
-    match state {
-        ModelState::Ready => ("installiert ✓".into(), None),
-        ModelState::Missing => ("fehlt".into(), Some("Neu laden")),
-        ModelState::ConsentPending => ("wartet auf Lizenz-Zustimmung".into(), None),
-        ModelState::Downloading { pct } => (format!("lädt … {pct} %"), None),
-        ModelState::Verifying => ("wird geprüft …".into(), None),
-        ModelState::Corrupt => ("beschädigt (Checksum)".into(), Some("Reparieren")),
-        ModelState::Error(e) => (format!("Fehler: {e}"), Some("Reparieren")),
-    }
-}
-
-/// Fortschritts-Anteil (0–1) fürs Balken-UI eines Modells; None = kein Balken.
-pub(crate) fn progress_fraction(state: &ModelState) -> Option<f32> {
-    match state {
-        ModelState::Downloading { pct } => Some(f32::from(*pct) / 100.0),
-        ModelState::Verifying => Some(1.0),
-        _ => None,
-    }
-}
-
-/// Hinweistext bei PTT-Druck, solange Parakeet nicht ready (AK 3).
-/// None = PTT frei.
-pub fn setup_hint(parakeet: &ModelState) -> Option<String> {
-    match parakeet {
-        ModelState::Ready => None,
-        ModelState::Downloading { pct } => Some(format!("talker richtet sich ein … {pct} %")),
-        ModelState::Verifying => Some("talker richtet sich ein … Modell wird geprüft".into()),
-        ModelState::ConsentPending | ModelState::Missing => {
-            Some("Einrichtung nötig — Einstellungen öffnen".into())
-        }
-        ModelState::Corrupt | ModelState::Error(_) => {
-            Some("Modell-Download fehlgeschlagen — Einstellungen öffnen".into())
-        }
-    }
-}
-
 /// Fügt eine Kontext-Regel hinzu oder aktualisiert den Modus einer
 /// bestehenden — bundle-ids bleiben einmalig, damit „erste Regel gewinnt"
 /// (resolve_mode) nie mehrdeutig wird. Reine Logik, egui-frei (testbar).
@@ -1168,80 +1129,6 @@ mod tests {
             panic!("Error muss Failed ergeben");
         };
         assert_eq!(msg, "Netz weg");
-    }
-
-    /// Status→Darstellung-Mapping (Ticket-0029, DoD) — egui-frei.
-    #[test]
-    fn model_status_line_maps_every_state() {
-        let cases: [(ModelState, &str, Option<&str>); 7] = [
-            (ModelState::Ready, "installiert ✓", None),
-            (ModelState::Missing, "fehlt", Some("Neu laden")),
-            (
-                ModelState::ConsentPending,
-                "wartet auf Lizenz-Zustimmung",
-                None,
-            ),
-            (ModelState::Downloading { pct: 7 }, "lädt … 7 %", None),
-            (ModelState::Verifying, "wird geprüft …", None),
-            (
-                ModelState::Corrupt,
-                "beschädigt (Checksum)",
-                Some("Reparieren"),
-            ),
-            (
-                ModelState::Error("Netz weg".into()),
-                "Fehler: Netz weg",
-                Some("Reparieren"),
-            ),
-        ];
-        for (state, expected_text, expected_action) in cases {
-            let (text, action) = model_status_line(&state);
-            assert_eq!(text, expected_text, "{state:?}");
-            assert_eq!(action, expected_action, "{state:?}");
-        }
-    }
-
-    #[test]
-    fn progress_fraction_only_for_running_downloads() {
-        assert_eq!(
-            progress_fraction(&ModelState::Downloading { pct: 50 }),
-            Some(0.5)
-        );
-        assert_eq!(
-            progress_fraction(&ModelState::Downloading { pct: 0 }),
-            Some(0.0)
-        );
-        assert_eq!(progress_fraction(&ModelState::Verifying), Some(1.0));
-        assert_eq!(progress_fraction(&ModelState::Ready), None);
-        assert_eq!(progress_fraction(&ModelState::Missing), None);
-    }
-
-    /// PTT-Hinweis (AK 3): „richtet sich ein … X %" während des Downloads,
-    /// None sobald Parakeet ready.
-    #[test]
-    fn setup_hint_reports_progress_and_clears_when_ready() {
-        assert_eq!(setup_hint(&ModelState::Ready), None);
-        assert_eq!(
-            setup_hint(&ModelState::Downloading { pct: 42 }).unwrap(),
-            "talker richtet sich ein … 42 %"
-        );
-        assert!(
-            setup_hint(&ModelState::Verifying)
-                .unwrap()
-                .contains("geprüft")
-        );
-        for state in [ModelState::ConsentPending, ModelState::Missing] {
-            assert!(
-                setup_hint(&state).unwrap().contains("Einstellungen"),
-                "{state:?}"
-            );
-        }
-        for state in [ModelState::Corrupt, ModelState::Error("x".into())] {
-            assert!(
-                setup_hint(&state).unwrap().contains("fehlgeschlagen"),
-                "{state:?}"
-            );
-        }
     }
 
     /// Regel-Add/Remove + Toggle persistieren durch die Config (AK-Test 0027).
