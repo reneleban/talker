@@ -207,6 +207,26 @@ fn spawn_stt_worker(
     tx
 }
 
+/// Startet talker als neuen Prozess und beendet diesen (Ticket-0030):
+/// der Event-Tap funktioniert nach einem Laufzeit-Accessibility-Grant erst
+/// im frischen Prozess. Scheitert das Spawnen, läuft die App weiter.
+fn relaunch() {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("talker: Relaunch nicht möglich (current_exe): {e}");
+            return;
+        }
+    };
+    match std::process::Command::new(&exe).spawn() {
+        Ok(_) => {
+            eprintln!("talker: Accessibility erteilt — Neustart für den Event-Tap.");
+            std::process::exit(0);
+        }
+        Err(e) => eprintln!("talker: Relaunch fehlgeschlagen: {e}"),
+    }
+}
+
 fn main() -> ExitCode {
     let config = Arc::new(RwLock::new(config::Config::load()));
 
@@ -225,7 +245,13 @@ fn main() -> ExitCode {
     // First-Run-Onboarding: fehlt eine Permission oder die Spracherkennung
     // (Setup/Consent), startet das Fenster sichtbar.
     let accessibility = permissions::ensure_accessibility();
-    let mic_denied = permissions::microphone_status() == permissions::MicPermission::Denied;
+    let mic_status = permissions::microphone_status();
+    // Mic-Prompt sofort beim Erst-Start (Ticket-0030) — nicht erst beim
+    // ersten PTT, der den Event-Tap (Accessibility + Relaunch) voraussetzt.
+    if mic_status == permissions::MicPermission::Undetermined {
+        permissions::request_microphone();
+    }
+    let mic_denied = mic_status == permissions::MicPermission::Denied;
     let show_onboarding = !accessibility || mic_denied || !models_state.stt_ready();
 
     let native_options = eframe::NativeOptions {
@@ -410,12 +436,23 @@ fn main() -> ExitCode {
                     use objc2_foundation::NSTimer;
                     // Soundness wie beim Overlay-Timer: geplant + gefeuert nur
                     // auf dem Main-RunLoop, der Block verlässt den Thread nie.
+                    let models_relaunch = Arc::clone(&models_state);
                     let block = block2::RcBlock::new(move |timer: std::ptr::NonNull<NSTimer>| {
                         if let Ok(tap) = install_tap() {
                             std::mem::forget(tap);
                             tray::with_instance(|t| t.set_idle());
                             eprintln!("talker: Event-Tap nachträglich installiert — bereit.");
                             unsafe { timer.as_ref().invalidate() };
+                        } else if permissions::should_relaunch_for_tap(
+                            accessibility,
+                            permissions::accessibility_granted(),
+                        ) && !models_relaunch.any_download_running()
+                        {
+                            // TCC cached die Accessibility-Entscheidung pro
+                            // Prozess — nach Laufzeit-Grant hilft nur ein
+                            // Neustart (Ticket-0030). Laufende Modell-Downloads
+                            // erst fertig laufen lassen (kein 5-GB-Abbruch).
+                            relaunch();
                         }
                     });
                     let timer = unsafe {

@@ -60,7 +60,7 @@ pub fn permission_rows(accessibility: bool, mic: MicPermission) -> [PermissionRo
             label: "Bedienungshilfen",
             hint: Some(
                 "Nötig für den globalen Hotkey und das Einfügen (Cmd+V). \
-                 Nach dem Erteilen aktiviert sich talker binnen Sekunden selbst.",
+                 Nach dem Erteilen startet talker sich einmal selbst neu.",
             ),
             pane: Some("Privacy_Accessibility"),
         }
@@ -86,6 +86,38 @@ pub fn permission_rows(accessibility: bool, mic: MicPermission) -> [PermissionRo
         },
     };
     [ax, mic]
+}
+
+/// Fragt die Mikrofon-Permission aktiv an (System-Dialog, Ticket-0030).
+/// Ohne diesen Call käme der Prompt erst beim ersten Aufnahme-Versuch —
+/// der setzt den Hotkey voraus, der wiederum Accessibility (+ Relaunch).
+/// Fire-and-forget: die UI pollt den Status pro Frame, die Completion
+/// (beliebige Dispatch-Queue) loggt nur.
+pub fn request_microphone() {
+    use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+    let Some(media_type) = (unsafe { AVMediaTypeAudio }) else {
+        return;
+    };
+    let handler = block2::RcBlock::new(|granted: objc2::runtime::Bool| {
+        eprintln!(
+            "talker: Mikrofon-Permission {}.",
+            if granted.as_bool() {
+                "erteilt"
+            } else {
+                "abgelehnt"
+            }
+        );
+    });
+    unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type, &handler) };
+}
+
+/// Braucht talker einen Self-Relaunch, damit der Event-Tap funktioniert?
+/// macOS/TCC cached die Accessibility-Entscheidung pro Prozess: wurde sie
+/// erst zur Laufzeit erteilt, scheitert `CGEventTap::new` bis zum Neustart.
+/// Loop-Guard: war sie schon beim Start erteilt und der Tap scheitert
+/// trotzdem, hilft ein Relaunch nicht — dann sichtbarer Fehler statt Schleife.
+pub fn should_relaunch_for_tap(had_accessibility_at_start: bool, granted_now: bool) -> bool {
+    !had_accessibility_at_start && granted_now
 }
 
 /// Status der Mikrofon-Permission (TCC).
@@ -135,5 +167,18 @@ mod tests {
         let [_, mic] = permission_rows(true, MicPermission::Denied);
         assert!(!mic.granted);
         assert_eq!(mic.pane, Some("Privacy_Microphone"));
+    }
+
+    /// Relaunch nur nach Laufzeit-Grant (AK 2), nie als Schleife (AK 3).
+    #[test]
+    fn relaunch_only_after_runtime_grant_never_loops() {
+        // Beim Start fehlend, jetzt erteilt → Relaunch (TCC-Cache umgehen).
+        assert!(should_relaunch_for_tap(false, true));
+        // Beim Start schon erteilt, Tap scheitert trotzdem → KEIN Relaunch
+        // (sonst Endlos-Schleife: der neue Prozess sähe dieselbe Lage).
+        assert!(!should_relaunch_for_tap(true, true));
+        // Noch nicht erteilt → weiter warten, kein Relaunch.
+        assert!(!should_relaunch_for_tap(false, false));
+        assert!(!should_relaunch_for_tap(true, false));
     }
 }

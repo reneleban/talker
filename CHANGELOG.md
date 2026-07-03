@@ -10,6 +10,12 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Fixed
 
+- Erst-Start-Permissions ohne manuellen Neustart: der Mikrofon-Dialog kommt
+  jetzt sofort beim ersten Start (nicht erst beim ersten Diktat), und nach dem
+  Erteilen der Bedienungshilfen-Berechtigung startet talker sich einmal selbst
+  neu, damit der globale Hotkey ohne Zutun funktioniert (macOS cached die
+  Entscheidung pro Prozess). Laufende Modell-Downloads werden dabei nicht
+  abgebrochen — der Neustart wartet, bis sie fertig sind.
 - Schlägt das Einfügen fehl (Clipboard-Schreiben oder Cmd+V), wird das
   Nutzer-Clipboard trotzdem wiederhergestellt — vorher ging der ursprüngliche
   Inhalt verloren.

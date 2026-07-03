@@ -360,6 +360,17 @@ impl ModelsState {
         self.get(ModelId::Parakeet) == ModelState::Ready
     }
 
+    /// Läuft gerade ein Download/Verify? (Ticket-0030: Self-Relaunch wartet,
+    /// statt einen laufenden Modell-Download abzubrechen.)
+    pub fn any_download_running(&self) -> bool {
+        [ModelId::Parakeet, ModelId::Gemma].into_iter().any(|id| {
+            matches!(
+                self.get(id),
+                ModelState::Downloading { .. } | ModelState::Verifying
+            )
+        })
+    }
+
     /// Live-Aktivierung: Nicht-Roh-Modi sind verfügbar, sobald gemma ready ist.
     pub fn llm_modes_available(&self) -> bool {
         self.get(ModelId::Gemma) == ModelState::Ready
@@ -1073,6 +1084,24 @@ mod tests {
         start_needed_downloads(&state, &dir.0, false);
         assert_eq!(state.get(ModelId::Parakeet), ModelState::Missing);
         assert_eq!(state.get(ModelId::Gemma), ModelState::Missing);
+    }
+
+    #[test]
+    fn any_download_running_covers_download_and_verify_phases() {
+        for (gemma, expected) in [
+            (ModelState::Downloading { pct: 1 }, true),
+            (ModelState::Verifying, true),
+            (ModelState::Missing, false),
+            (ModelState::Ready, false),
+            (ModelState::Corrupt, false),
+            (ModelState::Error("x".into()), false),
+        ] {
+            let state = ModelsState::new(ModelState::Ready, gemma.clone());
+            assert_eq!(state.any_download_running(), expected, "{gemma:?}");
+        }
+        // Beide Slots zählen — auch Parakeet allein.
+        let state = ModelsState::new(ModelState::Downloading { pct: 9 }, ModelState::Missing);
+        assert!(state.any_download_running());
     }
 
     #[test]
