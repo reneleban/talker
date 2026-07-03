@@ -2,7 +2,7 @@
 
 APP_DEST ?= $(HOME)/Applications
 
-.PHONY: help verify build test clippy bundle install stress run
+.PHONY: help verify build test clippy bundle install cert stress run
 
 help: ## Diese Übersicht
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -23,6 +23,9 @@ clippy: ## Lint, Warnungen sind Fehler
 
 bundle: ## talker.app bauen (signiert mit talker-dev, sonst ad-hoc)
 	bash scripts/bundle.sh
+
+cert: ## Einmalig pro Mac: talker-dev-Zertifikat anlegen (Permissions überleben Rebuilds)
+	bash scripts/make-cert.sh
 
 install: bundle ## Bundle bauen + installieren (ERSETZT das alte Bundle — nie überkopieren!)
 	@if [ -d "$(APP_DEST)/talker.app" ]; then \

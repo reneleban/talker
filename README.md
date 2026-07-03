@@ -76,8 +76,10 @@ make install  # baut talker.app und installiert nach ~/Applications
    siehe [`docs/licensing.md`](docs/licensing.md)):
    - `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/` — [Download](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2) (entpacken)
    - `gemma-4-E2B-it-Q8_0.gguf` — von `ggml-org/gemma-4-E2B-it-GGUF` (Hugging Face)
-3. **Bauen & installieren:** `make install` (s. o.).
-4. **Permissions erteilen** (einmalig, siehe unten) — dann PTT-Taste halten
+3. **Signatur-Zertifikat anlegen (einmalig):** `make cert` — sonst verfallen
+   die Permissions bei jedem Update (siehe Known Issue unten).
+4. **Bauen & installieren:** `make install` (s. o.).
+5. **Permissions erteilen** (einmalig, siehe unten) — dann PTT-Taste halten
    und lossprechen.
 
 ## Entwicklung
@@ -99,8 +101,11 @@ Architektur & Entscheidungen: `docs/adr/`, Begriffe: `CONTEXT.md`.
 Wichtig: Das Bundle wird ersetzt, nie überkopiert — In-Place-Kopieren macht
 die Code-Signatur aus Kernel-Sicht ungültig (App startet nicht mehr).
 
-Das Bundle ist **ad-hoc signiert** (kein Developer-Account, keine Notarisierung)
-und nur für den eigenen Mac gedacht. Beim ersten Start:
+Das Bundle ist lokal signiert (kein Developer-Account, keine Notarisierung —
+bewusst: source-first, siehe oben) und nur für den eigenen Mac gedacht.
+**Vor dem ersten `make install` einmalig `make cert` ausführen** — das legt ein
+selbstsigniertes Codesign-Zertifikat `talker-dev` im Login-Schlüsselbund an.
+Beim ersten Start:
 
 1. **Bedienungshilfen** erlauben (Systemeinstellungen → Datenschutz & Sicherheit
    → Bedienungshilfen → talker) — für den globalen Hotkey und das Einfügen.
@@ -111,6 +116,20 @@ und nur für den eigenen Mac gedacht. Beim ersten Start:
 Hinweis: Nach dem Erteilen der Bedienungshilfen-Permission talker neu starten.
 Für Accessibility gibt es keinen Info.plist-Usage-String (macOS kennt dafür
 keinen Key); der Hinweis kommt aus dem App-Onboarding.
+
+### Known Issue: Permissions nach Update wieder weg
+
+macOS bindet die erteilten Rechte (Bedienungshilfen, Mikrofon) an die
+Code-Signatur der App. Ohne das `talker-dev`-Zertifikat signiert der Build
+**ad-hoc** — dann ist talker für macOS nach jedem `make install` eine „neue"
+App und alle Rechte sind weg (der Eintrag in den Systemeinstellungen wirkt
+gesetzt, ist aber tot: einmal löschen und neu erteilen).
+
+**Workaround (einmalig pro Mac):** `make cert`, danach `make install`. Nach
+diesem einen Wechsel der Signatur die Rechte ein letztes Mal neu erteilen —
+ab dann überleben sie jedes Update, weil Bundle-ID und Zertifikat stabil
+bleiben. Alternative von Hand: Schlüsselbundverwaltung → Zertifikatsassistent →
+„Ein Zertifikat erstellen…" → Name `talker-dev`, Typ *Codesignierung*.
 
 ## Konfiguration
 
