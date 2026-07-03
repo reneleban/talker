@@ -147,7 +147,8 @@ impl ModelSpec {
         }
     }
 
-    /// Ablageort des laufenden (Teil-)Downloads — bei Retry gelöscht.
+    /// Ablageort des laufenden (Teil-)Downloads — bleibt bei Abbruch liegen
+    /// und wird beim nächsten Versuch fortgesetzt (Ticket-0031).
     fn partial_path(&self) -> PathBuf {
         match self {
             ModelSpec::File { dest, .. } => {
@@ -250,8 +251,10 @@ pub fn percent(done: u64, total: Option<u64>) -> u8 {
     }
 }
 
-/// Lädt `url` vollständig nach `dest` (überschreibt) und meldet Fortschritt
-/// als (geladene Bytes, Gesamtgröße falls bekannt). Mockbar (AK 2).
+/// Lädt `url` nach `dest` und meldet Fortschritt als (geladene Bytes,
+/// Gesamtgröße falls bekannt). Mockbar (AK 2). Resume-Vertrag (Ticket-0031):
+/// existiert `dest` bereits, wird ab dessen Ende fortgesetzt — vorhandene
+/// Bytes zählen in den Fortschritt ein.
 pub trait ModelFetcher: Send + Sync {
     fn fetch(
         &self,
@@ -261,7 +264,10 @@ pub trait ModelFetcher: Send + Sync {
     ) -> Result<()>;
 }
 
-/// Produktions-Fetcher über HTTPS (ureq, folgt Redirects).
+/// Produktions-Fetcher über HTTPS (ureq, folgt Redirects). Teildownloads
+/// werden per `Range`-Request fortgesetzt (206 → anhängen); ignoriert der
+/// Server Range (200), wird von vorn geschrieben. 416 = Teildownload
+/// ungültig → löschen, der nächste Versuch startet frisch.
 pub struct HttpFetcher;
 
 impl ModelFetcher for HttpFetcher {
@@ -276,16 +282,36 @@ impl ModelFetcher for HttpFetcher {
         if let Some(dir) = dest.parent() {
             fs::create_dir_all(dir).map_err(|e| map("Modell-Verzeichnis", &e))?;
         }
-        let mut resp = ureq::get(url)
-            .call()
-            .map_err(|e| map(&format!("Download {url}"), &e))?;
-        let total = resp.body().content_length();
+        let offset = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        let mut req = ureq::get(url);
+        if offset > 0 {
+            req = req.header("Range", format!("bytes={offset}-"));
+        }
+        let mut resp = match req.call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::StatusCode(416)) => {
+                let _ = fs::remove_file(dest);
+                return Err(TalkerError::Download(
+                    "Teildownload ungültig (HTTP 416) — der nächste Versuch startet neu".into(),
+                ));
+            }
+            Err(e) => return Err(map(&format!("Download {url}"), &e)),
+        };
+        // 206 = Server setzt ab Offset fort; alles andere (200) liefert den
+        // kompletten Body → Datei von vorn schreiben.
+        let resumed = offset > 0 && resp.status() == 206;
+        let start = if resumed { offset } else { 0 };
+        let total = resp.body().content_length().map(|len| start + len);
         let mut reader = resp.body_mut().as_reader();
-        let file = fs::File::create(dest)
-            .map_err(|e| map(&format!("{} nicht schreibbar", dest.display()), &e))?;
+        let file = if resumed {
+            fs::OpenOptions::new().append(true).open(dest)
+        } else {
+            fs::File::create(dest)
+        }
+        .map_err(|e| map(&format!("{} nicht schreibbar", dest.display()), &e))?;
         let mut writer = BufWriter::new(file);
         let mut buf = [0u8; 64 * 1024];
-        let mut done: u64 = 0;
+        let mut done: u64 = start;
         loop {
             let n = reader
                 .read(&mut buf)
@@ -384,8 +410,9 @@ impl ModelsState {
 
 /// Führt einen Download durch (blockierend) und pflegt die State-Maschine:
 /// downloading(%) → verifying → ready; Fehler → error, Hash-Mismatch → corrupt
-/// (Datei gelöscht). Retry = erneut aufrufen — Teildownloads werden vorab
-/// entfernt (AK 5). Ohne Consent passiert kein Fetch (consent-pending).
+/// (Datei gelöscht). Retry = erneut aufrufen — liegen gebliebene Teildownloads
+/// werden fortgesetzt (Ticket-0031), nur Hash-Mismatch räumt auf (AK 5).
+/// Ohne Consent passiert kein Fetch (consent-pending).
 pub fn run_download(
     state: &ModelsState,
     id: ModelId,
@@ -400,7 +427,6 @@ pub fn run_download(
         ));
     }
     let partial = spec.partial_path();
-    let _ = fs::remove_file(&partial);
 
     state.set(id, ModelState::Downloading { pct: 0 });
     let mut last_pct = 0u8;
@@ -412,7 +438,7 @@ pub fn run_download(
         }
     });
     if let Err(e) = fetched {
-        let _ = fs::remove_file(&partial);
+        // Teildownload bewusst liegen lassen — der Retry setzt fort.
         state.set(id, ModelState::Error(e.to_string()));
         return Err(e);
     }
@@ -571,21 +597,38 @@ mod tests {
         }
     }
 
-    /// Skriptbarer Fake: pro Aufruf entweder Bytes „liefern" oder scheitern.
+    /// Schritte des skriptbaren Fakes — mit derselben Resume-Semantik wie der
+    /// echte Fetcher (Ticket-0031): vorhandene Bytes in `dest` bleiben stehen,
+    /// Geliefertes wird angehängt.
+    enum FakeStep {
+        /// Bytes anhängen, Erfolg.
+        Deliver(Vec<u8>),
+        /// Bytes anhängen, dann Fehler (Abbruch mitten im Download).
+        AbortAfter(Vec<u8>, String),
+        /// Sofortiger Fehler, nichts geschrieben.
+        Fail(String),
+    }
+
     struct FakeFetcher {
         calls: AtomicUsize,
-        script: Mutex<VecDeque<std::result::Result<Vec<u8>, String>>>,
+        script: Mutex<VecDeque<FakeStep>>,
+        /// Beim jeweiligen Aufruf vorgefundene `dest`-Größe (Resume-Nachweis).
+        seen_offsets: Mutex<Vec<u64>>,
     }
 
     impl FakeFetcher {
-        fn new(script: Vec<std::result::Result<Vec<u8>, String>>) -> Self {
+        fn new(script: Vec<FakeStep>) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
                 script: Mutex::new(script.into()),
+                seen_offsets: Mutex::new(Vec::new()),
             }
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+        fn seen_offsets(&self) -> Vec<u64> {
+            self.seen_offsets.lock().unwrap().clone()
         }
     }
 
@@ -597,6 +640,16 @@ mod tests {
             progress: &mut dyn FnMut(u64, Option<u64>),
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            let offset = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+            self.seen_offsets.lock().unwrap().push(offset);
+            let append = |bytes: &[u8]| {
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dest)
+                    .unwrap();
+                f.write_all(bytes).unwrap();
+            };
             let step = self
                 .script
                 .lock()
@@ -604,14 +657,19 @@ mod tests {
                 .pop_front()
                 .expect("unerwarteter fetch-Aufruf");
             match step {
-                Ok(bytes) => {
-                    let total = bytes.len() as u64;
-                    progress(total / 2, Some(total));
-                    fs::write(dest, &bytes).unwrap();
+                FakeStep::Deliver(bytes) => {
+                    let total = offset + bytes.len() as u64;
+                    progress(offset + bytes.len() as u64 / 2, Some(total));
+                    append(&bytes);
                     progress(total, Some(total));
                     Ok(())
                 }
-                Err(msg) => Err(TalkerError::Download(msg)),
+                FakeStep::AbortAfter(bytes, msg) => {
+                    append(&bytes);
+                    progress(offset + bytes.len() as u64, None);
+                    Err(TalkerError::Download(msg))
+                }
+                FakeStep::Fail(msg) => Err(TalkerError::Download(msg)),
             }
         }
     }
@@ -779,7 +837,7 @@ mod tests {
     fn successful_file_download_ends_ready_with_file_in_place() {
         let dir = TempDir::new("file-ok");
         let spec = file_spec(&dir, b"gguf-bytes");
-        let fetcher = FakeFetcher::new(vec![Ok(b"gguf-bytes".to_vec())]);
+        let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(b"gguf-bytes".to_vec())]);
         let state = ModelsState::new(ModelState::Ready, ModelState::Missing);
 
         run_download(&state, ModelId::Gemma, &spec, &fetcher, true).unwrap();
@@ -794,7 +852,7 @@ mod tests {
     fn no_download_without_consent() {
         let dir = TempDir::new("consent");
         let spec = file_spec(&dir, b"x");
-        let fetcher = FakeFetcher::new(vec![Ok(b"x".to_vec())]);
+        let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(b"x".to_vec())]);
         let state = ModelsState::new(ModelState::Ready, ModelState::Missing);
 
         let err = run_download(&state, ModelId::Gemma, &spec, &fetcher, false).unwrap_err();
@@ -808,7 +866,10 @@ mod tests {
     fn fetch_error_sets_error_state_and_retry_recovers() {
         let dir = TempDir::new("retry");
         let spec = file_spec(&dir, b"inhalt");
-        let fetcher = FakeFetcher::new(vec![Err("Netz weg".into()), Ok(b"inhalt".to_vec())]);
+        let fetcher = FakeFetcher::new(vec![
+            FakeStep::Fail("Netz weg".into()),
+            FakeStep::Deliver(b"inhalt".to_vec()),
+        ]);
         let state = ModelsState::new(ModelState::Ready, ModelState::Missing);
 
         // 1. Versuch: Fehler → error-State, kein Partial-Rest.
@@ -827,8 +888,8 @@ mod tests {
         let dir = TempDir::new("mismatch");
         let spec = file_spec(&dir, b"erwarteter inhalt");
         let fetcher = FakeFetcher::new(vec![
-            Ok(b"manipulierter inhalt".to_vec()),
-            Ok(b"erwarteter inhalt".to_vec()),
+            FakeStep::Deliver(b"manipulierter inhalt".to_vec()),
+            FakeStep::Deliver(b"erwarteter inhalt".to_vec()),
         ]);
         let state = ModelsState::new(ModelState::Ready, ModelState::Missing);
 
@@ -844,6 +905,37 @@ mod tests {
 
         run_download(&state, ModelId::Gemma, &spec, &fetcher, true).unwrap();
         assert_eq!(state.get(ModelId::Gemma), ModelState::Ready);
+    }
+
+    /// Resume (Ticket-0031): Abbruch mitten im Download lässt den Teildownload
+    /// liegen, der Retry setzt ab dessen Größe fort statt neu zu laden.
+    #[test]
+    fn interrupted_download_resumes_on_retry() {
+        let dir = TempDir::new("resume");
+        let spec = file_spec(&dir, b"AAAABBBB");
+        let fetcher = FakeFetcher::new(vec![
+            FakeStep::AbortAfter(b"AAAA".to_vec(), "Netz weg".into()),
+            FakeStep::Deliver(b"BBBB".to_vec()),
+        ]);
+        let state = ModelsState::new(ModelState::Ready, ModelState::Missing);
+
+        assert!(run_download(&state, ModelId::Gemma, &spec, &fetcher, true).is_err());
+        assert!(matches!(state.get(ModelId::Gemma), ModelState::Error(_)));
+        assert_eq!(
+            fs::read(spec.partial_path()).unwrap(),
+            b"AAAA",
+            "Teildownload muss liegen bleiben"
+        );
+
+        run_download(&state, ModelId::Gemma, &spec, &fetcher, true).unwrap();
+
+        assert_eq!(state.get(ModelId::Gemma), ModelState::Ready);
+        assert_eq!(fs::read(dir.path("modell.gguf")).unwrap(), b"AAAABBBB");
+        assert_eq!(
+            fetcher.seen_offsets(),
+            vec![0, 4],
+            "zweiter Aufruf resumed ab Byte 4"
+        );
     }
 
     #[test]
@@ -887,7 +979,7 @@ mod tests {
         let archive = build_archive(&files);
         let dir = TempDir::new("archive-ok");
         let spec = archive_spec(&dir, &archive, &files);
-        let fetcher = FakeFetcher::new(vec![Ok(archive.clone())]);
+        let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(archive.clone())]);
         let state = ModelsState::new(ModelState::Missing, ModelState::Ready);
 
         run_download(&state, ModelId::Parakeet, &spec, &fetcher, true).unwrap();
@@ -911,7 +1003,7 @@ mod tests {
             root: dir.0.clone(),
             files: vec![(dir.path("m/tokens.txt"), sha_of(b"anders"))],
         };
-        let fetcher = FakeFetcher::new(vec![Ok(archive)]);
+        let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(archive)]);
         let state = ModelsState::new(ModelState::Missing, ModelState::Ready);
 
         let err = run_download(&state, ModelId::Parakeet, &spec, &fetcher, true).unwrap_err();
@@ -932,7 +1024,7 @@ mod tests {
             root: dir.0.clone(),
             files: vec![(dir.path("m/tokens.txt"), sha_of(b"x"))],
         };
-        let fetcher = FakeFetcher::new(vec![Ok(broken)]);
+        let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(broken)]);
         let state = ModelsState::new(ModelState::Missing, ModelState::Ready);
 
         assert!(run_download(&state, ModelId::Parakeet, &spec, &fetcher, true).is_err());
@@ -951,7 +1043,7 @@ mod tests {
             initial_state(ModelStatus::Missing, true),
         ));
         let fetcher: Arc<dyn ModelFetcher> =
-            Arc::new(FakeFetcher::new(vec![Ok(b"gemma".to_vec())]));
+            Arc::new(FakeFetcher::new(vec![FakeStep::Deliver(b"gemma".to_vec())]));
 
         // Vorher: nur Roh verfügbar.
         assert!(!state.llm_modes_available());
@@ -984,6 +1076,136 @@ mod tests {
             let state = ModelsState::new(parakeet.clone(), ModelState::Missing);
             assert_eq!(state.stt_ready(), expected, "{parakeet:?}");
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ServerMode {
+        /// Beantwortet Range-Requests korrekt mit 206.
+        Ranges,
+        /// Ignoriert Range, liefert immer 200 + kompletten Body.
+        IgnoreRange,
+        /// Immer 416 (Teildownload für den Server ungültig).
+        Always416,
+    }
+
+    /// Mini-HTTP-Server für Offline-Tests des HttpFetcher (Ticket-0031):
+    /// beantwortet `max_requests` Verbindungen (Connection: close) und
+    /// protokolliert die gesehenen Range-Header.
+    fn spawn_http_server(
+        content: Vec<u8>,
+        mode: ServerMode,
+        max_requests: usize,
+    ) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        use std::io::BufRead as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/modell.bin", listener.local_addr().unwrap());
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&ranges);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(max_requests) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut range: Option<String> = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("range:") {
+                        range = Some(v.trim().to_string());
+                    }
+                }
+                seen.lock().unwrap().push(range.clone());
+                let respond = |stream: &mut std::net::TcpStream,
+                               status: &str,
+                               extra: &str,
+                               body: &[u8]| {
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body);
+                };
+                match (mode, range) {
+                    (ServerMode::Always416, _) => {
+                        respond(&mut stream, "416 Range Not Satisfiable", "", b"");
+                    }
+                    (ServerMode::Ranges, Some(r)) => {
+                        let from: usize = r
+                            .strip_prefix("bytes=")
+                            .and_then(|s| s.strip_suffix('-'))
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        let extra = format!(
+                            "Content-Range: bytes {from}-{}/{}\r\n",
+                            content.len().saturating_sub(1),
+                            content.len()
+                        );
+                        respond(&mut stream, "206 Partial Content", &extra, &content[from..]);
+                    }
+                    _ => respond(&mut stream, "200 OK", "", &content),
+                }
+            }
+        });
+        (url, ranges)
+    }
+
+    #[test]
+    fn http_fetcher_resumes_partial_with_range_request() {
+        let content = b"0123456789ABCDEF".to_vec();
+        let (url, ranges) = spawn_http_server(content.clone(), ServerMode::Ranges, 1);
+        let dir = TempDir::new("http-resume");
+        let dest = dir.path("d.bin");
+        fs::write(&dest, b"0123").unwrap();
+        let mut first_done = None;
+        let mut last = (0, None);
+
+        HttpFetcher
+            .fetch(&url, &dest, &mut |done, total| {
+                first_done.get_or_insert(done);
+                last = (done, total);
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), content);
+        assert_eq!(ranges.lock().unwrap()[0].as_deref(), Some("bytes=4-"));
+        assert!(
+            first_done.unwrap() > 4,
+            "Fortschritt zählt vorhandene Bytes mit"
+        );
+        assert_eq!(last, (16, Some(16)), "total = Offset + Rest");
+    }
+
+    #[test]
+    fn http_fetcher_restarts_cleanly_when_server_ignores_range() {
+        let content = b"KORREKTER INHALT".to_vec();
+        let (url, _) = spawn_http_server(content.clone(), ServerMode::IgnoreRange, 1);
+        let dir = TempDir::new("http-200");
+        let dest = dir.path("d.bin");
+        fs::write(&dest, b"MUELLDATEN").unwrap();
+
+        HttpFetcher.fetch(&url, &dest, &mut |_, _| {}).unwrap();
+
+        // 200 statt 206 → truncate + von vorn, kein Anhängen an den Müll.
+        assert_eq!(fs::read(&dest).unwrap(), content);
+    }
+
+    #[test]
+    fn http_fetcher_deletes_partial_on_416() {
+        let (url, _) = spawn_http_server(Vec::new(), ServerMode::Always416, 1);
+        let dir = TempDir::new("http-416");
+        let dest = dir.path("d.bin");
+        fs::write(&dest, b"zu viel oder ungueltig").unwrap();
+
+        let err = HttpFetcher.fetch(&url, &dest, &mut |_, _| {}).unwrap_err();
+
+        assert!(err.to_string().contains("416"), "{err}");
+        assert!(!dest.exists(), "ungültiger Teildownload muss weg sein");
     }
 
     /// Echter Netz-Smoke für den Produktions-Fetcher (Redirect + Streaming +
