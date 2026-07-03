@@ -59,6 +59,12 @@ impl CleanupMode {
 /// Raw Transcript → Cleaned Transcript.
 pub trait LlmCleaner {
     fn clean(&mut self, raw: &str) -> Result<String>;
+    /// Aktives Stil-Profil setzen (wirkt ab dem nächsten `clean`). Default
+    /// no-op für Cleaner ohne Modi — der Dictation Worker konfiguriert
+    /// hierüber den aufgelösten Cleanup-Modus pro Utterance.
+    fn set_mode(&mut self, _mode: CleanupMode) {}
+    /// Nutzer-Vokabular setzen (wirkt ab dem nächsten `clean`).
+    fn set_vocab(&mut self, _vocab: &[String]) {}
 }
 
 /// Ausfallsicherer Einstiegspunkt: Fehler/Timeout/leerer Output → Raw Transcript
@@ -264,16 +270,6 @@ impl GemmaCleaner {
         })
     }
 
-    /// Aktives Stil-Profil setzen (wirkt ab dem nächsten `clean`).
-    pub fn set_mode(&mut self, mode: CleanupMode) {
-        self.mode = mode;
-    }
-
-    /// Nutzer-Vokabular setzen (wirkt ab dem nächsten `clean`).
-    pub fn set_vocab(&mut self, vocab: &[String]) {
-        self.vocab = vocab.to_vec();
-    }
-
     /// Default-Ablageort: ~/Library/Application Support/talker/models/…
     pub fn default_model_path() -> PathBuf {
         let home = std::env::var_os("HOME")
@@ -284,6 +280,14 @@ impl GemmaCleaner {
 }
 
 impl LlmCleaner for GemmaCleaner {
+    fn set_mode(&mut self, mode: CleanupMode) {
+        self.mode = mode;
+    }
+
+    fn set_vocab(&mut self, vocab: &[String]) {
+        self.vocab = vocab.to_vec();
+    }
+
     fn clean(&mut self, raw: &str) -> Result<String> {
         if raw.trim().is_empty() {
             return Ok(raw.to_string());

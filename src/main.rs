@@ -44,9 +44,9 @@ fn try_load_cleaner() -> (Option<cleanup::GemmaCleaner>, bool) {
     }
 }
 
-/// STT + Cleanup + Injection laufen abseits des Main-Threads: ein Worker-Thread
-/// besitzt die Modelle und bekommt Utterances per Channel. Config-Änderungen
-/// (Cleanup an/aus, STT-Pfad) wirken pro Utterance.
+/// STT + Cleanup + Injection laufen abseits des Main-Threads: der Dictation
+/// Worker (pipeline.rs) besitzt die Modelle und deren Lebenszyklus; dieser
+/// Thread drainiert nur den Channel und mappt `Outcome` auf Indicator/Injection.
 fn spawn_stt_worker(
     config: Arc<RwLock<config::Config>>,
     indicator: Arc<Mutex<Indicator>>,
@@ -64,142 +64,45 @@ fn spawn_stt_worker(
     std::thread::spawn(move || {
         let snapshot = |cfg: &Arc<RwLock<config::Config>>| cfg.read().map(|c| c.clone()).ok();
 
-        let mut stt_dir = match snapshot(&config) {
-            Some(c) => c.stt_model_dir,
-            None => return,
-        };
-        let t0 = Instant::now();
-        let mut transcriber = match stt::ParakeetTranscriber::new(&stt_dir) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("talker: STT nicht verfügbar — {e}");
-                None
-            }
-        };
-        if transcriber.is_some() {
-            eprintln!(
-                "talker: STT-Modell geladen in {:.1}s.",
-                t0.elapsed().as_secs_f32()
-            );
-        }
-
-        // Cleanup: wenn aktiviert, direkt vorladen (danach ist alles „bereit");
-        // bei Fehler nicht pro Utterance erneut versuchen, bis der Schalter
-        // erneut umgelegt wird. Späteres Aktivieren lädt lazy in der Loop.
-        let mut cleaner: Option<cleanup::GemmaCleaner> = None;
-        let mut cleaner_failed = false;
-        // Vorladen nur, wenn das gemma-Modell laut Downloader-State auch da
-        // ist — beim Erst-Start (Download läuft noch) wäre es nur ein Fehler.
-        let mut llm_was_available = models_state.llm_modes_available();
-        if llm_was_available && snapshot(&config).is_some_and(|c| pipeline::config_wants_llm(&c)) {
-            (cleaner, cleaner_failed) = try_load_cleaner();
-        }
+        let Some(cfg) = snapshot(&config) else { return };
+        let mut worker = pipeline::DictationWorker::new(
+            &cfg,
+            models_state,
+            Box::new(|dir: &std::path::Path| stt::ParakeetTranscriber::new(dir)),
+            Box::new(try_load_cleaner),
+        );
         report(&|ind| ind.ready(Instant::now()));
 
         for (pcm, frontmost) in rx {
-            // Live-Aktivierung (Ticket-0029): wird gemma nachträglich ready,
-            // den Fehler-Cache löschen — der nächste LLM-Bedarf lädt dann.
-            let llm_available = models_state.llm_modes_available();
-            if llm_available && !llm_was_available {
-                cleaner_failed = false;
-            }
-            llm_was_available = llm_available;
             let Some(cfg) = snapshot(&config) else {
                 // Poisoned Config-Lock: nicht still verwerfen (CLAUDE.md).
                 eprintln!("talker: Config-Lock poisoned — Utterance verworfen.");
                 report(&|ind| ind.fail(Instant::now(), "Interner Fehler (Config)"));
                 continue;
             };
-            // Kontext-Awareness (Ticket-0026): Modus für DIESE Utterance auflösen.
-            let resolved = pipeline::resolve_mode(&cfg, frontmost.as_deref());
-            if resolved != cfg.cleanup_mode {
-                eprintln!(
-                    "talker: Kontext-Regel aktiv ({}) → Modus {}.",
-                    frontmost.as_deref().unwrap_or("?"),
-                    resolved.label()
-                );
-            }
-
-            // STT-Pfad geändert → Modell neu laden (alter bleibt bei Fehler aktiv).
-            if cfg.stt_model_dir != stt_dir || transcriber.is_none() {
-                match stt::ParakeetTranscriber::new(&cfg.stt_model_dir) {
-                    Ok(t) => {
-                        transcriber = Some(t);
-                        stt_dir = cfg.stt_model_dir.clone();
-                        eprintln!("talker: STT-Modell neu geladen: {}", stt_dir.display());
-                    }
-                    Err(e) => eprintln!("talker: STT-Neuladen fehlgeschlagen — {e}"),
-                }
-            }
-            let Some(transcriber) = transcriber.as_mut() else {
-                eprintln!("talker: kein STT-Modell — Utterance verworfen.");
-                report(&|ind| ind.fail(Instant::now(), "Kein STT-Modell"));
-                continue;
-            };
-
-            if resolved.uses_llm() && cleaner.is_none() && !cleaner_failed {
-                (cleaner, cleaner_failed) = try_load_cleaner();
-            }
-            // Entladen/Fehler-Reset folgt dem GESAMT-Bedarf der Config, nicht
-            // der einzelnen Utterance — sonst würde jede Raw-geregelte App das
-            // Modell entladen und die nächste LLM-Utterance den Kaltstart zahlen.
-            if !pipeline::config_wants_llm(&cfg) {
-                pipeline::reset_cleaner_on_raw_mode(
-                    cfg.cleanup_mode,
-                    &mut cleaner,
-                    &mut cleaner_failed,
-                );
-            }
-
-            // Ab hier gilt der aufgelöste Modus (process_utterance, set_mode).
-            let cfg = config::Config {
-                cleanup_mode: resolved,
-                ..cfg
-            };
-            // Cleaner nur im LLM-Modus übergeben: aufgelöstes Raw darf einen
-            // (für andere Apps) geladenen Cleaner nicht anwenden.
-            let cleaner_ref = resolved
-                .uses_llm()
-                .then_some(cleaner.as_mut())
-                .flatten()
-                .map(|c| {
-                    c.set_mode(cfg.cleanup_mode);
-                    c.set_vocab(&cfg.vocabulary);
-                    c as &mut dyn cleanup::LlmCleaner
-                });
-            let (text, cleanup_fell_back) = match pipeline::process_utterance(
-                &pcm,
-                &cfg,
-                transcriber,
-                cleaner_ref,
-                cleaner_failed,
-            ) {
-                pipeline::Processed::Text {
+            match worker.handle(&pcm, frontmost.as_deref(), &cfg) {
+                pipeline::Outcome::Inject {
                     text,
                     cleanup_fell_back,
-                } => (text, cleanup_fell_back),
-                pipeline::Processed::Empty => {
-                    eprintln!("talker: leerer Transcript — nichts einzufügen.");
-                    report(&|ind| ind.fail(Instant::now(), "Nichts erkannt"));
-                    continue;
-                }
-                pipeline::Processed::SttFailed(e) => {
-                    eprintln!("talker: STT fehlgeschlagen: {e}");
-                    report(&|ind| ind.fail(Instant::now(), "Spracherkennung fehlgeschlagen"));
-                    continue;
-                }
-            };
-            match injection::inject(&clipboard::NsPasteboard, &injection::CgKeySender, &text) {
-                Ok(()) if cleanup_fell_back => {
-                    // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
-                    report(&|ind| {
-                        ind.fail(Instant::now(), "Cleanup übersprungen — Rohtext eingefügt")
-                    });
-                }
-                Ok(()) => report(&|ind| ind.finish_ok(Instant::now())),
-                Err(e) => {
-                    eprintln!("talker: Injection fehlgeschlagen: {e}");
-                    report(&|ind| ind.fail(Instant::now(), "Einfügen fehlgeschlagen"));
+                } => match injection::inject(
+                    &clipboard::NsPasteboard,
+                    &injection::CgKeySender,
+                    &text,
+                ) {
+                    Ok(()) if cleanup_fell_back => {
+                        // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
+                        report(&|ind| {
+                            ind.fail(Instant::now(), "Cleanup übersprungen — Rohtext eingefügt")
+                        });
+                    }
+                    Ok(()) => report(&|ind| ind.finish_ok(Instant::now())),
+                    Err(e) => {
+                        eprintln!("talker: Injection fehlgeschlagen: {e}");
+                        report(&|ind| ind.fail(Instant::now(), "Einfügen fehlgeschlagen"));
+                    }
+                },
+                pipeline::Outcome::Rejected(hint) => {
+                    report(&|ind| ind.fail(Instant::now(), hint));
                 }
             }
         }
