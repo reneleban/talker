@@ -40,11 +40,16 @@ pub fn apply(transcript: &str, vocab: &[String]) -> String {
             let win_code = cologne(&win_sq);
             for (term, code, term_sq, term_first) in &terms {
                 let len_diff = win_sq.chars().count().abs_diff(term_sq.chars().count());
-                if first == *term_first
-                    && len_diff <= 3
-                    && win_sq != *term_sq
-                    && cologne_close(&win_code, code)
-                {
+                // Exakt gleicher Code reicht bei kurzen Begriffen nicht (Tunnel↔TOML,
+                // Karte↔Kyroth klingen »gleich«): zusätzlich muss die Wort-Oberfläche
+                // nah sein. Der Fuzzy-Zweig (lange Codes) bleibt oberflächen-frei —
+                // Clotzelei↔Claude CLI liegt an der Oberfläche weit auseinander.
+                let sounds_alike = if win_code == *code {
+                    !win_code.is_empty() && edit_distance(&win_sq, term_sq) <= 2
+                } else {
+                    cologne_close(&win_code, code)
+                };
+                if first == *term_first && len_diff <= 3 && win_sq != *term_sq && sounds_alike {
                     matched = Some((len, term));
                     break 'window;
                 }
@@ -69,14 +74,21 @@ pub fn apply(transcript: &str, vocab: &[String]) -> String {
     out
 }
 
-/// Klangbild-Vergleich: exakt gleich, oder ein Editier-Schritt Abstand bei
-/// mindestens 3-stelligen Codes (»45285« vs »4585« = Claude CLI vs Clotzelei).
+/// Klangbild-Vergleich: exakt gleich, oder ein Editier-Schritt Abstand, wenn
+/// BEIDE Codes mindestens 4-stellig sind (»45285« vs »4585« = Claude CLI vs
+/// Clotzelei). Bei 3er-Codes wäre ed ≤ 1 schon ≈ 33 % Abweichung — genau die
+/// Fehltreffer-Klasse kaputt(412)↔Kyroth(472) bzw. Markt(6742)↔merge(674).
+///
+/// Irreduzibel bleiben echte Beinah-Homophone mit gleichem Code UND naher
+/// Oberfläche (Pudding↔Padding, merke↔merge): die sind phonetisch nicht
+/// trennbar. Empfehlung: solche Begriffe nicht ins Phonetik-Vokabular
+/// aufnehmen, sondern dem LLM-Cleanup überlassen (Ticket-0032).
 fn cologne_close(a: &str, b: &str) -> bool {
     if a == b {
         return !a.is_empty();
     }
     let (la, lb) = (a.chars().count(), b.chars().count());
-    la.max(lb) >= 3 && la.abs_diff(lb) <= 1 && edit_distance(a, b) <= 1
+    la.min(lb) >= 4 && la.abs_diff(lb) <= 1 && edit_distance(a, b) <= 1
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -317,17 +329,57 @@ mod tests {
     }
 
     #[test]
+    fn does_not_replace_common_words_via_short_fuzzy_codes() {
+        // AK1 (Fuzzy): kurze Kölner-Codes erlauben keinen Editier-Schritt mehr —
+        // ed ≤ 1 auf 3er-Codes wäre ≈ 33 % Klangabweichung.
+        assert_eq!(cologne(&squash("kaputt")), "412", "Vorbedingung");
+        assert_eq!(cologne(&squash("Kyroth")), "472", "Vorbedingung");
+        assert_eq!(cologne(&squash("Markt")), "6742", "Vorbedingung");
+        assert_eq!(cologne(&squash("merge")), "674", "Vorbedingung");
+        let v = vec!["Kyroth".to_string(), "merge".to_string()];
+        assert_eq!(apply("das Ding ist kaputt", &v), "das Ding ist kaputt");
+        assert_eq!(apply("der Markt ist offen", &v), "der Markt ist offen");
+    }
+
+    #[test]
+    fn does_not_replace_words_with_equal_code_but_distant_surface() {
+        // AK1 (Exakt-Kollision): gleicher Kölner-Code, aber die Wort-Oberfläche
+        // liegt zu weit weg (Editierdistanz der gesquashten Strings > 2).
+        assert_eq!(
+            cologne(&squash("Tunnel")),
+            cologne(&squash("TOML")),
+            "Vorbedingung: Code-Kollision"
+        );
+        assert_eq!(
+            cologne(&squash("Karte")),
+            cologne(&squash("Kyroth")),
+            "Vorbedingung: Code-Kollision"
+        );
+        assert_eq!(
+            cologne(&squash("Kröte")),
+            cologne(&squash("Kyroth")),
+            "Vorbedingung: Code-Kollision"
+        );
+        let v = vec!["TOML".to_string(), "Kyroth".to_string()];
+        assert_eq!(apply("der Tunnel ist lang", &v), "der Tunnel ist lang");
+        assert_eq!(apply("die Karte liegt hier", &v), "die Karte liegt hier");
+        assert_eq!(apply("die Kröte hüpft", &v), "die Kröte hüpft");
+    }
+
+    #[test]
     fn cologne_codes_are_close_for_expected_pairs() {
         for (a, b) in [
             ("clotzelei", "claudecli"),
             ("tommel", "toml"),
             ("kubanetis", "kubernetes"),
-            ("ekwi", "egui"),
             ("darkerimage", "dockerimage"),
         ] {
             assert!(cologne_close(&cologne(a), &cologne(b)), "{a} ≉ {b}");
         }
         assert!(!cologne_close(&cologne("mal"), &cologne("kaffee")));
         assert!(!cologne_close(&cologne("bild"), &cologne("toml")));
+        // Bewusste Änderung (Ticket-0032): ekwi(043)↔egui(04) fällt unter die
+        // Fuzzy-Mindestlänge 4 — der Preis dafür, dass kaputt(412)↛Kyroth(472).
+        assert!(!cologne_close(&cologne("ekwi"), &cologne("egui")));
     }
 }

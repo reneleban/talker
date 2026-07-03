@@ -10,6 +10,15 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Fixed
 
+- Vokabular-Korrektur greift nicht mehr zu hart: häufige Wörter werden nicht
+  mehr fälschlich durch klanglich nur grob ähnliche Vokabular-Begriffe ersetzt
+  (z. B. „kaputt" → „Kyroth", „Tunnel" → „TOML"). Der unscharfe
+  Phonetik-Vergleich braucht jetzt längere Klang-Codes, und bei exakt gleichem
+  Klang-Code muss zusätzlich das Schriftbild nah sein. Die gewollten
+  Korrekturen (Tommel→TOML, Clotzelei→Claude CLI, Kubanetis→Kubernetes,
+  Darker Image→Docker Image) bleiben erhalten. Echte Beinah-Homophone
+  (Pudding↔Padding, merke↔merge) sind phonetisch nicht trennbar — solche
+  Begriffe besser nicht ins Vokabular aufnehmen, das erledigt der LLM-Cleanup.
 - Erst-Start-Permissions ohne manuellen Neustart: der Mikrofon-Dialog kommt
   jetzt sofort beim ersten Start (nicht erst beim ersten Diktat), und nach dem
   Erteilen der Bedienungshilfen-Berechtigung startet talker sich einmal selbst
