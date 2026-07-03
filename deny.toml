@@ -31,6 +31,9 @@ allow = [
     # erlauben Einbettung und Weitergabe.
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # libbz2-rs-sys (Pure-Rust-bzip2 fürs Parakeet-Tarball-Entpacken,
+    # Ticket-0028): klassische bzip2-Lizenz, BSD-artig permissiv.
+    "bzip2-1.0.6",
 ]
 
 [bans]

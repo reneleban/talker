@@ -52,6 +52,9 @@ pub struct Config {
     pub context_aware_enabled: bool,
     /// Regeln (bundle-id → Modus); erste passende gewinnt, sonst `cleanup_mode`.
     pub context_rules: Vec<(String, CleanupMode)>,
+    /// Modell-Downloader (Ticket-0028): Nutzer hat den Modell-Lizenzen
+    /// (NVIDIA/Parakeet + Gemma Terms) zugestimmt — ohne dies kein Download.
+    pub model_download_consent: bool,
 }
 
 /// Default-Farben der Wellen: Weiß, Cyan, Blau, Violett (kühle Siri-Palette).
@@ -83,6 +86,7 @@ struct RawConfig {
     overlay_colors: Vec<[u8; 3]>,
     context_aware_enabled: bool,
     context_rules: Vec<(String, CleanupMode)>,
+    model_download_consent: bool,
 }
 
 impl Default for RawConfig {
@@ -105,6 +109,7 @@ impl Default for RawConfig {
             overlay_colors: d.overlay_colors,
             context_aware_enabled: d.context_aware_enabled,
             context_rules: d.context_rules,
+            model_download_consent: d.model_download_consent,
         }
     }
 }
@@ -134,6 +139,7 @@ impl From<RawConfig> for Config {
             overlay_colors: raw.overlay_colors,
             context_aware_enabled: raw.context_aware_enabled,
             context_rules: raw.context_rules,
+            model_download_consent: raw.model_download_consent,
         }
     }
 }
@@ -156,6 +162,7 @@ impl Default for Config {
             overlay_colors: DEFAULT_OVERLAY_COLORS.to_vec(),
             context_aware_enabled: false,
             context_rules: Vec::new(),
+            model_download_consent: false,
         }
     }
 }
@@ -339,6 +346,25 @@ mod tests {
     #[test]
     fn context_rules_with_unknown_mode_are_a_parse_error() {
         assert!(Config::parse("context_rules = [[\"com.foo\", \"episch\"]]").is_err());
+    }
+
+    #[test]
+    fn model_download_consent_defaults_false_and_roundtrips() {
+        // Abwärtskompatibilität: alte Configs ohne das Feld → kein Consent.
+        assert!(
+            !Config::parse("cleanup_mode = \"raw\"")
+                .unwrap()
+                .model_download_consent
+        );
+        assert!(!Config::default().model_download_consent);
+        let cfg = Config {
+            model_download_consent: true,
+            ..Config::default()
+        };
+        let text = cfg.serialize().unwrap();
+        assert!(Config::parse(&text).unwrap().model_download_consent);
+        // Falscher Typ ist ein Parse-Fehler, kein stiller Fallback.
+        assert!(Config::parse("model_download_consent = \"ja\"").is_err());
     }
 
     #[test]

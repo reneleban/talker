@@ -16,6 +16,8 @@ pub enum TalkerError {
     Cleanup(String),
     #[error("Config: {0}")]
     Config(String),
+    #[error("Modell-Download: {0}")]
+    Download(String),
     #[error("Menüleiste: {0}")]
     Tray(String),
 }
