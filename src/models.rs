@@ -217,6 +217,21 @@ pub fn check(spec: &ModelSpec) -> ModelStatus {
     check_files(&spec.installed_files())
 }
 
+/// Reiner Präsenz-Check ohne Hashing — für den App-Start: die vollen
+/// Checksummen (gemma ~5 GB) würden den Start Sekunden blockieren; sie
+/// prüft `spawn_integrity_check` im Hintergrund nach.
+pub fn check_presence(spec: &ModelSpec) -> ModelStatus {
+    let files = spec.installed_files();
+    let present: Vec<bool> = files.iter().map(|(p, _)| p.is_file()).collect();
+    if present.iter().all(|p| !p) {
+        return ModelStatus::Missing;
+    }
+    if present.iter().any(|p| !p) {
+        return ModelStatus::Corrupt;
+    }
+    ModelStatus::Ready
+}
+
 /// Anfangszustand der Maschine aus Disk-Status + Consent-Flag.
 pub fn initial_state(status: ModelStatus, consent: bool) -> ModelState {
     match status {
@@ -309,6 +324,13 @@ impl ModelsState {
     /// Zustand aus dem Disk-Befund unter `models_root` + Consent-Flag.
     pub fn from_disk(models_root: &Path, consent: bool) -> Self {
         let state = |id| initial_state(check(&spec_for(id, models_root)), consent);
+        Self::new(state(ModelId::Parakeet), state(ModelId::Gemma))
+    }
+
+    /// Wie `from_disk`, aber nur Präsenz (kein Hashing) — Start-Pfad;
+    /// danach `spawn_integrity_check` fürs volle Checksum-Urteil starten.
+    pub fn from_disk_quick(models_root: &Path, consent: bool) -> Self {
+        let state = |id| initial_state(check_presence(&spec_for(id, models_root)), consent);
         Self::new(state(ModelId::Parakeet), state(ModelId::Gemma))
     }
 
@@ -450,6 +472,62 @@ pub fn spawn_background_download(
     std::thread::spawn(move || {
         if let Err(e) = run_download(&state, id, &spec, fetcher.as_ref(), consent) {
             eprintln!("talker: Modell-Download ({id:?}) fehlgeschlagen — {e}");
+        }
+    })
+}
+
+/// Braucht dieses Modell (jetzt) einen Download-Anstoß? Laufende Downloads,
+/// wartender Consent und fertige Modelle brauchen keinen.
+pub fn needs_download(state: &ModelState) -> bool {
+    matches!(
+        state,
+        ModelState::Missing | ModelState::Corrupt | ModelState::Error(_)
+    )
+}
+
+/// Stößt den Download EINES Modells an (Hintergrund-Thread, HttpFetcher),
+/// wenn es einen braucht. Setzt den Zustand synchron auf downloading —
+/// Doppelstart-Schutz gegen schnelle Wiederholungs-Klicks.
+pub fn start_download(state: &Arc<ModelsState>, id: ModelId, models_root: &Path, consent: bool) {
+    if !consent || !needs_download(&state.get(id)) {
+        return;
+    }
+    state.set(id, ModelState::Downloading { pct: 0 });
+    spawn_background_download(
+        Arc::clone(state),
+        id,
+        spec_for(id, models_root),
+        Arc::new(HttpFetcher),
+        consent,
+    );
+}
+
+/// Stößt alle nötigen Downloads an (Erst-Start nach Consent bzw. App-Start
+/// mit unvollständigem Setup). Ohne Consent passiert nichts.
+pub fn start_needed_downloads(state: &Arc<ModelsState>, models_root: &Path, consent: bool) {
+    for id in [ModelId::Parakeet, ModelId::Gemma] {
+        start_download(state, id, models_root, consent);
+    }
+}
+
+/// Voller Checksum-Check im Hintergrund (Start-Pfad nach `from_disk_quick`):
+/// stuft präsenz-`Ready` geglaubte Modelle bei Hash-Mismatch auf `Corrupt`
+/// zurück — UI/PTT-Gating reagieren über den geteilten State.
+pub fn spawn_integrity_check(
+    state: Arc<ModelsState>,
+    models_root: PathBuf,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for id in [ModelId::Parakeet, ModelId::Gemma] {
+            if state.get(id) != ModelState::Ready {
+                continue;
+            }
+            let status = check(&spec_for(id, &models_root));
+            // Nur zurückstufen, wenn zwischenzeitlich nichts anderes lief.
+            if status != ModelStatus::Ready && state.get(id) == ModelState::Ready {
+                eprintln!("talker: Modell {id:?} besteht den Checksum-Check nicht — {status:?}.");
+                state.set(id, ModelState::Corrupt);
+            }
         }
     })
 }
@@ -920,6 +998,81 @@ mod tests {
             meta.len(),
             "Fortschritt muss Dateigröße erreichen"
         );
+    }
+
+    #[test]
+    fn needs_download_only_for_missing_corrupt_error() {
+        assert!(needs_download(&ModelState::Missing));
+        assert!(needs_download(&ModelState::Corrupt));
+        assert!(needs_download(&ModelState::Error("x".into())));
+        assert!(!needs_download(&ModelState::Ready));
+        assert!(!needs_download(&ModelState::ConsentPending));
+        assert!(!needs_download(&ModelState::Downloading { pct: 3 }));
+        assert!(!needs_download(&ModelState::Verifying));
+    }
+
+    #[test]
+    fn check_presence_skips_hashing_but_detects_partial_installs() {
+        let dir = TempDir::new("presence");
+        let file = dir.path("f.bin");
+        fs::write(&file, b"beliebiger inhalt").unwrap();
+        // Präsenz reicht — auch mit absichtlich falschem Hash Ready.
+        let spec = ModelSpec::File {
+            url: "https://example.invalid/f".into(),
+            sha256: "definitiv-falsch".into(),
+            dest: file,
+        };
+        assert_eq!(check_presence(&spec), ModelStatus::Ready);
+        assert_eq!(check(&spec), ModelStatus::Corrupt, "voller Check urteilt");
+        // Fehlend bzw. teilweise vorhanden wie beim vollen Check.
+        let missing = ModelSpec::File {
+            url: String::new(),
+            sha256: String::new(),
+            dest: dir.path("nix.bin"),
+        };
+        assert_eq!(check_presence(&missing), ModelStatus::Missing);
+    }
+
+    #[test]
+    fn integrity_check_downgrades_presence_ready_to_corrupt() {
+        let dir = TempDir::new("integrity");
+        // Datei liegt am gemma-Produktionspfad, Inhalt passt nicht zum Pin.
+        fs::write(dir.path(GEMMA_FILE_NAME), b"kaputt").unwrap();
+        let state = Arc::new(ModelsState::from_disk_quick(&dir.0, true));
+        assert_eq!(state.get(ModelId::Gemma), ModelState::Ready, "Präsenz");
+
+        spawn_integrity_check(Arc::clone(&state), dir.0.clone())
+            .join()
+            .unwrap();
+
+        assert_eq!(state.get(ModelId::Gemma), ModelState::Corrupt);
+        assert_eq!(
+            state.get(ModelId::Parakeet),
+            ModelState::Missing,
+            "fehlende Modelle bleiben unberührt"
+        );
+    }
+
+    #[test]
+    fn start_download_ignores_models_that_need_none() {
+        // Ready/Downloading dürfen nicht neu angestoßen werden (kein State-Reset).
+        let dir = TempDir::new("start-noop");
+        let state = Arc::new(ModelsState::new(
+            ModelState::Ready,
+            ModelState::Downloading { pct: 40 },
+        ));
+        start_download(&state, ModelId::Parakeet, &dir.0, true);
+        start_download(&state, ModelId::Gemma, &dir.0, true);
+        assert_eq!(state.get(ModelId::Parakeet), ModelState::Ready);
+        assert_eq!(
+            state.get(ModelId::Gemma),
+            ModelState::Downloading { pct: 40 }
+        );
+        // Ohne Consent auch bei Bedarf kein Anstoß.
+        let state = Arc::new(ModelsState::new(ModelState::Missing, ModelState::Missing));
+        start_needed_downloads(&state, &dir.0, false);
+        assert_eq!(state.get(ModelId::Parakeet), ModelState::Missing);
+        assert_eq!(state.get(ModelId::Gemma), ModelState::Missing);
     }
 
     #[test]

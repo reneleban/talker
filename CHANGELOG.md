@@ -18,12 +18,17 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Added
 
-- Modell-Downloader (Kern): talker kann Parakeet (sherpa-onnx-Release) und
-  gemma (ggml-org GGUF) selbst laden — SHA-256-verifiziert gegen gepinnte
-  Hashes, mit Fortschritt, Retry bei Fehler/Checksum-Mismatch und
-  Live-Freischaltung der Nicht-Roh-Modi, sobald gemma bereit ist. Downloads
-  passieren nur nach Lizenz-Zustimmung (neues Config-Feld
-  `model_download_consent`, Default aus). Die Erst-Start-UI dazu folgt.
+- Modell-Downloader: talker lädt Parakeet (sherpa-onnx-Release) und gemma
+  (ggml-org GGUF) beim Erst-Start selbst — SHA-256-verifiziert gegen gepinnte
+  Hashes, mit Fortschritt und Retry bei Fehler/Checksum-Mismatch. Downloads
+  starten erst nach Zustimmung zu beiden Modell-Lizenzen (einmalig im
+  Erst-Start-Fenster; Config-Feld `model_download_consent`, Default aus).
+  Parakeet lädt blockierend mit Fortschrittsbalken (PTT bleibt gesperrt, bei
+  Druck erscheint „talker richtet sich ein … X %"; Tray zeigt ein
+  durchgestrichenes Setup-Icon), gemma lädt im Hintergrund — die Nicht-Roh-Modi
+  sind bis dahin ausgegraut und schalten sich ohne Neustart frei. Neuer
+  Einstellungen-Bereich „Modelle" mit Status je Modell (installiert/lädt
+  X %/fehlt/beschädigt) und Neu-laden/Reparieren-Button.
 - Kontext-Awareness (opt-in, Default aus): talker wählt den Cleanup-Modus
   automatisch je fokussierter App (Regeln bundle-id → Modus in der Config,
   `context_aware_enabled` + `context_rules`); ohne Regel-Treffer gilt der

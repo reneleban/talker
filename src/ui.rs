@@ -17,6 +17,7 @@ use std::time::Instant;
 use crate::config::{Config, OverlayPosition};
 use crate::indicator::Indicator;
 use crate::login_item::{self, LoginItemStatus};
+use crate::models::{self, ModelId, ModelState, ModelsState};
 use crate::permissions;
 use crate::{audio, hotkey, injection};
 
@@ -47,6 +48,11 @@ pub struct SettingsApp {
     /// Laufende Apps für den Kontext-Regel-Picker; aktualisiert beim Öffnen
     /// des Fensters und beim Wechsel auf den Kontext-Tab.
     running_apps: Vec<injection::RunningApp>,
+    /// Geteilter Modell-Zustand (Ticket-0028/0029): Setup-Gate + Live-Status.
+    models_state: Arc<ModelsState>,
+    models_root: std::path::PathBuf,
+    /// Zuletzt ans Tray gemeldeter Setup-Zustand (nur Änderungen senden).
+    tray_setup: bool,
 }
 
 impl SettingsApp {
@@ -56,6 +62,8 @@ impl SettingsApp {
         quit_id: tray_icon::menu::MenuId,
         hide_on_start: bool,
         indicator: Arc<Mutex<Indicator>>,
+        models_state: Arc<ModelsState>,
+        models_root: std::path::PathBuf,
     ) -> Self {
         let (stt_dir_input, vocab_input) = config
             .read()
@@ -81,6 +89,9 @@ impl SettingsApp {
             indicator,
             preview_on: false,
             running_apps: injection::running_apps(),
+            models_state,
+            models_root,
+            tray_setup: false,
         }
     }
 
@@ -299,12 +310,22 @@ impl SettingsApp {
                 "Cleanup-Modus (gemma4:e2b)",
                 "Stil der Bereinigung: Roh = wortwörtlich ohne LLM · Geschäftlich = formal, ohne Füllsel · Natürlich = nur Korrekturen, dein Ton bleibt · LLM-optimiert = macht aus Diktat einen strukturierten Prompt für z.B. Claude Code.",
                 |ui| {
+                    // Nicht-Roh-Modi ausgegraut, bis gemma ready ist — die
+                    // Live-Aktivierung kommt über den geteilten ModelsState.
+                    let llm_ok = self.models_state.llm_modes_available();
                     egui::ComboBox::from_id_salt("cleanup_mode")
                         .selected_text(snapshot.cleanup_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in crate::cleanup::CleanupMode::ALL {
+                                let enabled = !mode.uses_llm() || llm_ok;
                                 if ui
-                                    .selectable_label(snapshot.cleanup_mode == mode, mode.label())
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::selectable(
+                                            snapshot.cleanup_mode == mode,
+                                            mode.label(),
+                                        ),
+                                    )
                                     .clicked()
                                 {
                                     self.update_config(|c| c.cleanup_mode = mode);
@@ -313,10 +334,46 @@ impl SettingsApp {
                         });
                 },
             );
+            if !self.models_state.llm_modes_available() {
+                ui.label(
+                    RichText::new(
+                        "Nicht-Roh-Modi werden aktiv, sobald das Cleanup-Modell \
+                         geladen ist (Status unter MODELLE).",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
         });
 
         Self::section_title(ui, "MODELLE");
         Self::card(ui, |ui| {
+            // Status je Modell + Neu laden/Reparieren (Ticket-0029, AK 4/5);
+            // gemma-Hintergrund-Fortschritt erscheint als Balken unter der Zeile.
+            for (id, label) in [
+                (ModelId::Parakeet, "Spracherkennung (Parakeet)"),
+                (ModelId::Gemma, "Cleanup-LLM (gemma4:e2b)"),
+            ] {
+                let state = self.models_state.get(id);
+                let (text, action) = model_status_line(&state);
+                Self::row(ui, label, "", |ui| {
+                    if let Some(button_label) = action
+                        && ui.button(button_label).clicked()
+                    {
+                        if snapshot.model_download_consent {
+                            models::start_download(&self.models_state, id, &self.models_root, true);
+                        } else {
+                            self.save_note =
+                                Some("Zuerst den Modell-Lizenzen zustimmen (Erst-Start).".into());
+                        }
+                    }
+                    ui.label(RichText::new(text).small());
+                });
+                if let Some(frac) = progress_fraction(&state) {
+                    ui.add(egui::ProgressBar::new(frac).show_percentage());
+                }
+                Self::hairline(ui);
+            }
             ui.label("STT-Modell-Verzeichnis");
             ui.text_edit_singleline(&mut self.stt_dir_input);
             // In horizontal einpacken — sonst expandiert right_to_left vertikal
@@ -723,6 +780,99 @@ impl SettingsApp {
         });
     }
 
+    /// Erst-Start-Setup (Ticket-0029): Lizenz-Consent → Parakeet-Fortschritt
+    /// (blockiert die Nutzung) → bei Fehler sichtbar + Retry.
+    fn setup_view(&mut self, ui: &mut egui::Ui, stage: SetupStage) {
+        Self::section_title(ui, "EINRICHTUNG");
+        Self::card(ui, |ui| match stage {
+            SetupStage::Consent => {
+                ui.label(
+                    "talker lädt beim ersten Start zwei Modelle — alles läuft \
+                     danach vollständig lokal auf diesem Mac:",
+                );
+                ui.add_space(4.0);
+                ui.label("• Spracherkennung: Parakeet TDT 0.6b v3 (~0,5 GB)");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Lizenz:").small().weak());
+                    ui.hyperlink_to(
+                        "CC-BY-4.0 (NVIDIA)",
+                        "https://creativecommons.org/licenses/by/4.0/",
+                    );
+                });
+                ui.label("• Cleanup-LLM: gemma4:e2b (~5 GB, lädt im Hintergrund)");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Lizenz:").small().weak());
+                    ui.hyperlink_to(
+                        "Google Gemma Terms of Use",
+                        "https://ai.google.dev/gemma/terms",
+                    );
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Mit „Akzeptieren\" stimmst du beiden Modell-Lizenzen zu \
+                         (inkl. Gemma Prohibited-Use-Policy); danach starten die \
+                         Downloads. Bis die Spracherkennung da ist, bleibt \
+                         Push-to-talk deaktiviert.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                if ui
+                    .button("Lizenzen akzeptieren und Modelle laden")
+                    .clicked()
+                {
+                    self.update_config(|c| c.model_download_consent = true);
+                    // consent-pending → missing, dann Downloads anstoßen.
+                    for id in [ModelId::Parakeet, ModelId::Gemma] {
+                        if self.models_state.get(id) == ModelState::ConsentPending {
+                            self.models_state.set(id, ModelState::Missing);
+                        }
+                    }
+                    models::start_needed_downloads(&self.models_state, &self.models_root, true);
+                }
+            }
+            SetupStage::Downloading => {
+                let state = self.models_state.get(ModelId::Parakeet);
+                ui.label(
+                    "Die Spracherkennung wird eingerichtet — danach ist talker \
+                     sofort nutzbar (Modus Roh).",
+                );
+                let (text, _) = model_status_line(&state);
+                ui.label(RichText::new(text).small().weak());
+                ui.add(
+                    egui::ProgressBar::new(progress_fraction(&state).unwrap_or(0.0))
+                        .show_percentage(),
+                );
+                ui.label(
+                    RichText::new(
+                        "gemma (Cleanup) lädt im Hintergrund weiter — Status \
+                         unter MODELLE in den Einstellungen.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+            SetupStage::Failed(msg) => {
+                ui.label(
+                    RichText::new("Modell-Download fehlgeschlagen")
+                        .color(Color32::from_rgb(255, 69, 58)),
+                );
+                ui.label(RichText::new(msg).small());
+                if ui.button("Erneut versuchen").clicked() {
+                    models::start_download(
+                        &self.models_state,
+                        ModelId::Parakeet,
+                        &self.models_root,
+                        true,
+                    );
+                }
+            }
+            SetupStage::Done => {}
+        });
+    }
+
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (tab, label) in [
@@ -804,6 +954,14 @@ impl eframe::App for SettingsApp {
             crate::tray::with_instance(|t| t.sync_mode(mode));
         }
 
+        // Tray-Setup-Icon (Ticket-0029): durchgestrichen, solange die
+        // Spracherkennung fehlt — nur bei Zustands-Wechsel neu setzen.
+        let setup_active = !self.models_state.stt_ready();
+        if setup_active != self.tray_setup {
+            self.tray_setup = setup_active;
+            crate::tray::with_instance(|t| t.set_setup(setup_active));
+        }
+
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 
@@ -811,6 +969,25 @@ impl eframe::App for SettingsApp {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
+                // Setup-Gate (Ticket-0029): bis Parakeet ready ist, ersetzt das
+                // Erst-Start-Setup die Tabs — Consent, Fortschritt, Fehler.
+                let consent = self
+                    .config
+                    .read()
+                    .map(|c| c.model_download_consent)
+                    .unwrap_or(false);
+                let stage = setup_stage(consent, &self.models_state.get(ModelId::Parakeet));
+                if stage != SetupStage::Done {
+                    ui.heading("talker — Einrichtung");
+                    self.permissions_section(ui);
+                    self.setup_view(ui, stage);
+                    if let Some(note) = &self.save_note {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(note.clone()).small().weak());
+                    }
+                    ui.add_space(8.0);
+                    return;
+                }
                 ui.horizontal(|ui| {
                     ui.heading("talker");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -829,6 +1006,75 @@ impl eframe::App for SettingsApp {
                 ui.add_space(8.0);
             });
         });
+    }
+}
+
+/// Setup-Phase des Erst-Start-Fensters (Ticket-0029). Reine Logik, egui-frei:
+/// Consent-Gate vor allem anderen, dann blockiert Parakeet bis `ready`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetupStage {
+    /// Lizenzen noch nicht akzeptiert — kein Download.
+    Consent,
+    /// Parakeet lädt/prüft; App-Nutzung bleibt gesperrt.
+    Downloading,
+    /// Parakeet-Download gescheitert — Fehler zeigen + Retry.
+    Failed(String),
+    /// Parakeet ready — Setup vorbei, normale Einstellungen.
+    Done,
+}
+
+pub(crate) fn setup_stage(consent: bool, parakeet: &ModelState) -> SetupStage {
+    if *parakeet == ModelState::Ready {
+        return SetupStage::Done;
+    }
+    if !consent {
+        return SetupStage::Consent;
+    }
+    match parakeet {
+        ModelState::Corrupt => {
+            SetupStage::Failed("Checksum-Prüfung fehlgeschlagen — die Datei war beschädigt.".into())
+        }
+        ModelState::Error(e) => SetupStage::Failed(e.clone()),
+        _ => SetupStage::Downloading,
+    }
+}
+
+/// Statuszeile eines Modells im „Modelle"-Bereich: (Text, Aktions-Button?).
+/// Button-Beschriftung: „Neu laden" (fehlt) bzw. „Reparieren" (kaputt/Fehler).
+pub(crate) fn model_status_line(state: &ModelState) -> (String, Option<&'static str>) {
+    match state {
+        ModelState::Ready => ("installiert ✓".into(), None),
+        ModelState::Missing => ("fehlt".into(), Some("Neu laden")),
+        ModelState::ConsentPending => ("wartet auf Lizenz-Zustimmung".into(), None),
+        ModelState::Downloading { pct } => (format!("lädt … {pct} %"), None),
+        ModelState::Verifying => ("wird geprüft …".into(), None),
+        ModelState::Corrupt => ("beschädigt (Checksum)".into(), Some("Reparieren")),
+        ModelState::Error(e) => (format!("Fehler: {e}"), Some("Reparieren")),
+    }
+}
+
+/// Fortschritts-Anteil (0–1) fürs Balken-UI eines Modells; None = kein Balken.
+pub(crate) fn progress_fraction(state: &ModelState) -> Option<f32> {
+    match state {
+        ModelState::Downloading { pct } => Some(f32::from(*pct) / 100.0),
+        ModelState::Verifying => Some(1.0),
+        _ => None,
+    }
+}
+
+/// Hinweistext bei PTT-Druck, solange Parakeet nicht ready (AK 3).
+/// None = PTT frei.
+pub fn setup_hint(parakeet: &ModelState) -> Option<String> {
+    match parakeet {
+        ModelState::Ready => None,
+        ModelState::Downloading { pct } => Some(format!("talker richtet sich ein … {pct} %")),
+        ModelState::Verifying => Some("talker richtet sich ein … Modell wird geprüft".into()),
+        ModelState::ConsentPending | ModelState::Missing => {
+            Some("Einrichtung nötig — Einstellungen öffnen".into())
+        }
+        ModelState::Corrupt | ModelState::Error(_) => {
+            Some("Modell-Download fehlgeschlagen — Einstellungen öffnen".into())
+        }
     }
 }
 
@@ -889,6 +1135,121 @@ mod tests {
             ("com.apple.Terminal".to_string(), CleanupMode::Raw)
         );
         assert_eq!(rules[1].0, "com.apple.mail", "Reihenfolge bleibt");
+    }
+
+    /// Consent-Gate (Ticket-0029, DoD): vor Accept nie Downloading — egal
+    /// welcher Modell-Zustand; nach Accept blockiert Parakeet bis ready.
+    #[test]
+    fn setup_stage_gates_consent_before_any_download() {
+        for state in [
+            ModelState::Missing,
+            ModelState::ConsentPending,
+            ModelState::Corrupt,
+            ModelState::Error("x".into()),
+        ] {
+            assert_eq!(setup_stage(false, &state), SetupStage::Consent, "{state:?}");
+        }
+        // Modell schon da (z.B. manuell installiert) → kein Consent nötig.
+        assert_eq!(setup_stage(false, &ModelState::Ready), SetupStage::Done);
+        assert_eq!(setup_stage(true, &ModelState::Ready), SetupStage::Done);
+    }
+
+    #[test]
+    fn setup_stage_after_consent_downloads_and_surfaces_failures() {
+        for state in [
+            ModelState::Missing,
+            ModelState::Downloading { pct: 42 },
+            ModelState::Verifying,
+        ] {
+            assert_eq!(
+                setup_stage(true, &state),
+                SetupStage::Downloading,
+                "{state:?}"
+            );
+        }
+        assert!(matches!(
+            setup_stage(true, &ModelState::Corrupt),
+            SetupStage::Failed(_)
+        ));
+        let SetupStage::Failed(msg) = setup_stage(true, &ModelState::Error("Netz weg".into()))
+        else {
+            panic!("Error muss Failed ergeben");
+        };
+        assert_eq!(msg, "Netz weg");
+    }
+
+    /// Status→Darstellung-Mapping (Ticket-0029, DoD) — egui-frei.
+    #[test]
+    fn model_status_line_maps_every_state() {
+        let cases: [(ModelState, &str, Option<&str>); 7] = [
+            (ModelState::Ready, "installiert ✓", None),
+            (ModelState::Missing, "fehlt", Some("Neu laden")),
+            (
+                ModelState::ConsentPending,
+                "wartet auf Lizenz-Zustimmung",
+                None,
+            ),
+            (ModelState::Downloading { pct: 7 }, "lädt … 7 %", None),
+            (ModelState::Verifying, "wird geprüft …", None),
+            (
+                ModelState::Corrupt,
+                "beschädigt (Checksum)",
+                Some("Reparieren"),
+            ),
+            (
+                ModelState::Error("Netz weg".into()),
+                "Fehler: Netz weg",
+                Some("Reparieren"),
+            ),
+        ];
+        for (state, expected_text, expected_action) in cases {
+            let (text, action) = model_status_line(&state);
+            assert_eq!(text, expected_text, "{state:?}");
+            assert_eq!(action, expected_action, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn progress_fraction_only_for_running_downloads() {
+        assert_eq!(
+            progress_fraction(&ModelState::Downloading { pct: 50 }),
+            Some(0.5)
+        );
+        assert_eq!(
+            progress_fraction(&ModelState::Downloading { pct: 0 }),
+            Some(0.0)
+        );
+        assert_eq!(progress_fraction(&ModelState::Verifying), Some(1.0));
+        assert_eq!(progress_fraction(&ModelState::Ready), None);
+        assert_eq!(progress_fraction(&ModelState::Missing), None);
+    }
+
+    /// PTT-Hinweis (AK 3): „richtet sich ein … X %" während des Downloads,
+    /// None sobald Parakeet ready.
+    #[test]
+    fn setup_hint_reports_progress_and_clears_when_ready() {
+        assert_eq!(setup_hint(&ModelState::Ready), None);
+        assert_eq!(
+            setup_hint(&ModelState::Downloading { pct: 42 }).unwrap(),
+            "talker richtet sich ein … 42 %"
+        );
+        assert!(
+            setup_hint(&ModelState::Verifying)
+                .unwrap()
+                .contains("geprüft")
+        );
+        for state in [ModelState::ConsentPending, ModelState::Missing] {
+            assert!(
+                setup_hint(&state).unwrap().contains("Einstellungen"),
+                "{state:?}"
+            );
+        }
+        for state in [ModelState::Corrupt, ModelState::Error("x".into())] {
+            assert!(
+                setup_hint(&state).unwrap().contains("fehlgeschlagen"),
+                "{state:?}"
+            );
+        }
     }
 
     /// Regel-Add/Remove + Toggle persistieren durch die Config (AK-Test 0027).

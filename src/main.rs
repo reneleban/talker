@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use talker::indicator::Indicator;
 use talker::{
-    audio, cleanup, clipboard, config, hotkey, injection, overlay, permissions, pipeline, stt,
-    tray, ui,
+    audio, cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline,
+    stt, tray, ui,
 };
 
 thread_local! {
@@ -51,6 +51,7 @@ fn spawn_stt_worker(
     config: Arc<RwLock<config::Config>>,
     indicator: Arc<Mutex<Indicator>>,
     egui_ctx: eframe::egui::Context,
+    models_state: Arc<models::ModelsState>,
 ) -> mpsc::Sender<(Vec<f32>, Option<String>)> {
     // Ergebnis der Pipeline ans Overlay melden (+ Repaint anstoßen).
     let report = move |f: &dyn Fn(&mut Indicator)| {
@@ -87,12 +88,22 @@ fn spawn_stt_worker(
         // erneut umgelegt wird. Späteres Aktivieren lädt lazy in der Loop.
         let mut cleaner: Option<cleanup::GemmaCleaner> = None;
         let mut cleaner_failed = false;
-        if snapshot(&config).is_some_and(|c| pipeline::config_wants_llm(&c)) {
+        // Vorladen nur, wenn das gemma-Modell laut Downloader-State auch da
+        // ist — beim Erst-Start (Download läuft noch) wäre es nur ein Fehler.
+        let mut llm_was_available = models_state.llm_modes_available();
+        if llm_was_available && snapshot(&config).is_some_and(|c| pipeline::config_wants_llm(&c)) {
             (cleaner, cleaner_failed) = try_load_cleaner();
         }
         report(&|ind| ind.ready(Instant::now()));
 
         for (pcm, frontmost) in rx {
+            // Live-Aktivierung (Ticket-0029): wird gemma nachträglich ready,
+            // den Fehler-Cache löschen — der nächste LLM-Bedarf lädt dann.
+            let llm_available = models_state.llm_modes_available();
+            if llm_available && !llm_was_available {
+                cleaner_failed = false;
+            }
+            llm_was_available = llm_available;
             let Some(cfg) = snapshot(&config) else {
                 // Poisoned Config-Lock: nicht still verwerfen (CLAUDE.md).
                 eprintln!("talker: Config-Lock poisoned — Utterance verworfen.");
@@ -199,10 +210,23 @@ fn spawn_stt_worker(
 fn main() -> ExitCode {
     let config = Arc::new(RwLock::new(config::Config::load()));
 
-    // First-Run-Onboarding: fehlt eine Permission, startet das Fenster sichtbar.
+    // Modell-Setup (Ticket-0028/0029): Zustand per Präsenz-Check (der volle
+    // Checksum-Check läuft im Hintergrund nach), unfertige Downloads bei
+    // vorhandenem Consent direkt wieder anstoßen.
+    let models_root = models::default_models_root();
+    let consent = config
+        .read()
+        .map(|c| c.model_download_consent)
+        .unwrap_or(false);
+    let models_state = Arc::new(models::ModelsState::from_disk_quick(&models_root, consent));
+    models::spawn_integrity_check(Arc::clone(&models_state), models_root.clone());
+    models::start_needed_downloads(&models_state, &models_root, consent);
+
+    // First-Run-Onboarding: fehlt eine Permission oder die Spracherkennung
+    // (Setup/Consent), startet das Fenster sichtbar.
     let accessibility = permissions::ensure_accessibility();
     let mic_denied = permissions::microphone_status() == permissions::MicPermission::Denied;
-    let show_onboarding = !accessibility || mic_denied;
+    let show_onboarding = !accessibility || mic_denied || !models_state.stt_ready();
 
     let native_options = eframe::NativeOptions {
         // glow statt wgpu: wgpu kann auf macOS keine Fenster-Transparenz
@@ -266,6 +290,7 @@ fn main() -> ExitCode {
                 Arc::clone(&config),
                 Arc::clone(&indicator),
                 egui_ctx.clone(),
+                Arc::clone(&models_state),
             );
 
             // Tap-Installation als wiederholbare Factory: scheitert sie (z.B.
@@ -276,6 +301,7 @@ fn main() -> ExitCode {
                 let indicator = Arc::clone(&indicator);
                 let egui_ctx = egui_ctx.clone();
                 let stt_tx = stt_tx.clone();
+                let models_state = Arc::clone(&models_state);
                 move || {
                     let mic_config = Arc::clone(&config);
                     let ind_press = Arc::clone(&indicator);
@@ -283,9 +309,22 @@ fn main() -> ExitCode {
                     let ctx_press = egui_ctx.clone();
                     let ctx_release = egui_ctx.clone();
                     let stt_tx = stt_tx.clone();
+                    let models_press = Arc::clone(&models_state);
                     hotkey::install(
                         Arc::clone(&config),
                         move || {
+                            // PTT gesperrt bis Parakeet ready (Ticket-0029):
+                            // kurzer Hinweis mit Fortschritt statt Aufnahme.
+                            if let Some(hint) =
+                                ui::setup_hint(&models_press.get(models::ModelId::Parakeet))
+                            {
+                                eprintln!("talker: PTT gesperrt — {hint}");
+                                if let Ok(mut ind) = ind_press.lock() {
+                                    ind.fail(Instant::now(), hint);
+                                }
+                                ctx_press.request_repaint();
+                                return;
+                            }
                             // Frontmost-App beim Utterance-START erfassen (Ticket-0026):
                             // stabil, auch wenn während der Aufnahme die App wechselt.
                             let frontmost = injection::frontmost_bundle_id();
@@ -392,6 +431,8 @@ fn main() -> ExitCode {
                 tray.quit_id.clone(),
                 !show_onboarding,
                 Arc::clone(&indicator),
+                Arc::clone(&models_state),
+                models_root.clone(),
             )))
         }),
     );
