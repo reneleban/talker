@@ -1,0 +1,43 @@
+name: CI
+
+# Läuft auf GitHub-hosted macOS-Runnern (auf public Repos kostenlos).
+# Bewusste Ausnahme von der sonstigen "self-hosted Docker"-Konvention:
+# macOS ist nicht in Docker/Linux virtualisierbar (Apple-Lizenz), und der
+# Build braucht native macOS-APIs (CoreAudio, AppKit, CGEventTap) + Toolchain.
+# Modell-Integrationstests (tests/cleanup_gemma.rs, tests/stt_parakeet.rs) laufen
+# hier NICHT — sie brauchen mehrere GB lokale Modelle. Gate = verify:fast.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (aus rust-toolchain.toml)
+        run: rustc --version && cargo --version
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --all-targets --locked
+      - name: Unit-Tests (ohne Modell-Integrationstests)
+        run: cargo test --lib --locked
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
