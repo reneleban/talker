@@ -14,7 +14,7 @@ use tray_icon::menu::MenuEvent;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::config::{Config, OverlayPosition};
+use crate::config::{self, Config, OverlayPosition};
 use crate::indicator::Indicator;
 use crate::login_item::{self, LoginItemStatus};
 use crate::models::{self, ModelId, ModelState, ModelsState};
@@ -677,7 +677,8 @@ impl SettingsApp {
                 "Breite des Indikators in Prozent der Bildschirmbreite.",
                 |ui| {
                     let mut pct = snapshot.overlay_width_pct;
-                    let slider = egui::Slider::new(&mut pct, 15..=80).suffix(" %");
+                    let slider =
+                        egui::Slider::new(&mut pct, config::overlay_limits::WIDTH_PCT).suffix(" %");
                     if ui.add(slider).changed() {
                         self.update_config(|c| c.overlay_width_pct = pct);
                     }
@@ -695,7 +696,7 @@ impl SettingsApp {
                 |ui| {
                     let mut v = snapshot.overlay_gain;
                     if ui
-                        .add(egui::Slider::new(&mut v, 2.0..=30.0).step_by(0.5))
+                        .add(egui::Slider::new(&mut v, config::overlay_limits::GAIN).step_by(0.5))
                         .changed()
                     {
                         self.update_config(|c| c.overlay_gain = v);
@@ -710,7 +711,7 @@ impl SettingsApp {
                 |ui| {
                     let mut v = snapshot.overlay_speed;
                     if ui
-                        .add(egui::Slider::new(&mut v, 0.25..=3.0).step_by(0.05))
+                        .add(egui::Slider::new(&mut v, config::overlay_limits::SPEED).step_by(0.05))
                         .changed()
                     {
                         self.update_config(|c| c.overlay_speed = v);
@@ -724,7 +725,10 @@ impl SettingsApp {
                 "Anzahl der Nachbilder, die jede Welle hinter sich herzieht.",
                 |ui| {
                     let mut v = snapshot.overlay_trail_len;
-                    if ui.add(egui::Slider::new(&mut v, 1..=12)).changed() {
+                    if ui
+                        .add(egui::Slider::new(&mut v, config::overlay_limits::TRAIL_LEN))
+                        .changed()
+                    {
                         self.update_config(|c| c.overlay_trail_len = v);
                     }
                 },
@@ -738,7 +742,10 @@ impl SettingsApp {
                 |ui| {
                     let mut v = snapshot.overlay_trail_decay;
                     if ui
-                        .add(egui::Slider::new(&mut v, 0.2..=0.9).step_by(0.01))
+                        .add(
+                            egui::Slider::new(&mut v, config::overlay_limits::TRAIL_DECAY)
+                                .step_by(0.01),
+                        )
                         .changed()
                     {
                         self.update_config(|c| c.overlay_trail_decay = v);
@@ -952,6 +959,15 @@ impl eframe::App for SettingsApp {
         if let Ok(cfg) = self.config.read() {
             let mode = cfg.cleanup_mode;
             crate::tray::with_instance(|t| t.sync_mode(mode));
+        }
+
+        // Tray spiegelt den Aufnahme-Status aus der Indicator-Phase (Ticket-0035)
+        // — nach sync_mode, damit ein Modus-Wechsel während der Aufnahme das
+        // rote Icon nicht überschreibt. Idempotent, Besitzer ist der Indicator.
+        if let Ok(ind) = self.indicator.lock() {
+            let phase = ind.phase().clone();
+            drop(ind);
+            crate::tray::with_instance(|t| t.sync_recording(&phase));
         }
 
         // Tray-Setup-Icon (Ticket-0029): durchgestrichen, solange die

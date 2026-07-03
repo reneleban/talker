@@ -34,8 +34,9 @@ const WAVE_POINTS: usize = 72;
 /// NSStatusWindowLevel — über normalen Fenstern und Vollbild-Overlays.
 const WINDOW_LEVEL: isize = 25;
 /// Maximale Leuchtspur-Länge — Layer werden einmalig angelegt, die konfigurierte
-/// Länge (config.overlay_trail_len) blendet nur ein/aus.
-const MAX_TRAIL: usize = 12;
+/// Länge (config.overlay_trail_len) blendet nur ein/aus. Obergrenze kommt aus
+/// dem geteilten Wertebereichs-Vertrag (Ticket-0035).
+const MAX_TRAIL: usize = crate::config::overlay_limits::TRAIL_LEN_MAX;
 /// Anzahl Wellen-Linien (== WAVE_LAYERS.len(), Farben aus der Config).
 const N_RIBBONS: usize = 4;
 
@@ -201,13 +202,18 @@ impl Overlay {
     /// Ein Animations-Frame: Zustand lesen, Fenster + Layer nachziehen.
     /// Läuft per Timer auf dem Main-Thread (~60 fps); bei Hidden ein No-op.
     pub fn tick(&self, indicator: &Arc<Mutex<Indicator>>, config: &Arc<RwLock<Config>>) {
-        // Optik-Parameter live aus der Config (Vorschau: Regler wirken sofort).
+        // Optik-Parameter live aus der Config (Vorschau: Regler wirken sofort);
+        // Wertebereiche = geteilter Vertrag mit den ui-Slidern (Ticket-0035).
+        use crate::config::overlay_limits as limits;
         let cfg_snapshot = config.read().map(|c| c.clone()).unwrap_or_default();
-        let gain = cfg_snapshot.overlay_gain.clamp(2.0, 30.0);
-        let speed = cfg_snapshot.overlay_speed.clamp(0.25, 3.0);
+        let gain = limits::clamp(cfg_snapshot.overlay_gain, &limits::GAIN);
+        let speed = limits::clamp(cfg_snapshot.overlay_speed, &limits::SPEED);
         let style = Style {
-            trail_len: usize::from(cfg_snapshot.overlay_trail_len).clamp(1, MAX_TRAIL),
-            decay: cfg_snapshot.overlay_trail_decay.clamp(0.2, 0.9),
+            trail_len: usize::from(limits::clamp(
+                cfg_snapshot.overlay_trail_len,
+                &limits::TRAIL_LEN,
+            )),
+            decay: limits::clamp(cfg_snapshot.overlay_trail_decay, &limits::TRAIL_DECAY),
             colors: cfg_snapshot.overlay_colors.clone(),
         };
         let (position, pct) = (
@@ -243,7 +249,7 @@ impl Overlay {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         match &phase {
-            Phase::Recording => {
+            Phase::Recording { .. } => {
                 let t = self.started.elapsed().as_secs_f32() * speed;
                 self.render_waves(level, t, style.trail_len);
             }
@@ -346,7 +352,11 @@ impl Overlay {
             return;
         };
         let vf = screen.visibleFrame();
-        let width = (vf.size.width * f64::from(width_pct.clamp(15, 80)) / 100.0).max(160.0);
+        let width = {
+            use crate::config::overlay_limits as limits;
+            let pct = limits::clamp(width_pct, &limits::WIDTH_PCT);
+            (vf.size.width * f64::from(pct) / 100.0).max(160.0)
+        };
         if (width - self.width.get()).abs() > 0.5 {
             self.layout(width);
         }

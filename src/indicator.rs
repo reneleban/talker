@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 use crate::audio::LevelHandle;
+use crate::cleanup::CleanupMode;
 
 /// Wie lange done/error sichtbar bleiben, bevor das Overlay verschwindet.
 const DONE_SHOW: Duration = Duration::from_millis(700);
@@ -21,7 +22,12 @@ pub enum Phase {
     Ready,
     /// Live-Vorschau aus den Einstellungen (synthetischer Pegel, kein Mikro).
     Preview,
-    Recording,
+    /// Aufnahme läuft; trägt den für diese Utterance AUFGELÖSTEN Cleanup-Modus
+    /// (Kontext-Awareness, Ticket-0026) — der Indicator ist der einzige
+    /// Besitzer des Aufnahme-Status, das Tray leitet sein Icon daraus ab.
+    Recording {
+        mode: CleanupMode,
+    },
     Transcribing,
     Done,
     Error(String),
@@ -70,8 +76,8 @@ impl Indicator {
         }
     }
 
-    pub fn start_recording(&mut self, now: Instant, level: LevelHandle) {
-        self.phase = Phase::Recording;
+    pub fn start_recording(&mut self, now: Instant, level: LevelHandle, mode: CleanupMode) {
+        self.phase = Phase::Recording { mode };
         self.phase_since = now;
         self.level = Some(level);
         self.smoothed_level = 0.0;
@@ -176,8 +182,13 @@ mod tests {
         let mut ind = Indicator::default();
         assert!(!ind.visible());
 
-        ind.start_recording(t0, LevelHandle::default());
-        assert_eq!(*ind.phase(), Phase::Recording);
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
+        assert_eq!(
+            *ind.phase(),
+            Phase::Recording {
+                mode: CleanupMode::Raw
+            }
+        );
         assert!(ind.visible());
 
         ind.transcribing(t0);
@@ -196,7 +207,7 @@ mod tests {
     fn error_is_shown_longer_than_done() {
         let t0 = now();
         let mut ind = Indicator::default();
-        ind.start_recording(t0, LevelHandle::default());
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
         ind.transcribing(t0);
         ind.fail(t0, "STT fehlgeschlagen");
         assert_eq!(*ind.phase(), Phase::Error("STT fehlgeschlagen".into()));
@@ -228,11 +239,10 @@ mod tests {
     fn ready_is_ignored_outside_loading() {
         let t0 = now();
         let mut ind = Indicator::default();
-        ind.start_recording(t0, LevelHandle::default());
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
         ind.ready(t0);
-        assert_eq!(
-            *ind.phase(),
-            Phase::Recording,
+        assert!(
+            matches!(ind.phase(), Phase::Recording { .. }),
             "ready darf Recording nicht stören"
         );
     }
@@ -242,8 +252,13 @@ mod tests {
         let t0 = now();
         let mut ind = Indicator::default();
         ind.loading(t0);
-        ind.start_recording(t0, LevelHandle::default());
-        assert_eq!(*ind.phase(), Phase::Recording);
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
+        assert_eq!(
+            *ind.phase(),
+            Phase::Recording {
+                mode: CleanupMode::Raw
+            }
+        );
     }
 
     #[test]
@@ -258,12 +273,12 @@ mod tests {
         assert_eq!(*ind.phase(), Phase::Preview, "Preview hat kein Timeout");
 
         // Echtes Diktat übernimmt; Preview-Aus beendet Recording NICHT.
-        ind.start_recording(t0, LevelHandle::default());
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
         ind.set_preview(false, t0);
-        assert_eq!(*ind.phase(), Phase::Recording);
+        assert!(matches!(ind.phase(), Phase::Recording { .. }));
         // Preview-An während Recording wird ignoriert.
         ind.set_preview(true, t0);
-        assert_eq!(*ind.phase(), Phase::Recording);
+        assert!(matches!(ind.phase(), Phase::Recording { .. }));
 
         ind.cancel();
         ind.set_preview(true, t0);
@@ -276,7 +291,7 @@ mod tests {
     fn cancel_hides_immediately_from_any_phase() {
         let t0 = now();
         let mut ind = Indicator::default();
-        ind.start_recording(t0, LevelHandle::default());
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
         ind.cancel();
         assert!(!ind.visible());
     }
@@ -285,16 +300,21 @@ mod tests {
     fn tick_does_nothing_while_recording_or_transcribing() {
         let t0 = now();
         let mut ind = Indicator::default();
-        ind.start_recording(t0, LevelHandle::default());
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
         ind.tick(t0 + Duration::from_secs(60));
-        assert_eq!(*ind.phase(), Phase::Recording);
+        assert_eq!(
+            *ind.phase(),
+            Phase::Recording {
+                mode: CleanupMode::Raw
+            }
+        );
     }
 
     #[test]
     fn smoothed_level_rises_fast_and_decays_slow() {
         let mut ind = Indicator::default();
         let h = LevelHandle::default();
-        ind.start_recording(now(), h.clone());
+        ind.start_recording(now(), h.clone(), CleanupMode::Raw);
 
         h.set(0.2); // lautes Sprechen
         let mut rising = Vec::new();

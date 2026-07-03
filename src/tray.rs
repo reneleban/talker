@@ -13,6 +13,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::cleanup::CleanupMode;
 use crate::error::{Result, TalkerError};
+use crate::indicator::Phase;
 
 pub struct Tray {
     icon: TrayIcon,
@@ -24,6 +25,9 @@ pub struct Tray {
     /// Setup läuft (Modell-Download, Ticket-0029): idle zeigt dann das
     /// durchgestrichene Mikrofon, bis das Setup fertig ist.
     setup: Cell<bool>,
+    /// Aus der Indicator-Phase abgeleiteter Aufnahme-Zustand (Ticket-0035) —
+    /// nur Cache für Idempotenz, Besitzer ist der Indicator.
+    recording: Cell<Option<CleanupMode>>,
 }
 
 impl Tray {
@@ -64,6 +68,7 @@ impl Tray {
             mode_items,
             mode: Cell::new(initial_mode),
             setup: Cell::new(false),
+            recording: Cell::new(None),
         })
     }
 
@@ -97,7 +102,31 @@ impl Tray {
         self.set_idle();
     }
 
-    pub fn set_idle(&self) {
+    /// Aufnahme-Status aus der Indicator-Phase ableiten (Ticket-0035) —
+    /// idempotent, damit die UI das pro Frame aufrufen kann. Der Indicator ist
+    /// der einzige Besitzer des Zustands; das Badge zeigt während der Aufnahme
+    /// den für diese Utterance AUFGELÖSTEN Modus (Kontext-Awareness, Ticket-0026).
+    pub fn sync_recording(&self, phase: &Phase) {
+        let recording = recording_mode(phase);
+        if self.recording.get() == recording {
+            return;
+        }
+        self.recording.set(recording);
+        match recording {
+            Some(resolved_mode) => {
+                if let Err(e) = self
+                    .icon
+                    .set_icon(Some(mic_icon(MicStyle::Recording, Some(resolved_mode))))
+                {
+                    eprintln!("talker: Tray-Icon (aufnehmend) nicht setzbar: {e}");
+                }
+                self.icon.set_icon_as_template(false); // bewusst rot, soll auffallen
+            }
+            None => self.set_idle(),
+        }
+    }
+
+    fn set_idle(&self) {
         let (style, badge) = if self.setup.get() {
             (MicStyle::Setup, None)
         } else {
@@ -109,23 +138,25 @@ impl Tray {
         self.icon.set_icon_as_template(true);
     }
 
-    /// Aufnahme läuft: Badge zeigt den für diese Utterance AUFGELÖSTEN Modus
-    /// (Kontext-Awareness, Ticket-0026) — kann vom Fallback-Modus abweichen.
-    pub fn set_active(&self, resolved_mode: CleanupMode) {
-        if let Err(e) = self
-            .icon
-            .set_icon(Some(mic_icon(MicStyle::Recording, Some(resolved_mode))))
-        {
-            eprintln!("talker: Tray-Icon (aufnehmend) nicht setzbar: {e}");
-        }
-        self.icon.set_icon_as_template(false); // bewusst rot, soll auffallen
-    }
-
     pub fn set_permission_warning(&self) {
         if let Err(e) = self.icon.set_icon(Some(mic_icon(MicStyle::Warning, None))) {
             eprintln!("talker: Tray-Icon (Warnung) nicht setzbar: {e}");
         }
         self.icon.set_icon_as_template(true);
+    }
+
+    /// Warnung aufheben (z.B. Event-Tap nachträglich installiert) → idle.
+    pub fn clear_permission_warning(&self) {
+        self.set_idle();
+    }
+}
+
+/// Reine Ableitung MicStyle-Quelle: nur `Phase::Recording` färbt das Tray —
+/// Preview (Einstellungen) und alle Verarbeitungs-Phasen bleiben idle.
+fn recording_mode(phase: &Phase) -> Option<CleanupMode> {
+    match phase {
+        Phase::Recording { mode } => Some(*mode),
+        _ => None,
     }
 }
 
@@ -310,6 +341,27 @@ mod tests {
             );
         }
         assert!(badge_bitmap('X').is_none());
+    }
+
+    /// AK1 (Ticket-0035): vollständiges Phase→Aufnahme-Mapping — genau
+    /// `Phase::Recording` färbt das Tray, mit dem aufgelösten Modus als Badge;
+    /// alle anderen Phasen (inkl. Preview) sind idle.
+    #[test]
+    fn recording_derives_only_from_the_recording_phase() {
+        for mode in CleanupMode::ALL {
+            assert_eq!(recording_mode(&Phase::Recording { mode }), Some(mode));
+        }
+        for phase in [
+            Phase::Hidden,
+            Phase::Loading,
+            Phase::Ready,
+            Phase::Preview,
+            Phase::Transcribing,
+            Phase::Done,
+            Phase::Error("kaputt".into()),
+        ] {
+            assert_eq!(recording_mode(&phase), None, "{phase:?}");
+        }
     }
 
     #[test]

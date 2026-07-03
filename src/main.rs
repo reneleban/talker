@@ -265,12 +265,14 @@ fn main() -> ExitCode {
                             let device = mic_config.read().ok().and_then(|c| c.mic_device.clone());
                             match audio::start(device.as_deref()) {
                                 Ok(rec) => {
+                                    // Der Indicator besitzt den Aufnahme-Status
+                                    // (inkl. aufgelöstem Modus); das Tray leitet
+                                    // sein Icon daraus ab (Ticket-0035).
                                     if let Ok(mut ind) = ind_press.lock() {
-                                        ind.start_recording(Instant::now(), rec.level());
+                                        ind.start_recording(Instant::now(), rec.level(), resolved);
                                     }
                                     ctx_press.request_repaint();
                                     RECORDING.with(|r| *r.borrow_mut() = Some(rec));
-                                    tray::with_instance(|t| t.set_active(resolved));
                                 }
                                 Err(e) => {
                                     eprintln!("talker: {e}");
@@ -279,7 +281,6 @@ fn main() -> ExitCode {
                             }
                         },
                         move || {
-                            tray::with_instance(|t| t.set_idle());
                             let frontmost = FRONTMOST.with(|f| f.borrow_mut().take());
                             let Some(rec) = RECORDING.with(|r| r.borrow_mut().take()) else {
                                 return; // Aufnahme kam nie zustande (z.B. Permission fehlte)
@@ -343,7 +344,7 @@ fn main() -> ExitCode {
                     let block = block2::RcBlock::new(move |timer: std::ptr::NonNull<NSTimer>| {
                         if let Ok(tap) = install_tap() {
                             std::mem::forget(tap);
-                            tray::with_instance(|t| t.set_idle());
+                            tray::with_instance(|t| t.clear_permission_warning());
                             eprintln!("talker: Event-Tap nachträglich installiert — bereit.");
                             unsafe { timer.as_ref().invalidate() };
                         } else if permissions::should_relaunch_for_tap(

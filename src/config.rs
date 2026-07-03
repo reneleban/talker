@@ -65,6 +65,34 @@ pub const DEFAULT_OVERLAY_COLORS: [[u8; 3]; 4] = [
     [158, 102, 255],
 ];
 
+/// Gültige Wertebereiche der Overlay-Optik-Felder — die EINE Quelle für die
+/// Slider in `ui.rs` und die Clamps in `overlay.rs` (Ticket-0035). Werte
+/// außerhalb (z.B. von Hand editierte TOML) werden beim Rendern geclampt,
+/// nicht abgelehnt.
+pub mod overlay_limits {
+    use std::ops::RangeInclusive;
+
+    pub const WIDTH_PCT: RangeInclusive<u8> = 15..=80;
+    pub const GAIN: RangeInclusive<f32> = 2.0..=30.0;
+    pub const SPEED: RangeInclusive<f32> = 0.25..=3.0;
+    pub const TRAIL_LEN: RangeInclusive<u8> = 1..=12;
+    pub const TRAIL_DECAY: RangeInclusive<f32> = 0.2..=0.9;
+
+    /// Spur-Obergrenze als usize — dimensioniert die Layer-Pools des Overlays.
+    pub const TRAIL_LEN_MAX: usize = *TRAIL_LEN.end() as usize;
+
+    /// Clamp auf einen der Bereiche oben.
+    pub fn clamp<T: PartialOrd + Copy>(value: T, range: &RangeInclusive<T>) -> T {
+        if value < *range.start() {
+            *range.start()
+        } else if value > *range.end() {
+            *range.end()
+        } else {
+            value
+        }
+    }
+}
+
 /// Roh-Form fürs Laden: kennt zusätzlich das Legacy-Feld `cleanup_enabled`
 /// (bool, bis Ticket-0010) und migriert es beim Einlesen.
 #[derive(Deserialize)]
@@ -236,6 +264,25 @@ mod tests {
                 .to_string_lossy()
                 .contains("talker/models")
         );
+    }
+
+    /// AK2 (Ticket-0035): die Overlay-Defaults liegen im geteilten
+    /// Wertebereichs-Vertrag, den ui-Slider und overlay-Clamps nutzen —
+    /// und der Clamp-Helper schneidet an beiden Grenzen korrekt.
+    #[test]
+    fn overlay_defaults_lie_within_the_shared_limits() {
+        use overlay_limits::*;
+        let cfg = Config::default();
+        assert!(WIDTH_PCT.contains(&cfg.overlay_width_pct));
+        assert!(GAIN.contains(&cfg.overlay_gain));
+        assert!(SPEED.contains(&cfg.overlay_speed));
+        assert!(TRAIL_LEN.contains(&cfg.overlay_trail_len));
+        assert!(TRAIL_DECAY.contains(&cfg.overlay_trail_decay));
+        assert_eq!(TRAIL_LEN_MAX, usize::from(*TRAIL_LEN.end()));
+        // Grenzwertanalyse: unter/über/innerhalb.
+        assert_eq!(clamp(14u8, &WIDTH_PCT), 15);
+        assert_eq!(clamp(81u8, &WIDTH_PCT), 80);
+        assert_eq!(clamp(40u8, &WIDTH_PCT), 40);
     }
 
     #[test]
