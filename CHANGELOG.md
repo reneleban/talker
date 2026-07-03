@@ -34,7 +34,10 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
   durchgestrichenes Setup-Icon), gemma lädt im Hintergrund — die Nicht-Roh-Modi
   sind bis dahin ausgegraut und schalten sich ohne Neustart frei. Neuer
   Einstellungen-Bereich „Modelle" mit Status je Modell (installiert/lädt
-  X %/fehlt/beschädigt) und Neu-laden/Reparieren-Button.
+  X %/fehlt/beschädigt) und Neu-laden/Reparieren-Button. Abgebrochene
+  Downloads (Netzfehler, App beendet) werden beim nächsten Versuch
+  fortgesetzt statt neu geladen (HTTP-Range-Resume); die SHA-256-Prüfung
+  nach Abschluss bleibt unverändert.
 - Kontext-Awareness (opt-in, Default aus): talker wählt den Cleanup-Modus
   automatisch je fokussierter App (Regeln bundle-id → Modus in der Config,
   `context_aware_enabled` + `context_rules`); ohne Regel-Treffer gilt der
