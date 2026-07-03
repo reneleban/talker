@@ -21,6 +21,9 @@ pub struct Tray {
     /// Modus-Menüeinträge (Checkmark-Auswahl) in `CleanupMode::ALL`-Reihenfolge.
     mode_items: Vec<(MenuId, CleanupMode, CheckMenuItem)>,
     mode: Cell<CleanupMode>,
+    /// Setup läuft (Modell-Download, Ticket-0029): idle zeigt dann das
+    /// durchgestrichene Mikrofon, bis das Setup fertig ist.
+    setup: Cell<bool>,
 }
 
 impl Tray {
@@ -60,7 +63,15 @@ impl Tray {
             quit_id: quit.id().clone(),
             mode_items,
             mode: Cell::new(initial_mode),
+            setup: Cell::new(false),
         })
+    }
+
+    /// Setup-Zustand an/aus (Ticket-0029). Wirkt auf alle idle-Zeichnungen,
+    /// damit z.B. ein Modus-Sync das Setup-Icon nicht überschreibt.
+    pub fn set_setup(&self, on: bool) {
+        self.setup.set(on);
+        self.set_idle();
     }
 
     /// Gehört die Menü-ID zu einem Modus-Eintrag?
@@ -87,10 +98,12 @@ impl Tray {
     }
 
     pub fn set_idle(&self) {
-        if let Err(e) = self
-            .icon
-            .set_icon(Some(mic_icon(MicStyle::Idle, Some(self.mode.get()))))
-        {
+        let (style, badge) = if self.setup.get() {
+            (MicStyle::Setup, None)
+        } else {
+            (MicStyle::Idle, Some(self.mode.get()))
+        };
+        if let Err(e) = self.icon.set_icon(Some(mic_icon(style, badge))) {
             eprintln!("talker: Tray-Icon (idle) nicht setzbar: {e}");
         }
         self.icon.set_icon_as_template(true);
@@ -152,6 +165,8 @@ enum MicStyle {
     Idle,
     Recording,
     Warning,
+    /// Setup läuft: Mikrofon diagonal durchgestrichen (Ticket-0029).
+    Setup,
 }
 
 /// Rastert das Mikrofon-Glyph (22 pt @2x = 44 px) per Signed-Distance-Field,
@@ -169,6 +184,9 @@ fn mic_icon(style: MicStyle, badge: Option<CleanupMode>) -> Icon {
             let mut a = glyph_alpha(px, py);
             if style == MicStyle::Warning {
                 a = a.max(bang_alpha(px, py));
+            }
+            if style == MicStyle::Setup {
+                a = a.max(strike_alpha(px, py));
             }
             if a > 0.0 {
                 let i = (y * S + x) * 4;
@@ -218,6 +236,12 @@ fn glyph_alpha(x: f32, y: f32) -> f32 {
     let stem = sd_segment(x, y, 22.0, 30.0, 22.0, 34.5) - 1.4;
     let base = sd_segment(x, y, 15.5, 36.5, 28.5, 36.5) - 1.4;
     let d = capsule.min(holder).min(stem).min(base);
+    (0.5 - d).clamp(0.0, 1.0)
+}
+
+/// Diagonaler Durchstreich-Balken (für den Setup-Zustand).
+fn strike_alpha(x: f32, y: f32) -> f32 {
+    let d = sd_segment(x, y, 7.0, 7.0, 37.0, 37.0) - 2.0;
     (0.5 - d).clamp(0.0, 1.0)
 }
 
@@ -306,6 +330,18 @@ mod tests {
         // Bügel nur unterhalb der Kapselmitte.
         assert_eq!(glyph_alpha(12.0, 14.0), 0.0);
         assert!(glyph_alpha(12.2, 21.5) > 0.5);
+    }
+
+    #[test]
+    fn setup_strike_crosses_the_glyph_diagonally() {
+        // Auf der Diagonale voll deckend — auch außerhalb der Mikrofon-Tinte.
+        assert!(strike_alpha(10.0, 10.0) > 0.5);
+        assert!(strike_alpha(22.0, 22.0) > 0.5);
+        assert!(strike_alpha(34.0, 34.0) > 0.5);
+        assert_eq!(glyph_alpha(10.0, 10.0), 0.0, "kreuzt freie Fläche");
+        // Abseits der Diagonale keine Streich-Tinte.
+        assert_eq!(strike_alpha(36.0, 8.0), 0.0);
+        assert_eq!(strike_alpha(8.0, 36.0), 0.0);
     }
 
     #[test]
