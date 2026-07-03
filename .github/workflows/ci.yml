@@ -43,3 +43,23 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  cargo-machete:
+    name: cargo-machete
+    # Ungenutzte Dependencies in Cargo.toml — reine Quelltext-Analyse,
+    # braucht weder Build noch macOS → Linux-Runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-machete installieren
+        run: cargo install cargo-machete --locked
+      - run: cargo machete
+
+  shellcheck:
+    name: shellcheck
+    # Lint für die Build-/Hilfsskripte (bundle.sh, make-cert.sh, …) —
+    # ubuntu-Runner bringen shellcheck vorinstalliert mit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh
