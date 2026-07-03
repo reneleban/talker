@@ -3,6 +3,16 @@
 Verbindlich für alle, die in diesem Repo Code schreiben (Menschen wie Agenten/Fable).
 Kontext: Entscheidungen in `docs/adr/`, Begriffe in `CONTEXT.md`.
 
+## Dokumentations-Formate (Override des globalen Defaults)
+- **Architektur**: kein volles arc42. Stattdessen ADRs (`docs/adr/`, MADR-Format,
+  bereits Praxis) + `docs/architecture/overview.md` mit 3 Mermaid-Diagrammen
+  (Bausteinsicht, Laufzeitsicht/Pipeline, Kontextsicht ggü. macOS-APIs). Deckt
+  die Fragen ab, die bei Verständnisproblemen wirklich weiterhelfen, ohne die
+  übrigen arc42-Kapitel (Solo-Projekt, kein Mehrwert). Begründung: ADR-0004.
+- **Requirements**: kein IREB-Fließtext. Stattdessen **EARS**-Syntax
+  (Ubiquitär/Event/State/Optional/Unwanted-Behavior) unter `docs/requirements/`.
+  Kürzer, testbarer, deckt sich mit der AK↔Test-1:1-Regel unten. Begründung: ADR-0004.
+
 ## Stabilitäts-Policies (verbindlich)
 - **SemVer, CHANGELOG (Keep a Changelog), Config-Versionierung/Deprecation** —
   Details in `docs/stability.md`. Kurzfassung: Config-TOML ist ein
