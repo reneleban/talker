@@ -44,7 +44,8 @@ if security find-identity -p codesigning -v | grep -q '"talker-dev"'; then
   SIGN_ID="talker-dev"
 else
   SIGN_ID="-"
-  echo "⚠ kein talker-dev-Zertifikat — Ad-hoc-Signatur (Permissions überleben Rebuilds NICHT)"
+  echo "⚠ kein talker-dev-Zertifikat — Ad-hoc-Signatur: Bedienungshilfen/Mikrofon"
+  echo "  müssen nach JEDEM install neu erteilt werden. Fix (einmalig): make cert"
 fi
 echo "→ Signatur ($SIGN_ID) …"
 codesign --force -s "$SIGN_ID" "$APP/Contents/Frameworks/"*.dylib
