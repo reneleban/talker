@@ -73,8 +73,14 @@ impl Tray {
     }
 
     /// Setup-Zustand an/aus (Ticket-0029). Wirkt auf alle idle-Zeichnungen,
-    /// damit z.B. ein Modus-Sync das Setup-Icon nicht überschreibt.
-    pub fn set_setup(&self, on: bool) {
+    /// damit z.B. ein Modus-Sync das Setup-Icon nicht überschreibt. Idempotent
+    /// (Cell-Diff) — sonst überschreibt der 60-fps-Sync-Tick (Ticket-0037) das
+    /// rote Aufnahme-Icon aus `sync_recording` noch im selben Frame wieder mit
+    /// dem Idle-Icon.
+    fn set_setup(&self, on: bool) {
+        if self.setup.get() == on {
+            return;
+        }
         self.setup.set(on);
         self.set_idle();
     }
@@ -89,7 +95,7 @@ impl Tray {
 
     /// Tray auf den (extern geänderten) Modus bringen — idempotent, damit die
     /// UI das pro Frame aufrufen kann (eine Quelle der Wahrheit: die Config).
-    pub fn sync_mode(&self, mode: CleanupMode) {
+    fn sync_mode(&self, mode: CleanupMode) {
         if self.mode.get() == mode {
             return;
         }
@@ -102,11 +108,22 @@ impl Tray {
         self.set_idle();
     }
 
+    /// Bündelt Modus-, Aufnahme- und Setup-Sync in der Reihenfolge, die die
+    /// Icon-Priorität korrekt hält (Modus vor Aufnahme, sonst überschreibt ein
+    /// Moduswechsel während der Aufnahme das rote Icon). Einziger Aufrufer:
+    /// der 60-fps-Main-RunLoop-Timer in `main.rs`, alle drei Teilaufrufe sind
+    /// idempotent (Cell-Diff), häufiges Aufrufen kostet nur Lesezugriffe.
+    pub fn sync(&self, mode: CleanupMode, phase: &Phase, stt_ready: bool) {
+        self.sync_mode(mode);
+        self.sync_recording(phase);
+        self.set_setup(!stt_ready);
+    }
+
     /// Aufnahme-Status aus der Indicator-Phase ableiten (Ticket-0035) —
     /// idempotent, damit die UI das pro Frame aufrufen kann. Der Indicator ist
     /// der einzige Besitzer des Zustands; das Badge zeigt während der Aufnahme
     /// den für diese Utterance AUFGELÖSTEN Modus (Kontext-Awareness, Ticket-0026).
-    pub fn sync_recording(&self, phase: &Phase) {
+    fn sync_recording(&self, phase: &Phase) {
         let recording = recording_mode(phase);
         if self.recording.get() == recording {
             return;

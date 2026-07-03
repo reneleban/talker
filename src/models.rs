@@ -81,6 +81,47 @@ pub enum ModelState {
     Error(String),
 }
 
+impl ModelState {
+    /// Statuszeile eines Modells im „Modelle"-Bereich: (Text, Aktions-Button?).
+    /// Button-Beschriftung: „Neu laden" (fehlt) bzw. „Reparieren" (kaputt/Fehler).
+    pub fn status_line(&self) -> (String, Option<&'static str>) {
+        match self {
+            ModelState::Ready => ("installiert ✓".into(), None),
+            ModelState::Missing => ("fehlt".into(), Some("Neu laden")),
+            ModelState::ConsentPending => ("wartet auf Lizenz-Zustimmung".into(), None),
+            ModelState::Downloading { pct } => (format!("lädt … {pct} %"), None),
+            ModelState::Verifying => ("wird geprüft …".into(), None),
+            ModelState::Corrupt => ("beschädigt (Checksum)".into(), Some("Reparieren")),
+            ModelState::Error(e) => (format!("Fehler: {e}"), Some("Reparieren")),
+        }
+    }
+
+    /// Fortschritts-Anteil (0–1) fürs Balken-UI eines Modells; None = kein Balken.
+    pub fn progress_fraction(&self) -> Option<f32> {
+        match self {
+            ModelState::Downloading { pct } => Some(f32::from(*pct) / 100.0),
+            ModelState::Verifying => Some(1.0),
+            _ => None,
+        }
+    }
+
+    /// Hinweistext bei PTT-Druck, solange das Modell nicht ready ist (AK 3).
+    /// None = PTT frei.
+    pub fn setup_hint(&self) -> Option<String> {
+        match self {
+            ModelState::Ready => None,
+            ModelState::Downloading { pct } => Some(format!("talker richtet sich ein … {pct} %")),
+            ModelState::Verifying => Some("talker richtet sich ein … Modell wird geprüft".into()),
+            ModelState::ConsentPending | ModelState::Missing => {
+                Some("Einrichtung nötig — Einstellungen öffnen".into())
+            }
+            ModelState::Corrupt | ModelState::Error(_) => {
+                Some("Modell-Download fehlgeschlagen — Einstellungen öffnen".into())
+            }
+        }
+    }
+}
+
 /// Was für ein Modell installiert wird — parametrisierbar, damit Tests ohne
 /// die echten (gepinnten) Konstanten arbeiten können.
 #[derive(Debug, Clone)]
@@ -574,6 +615,81 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Status→Darstellung-Mapping (Ticket-0029, DoD).
+    #[test]
+    fn status_line_maps_every_state() {
+        let cases: [(ModelState, &str, Option<&str>); 7] = [
+            (ModelState::Ready, "installiert ✓", None),
+            (ModelState::Missing, "fehlt", Some("Neu laden")),
+            (
+                ModelState::ConsentPending,
+                "wartet auf Lizenz-Zustimmung",
+                None,
+            ),
+            (ModelState::Downloading { pct: 7 }, "lädt … 7 %", None),
+            (ModelState::Verifying, "wird geprüft …", None),
+            (
+                ModelState::Corrupt,
+                "beschädigt (Checksum)",
+                Some("Reparieren"),
+            ),
+            (
+                ModelState::Error("Netz weg".into()),
+                "Fehler: Netz weg",
+                Some("Reparieren"),
+            ),
+        ];
+        for (state, expected_text, expected_action) in cases {
+            let (text, action) = state.status_line();
+            assert_eq!(text, expected_text, "{state:?}");
+            assert_eq!(action, expected_action, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn progress_fraction_only_for_running_downloads() {
+        assert_eq!(
+            ModelState::Downloading { pct: 50 }.progress_fraction(),
+            Some(0.5)
+        );
+        assert_eq!(
+            ModelState::Downloading { pct: 0 }.progress_fraction(),
+            Some(0.0)
+        );
+        assert_eq!(ModelState::Verifying.progress_fraction(), Some(1.0));
+        assert_eq!(ModelState::Ready.progress_fraction(), None);
+        assert_eq!(ModelState::Missing.progress_fraction(), None);
+    }
+
+    /// PTT-Hinweis (AK 3): „richtet sich ein … X %" während des Downloads,
+    /// None sobald das Modell ready ist.
+    #[test]
+    fn setup_hint_reports_progress_and_clears_when_ready() {
+        assert_eq!(ModelState::Ready.setup_hint(), None);
+        assert_eq!(
+            ModelState::Downloading { pct: 42 }.setup_hint().unwrap(),
+            "talker richtet sich ein … 42 %"
+        );
+        assert!(
+            ModelState::Verifying
+                .setup_hint()
+                .unwrap()
+                .contains("geprüft")
+        );
+        for state in [ModelState::ConsentPending, ModelState::Missing] {
+            assert!(
+                state.setup_hint().unwrap().contains("Einstellungen"),
+                "{state:?}"
+            );
+        }
+        for state in [ModelState::Corrupt, ModelState::Error("x".into())] {
+            assert!(
+                state.setup_hint().unwrap().contains("fehlgeschlagen"),
+                "{state:?}"
+            );
+        }
+    }
 
     /// Frisches, test-eigenes Verzeichnis unterm System-Tempdir (wie config.rs).
     struct TempDir(PathBuf);
