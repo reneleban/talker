@@ -48,18 +48,22 @@ muss von allen späteren Versionen derselben MAJOR-Linie ladbar bleiben.
 
 Regeln:
 
-- **Vier Stellen pro Feld**: jedes neue Feld berührt in `src/config.rs`
-  `Config`, `RawConfig`, `Default` und `From<RawConfig>`. Ein Feld existiert
-  erst, wenn alle vier Stellen konsistent sind (Tests decken das ab).
+- **Zwei Stellen pro Feld**: jedes neue Feld berührt in `src/config.rs`
+  `Config` (mit Doc-Kommentar) und `impl Default for Config`. Struct-weites
+  `#[serde(default)]` füllt fehlende Felder aus dem Default — ein vergessenes
+  Feld ist damit ein Compile-Fehler, kein stiller Reset (Tests decken die
+  Abwärtskompatibilität ab).
 - **Neue Felder sind optional**: immer mit sinnvollem Default — eine alte Datei
   ohne das Feld lädt unverändert (`#[serde(default)]`).
 - **Deprecation statt stillem Break**: ein Feld wird nie einfach entfernt oder
-  umgedeutet. Stattdessen: neues Feld einführen, altes Feld beim Laden in
-  `From<RawConfig>` migrieren, im CHANGELOG unter `Deprecated` ankündigen.
-  Entfernen des Legacy-Pfads erst mit der nächsten MAJOR-Version.
+  umgedeutet. Stattdessen: neues Feld einführen, das alte in der
+  Legacy-Migration von `Config::parse()` auf das neue abbilden, im CHANGELOG
+  unter `Deprecated` ankündigen. Entfernen des Legacy-Pfads erst mit der
+  nächsten MAJOR-Version.
   **Referenzbeispiel**: `cleanup_enabled` (bool) → `cleanup_mode` (Enum) —
-  `RawConfig` kennt beide, explizites `cleanup_mode` gewinnt, das Legacy-Bool
-  migriert (`false` → `raw`, `true` → `business`).
+  `parse()` migriert das Legacy-Bool vor dem Deserialisieren (`false` → `raw`,
+  `true` → `business`), explizites `cleanup_mode` gewinnt, falscher Typ
+  bleibt ein Fehler.
 - **Falscher Typ ist ein Fehler, kein stiller Fallback**: Typfehler in einem
   bekannten Feld führen zum Parse-Fehler → `load()` meldet den Hinweis und
   nutzt Defaults, überschreibt die Datei aber nicht ungefragt.

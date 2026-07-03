@@ -6,8 +6,9 @@ Kontext: Entscheidungen in `docs/adr/`, Begriffe in `CONTEXT.md`.
 ## Stabilitäts-Policies (verbindlich)
 - **SemVer, CHANGELOG (Keep a Changelog), Config-Versionierung/Deprecation** —
   Details in `docs/stability.md`. Kurzfassung: Config-TOML ist ein
-  Kompatibilitäts-Vertrag (4 Stellen in `config.rs` pro Feld, Deprecation statt
-  stillem Break); jede nutzersichtbare Änderung bekommt einen CHANGELOG-Eintrag
+  Kompatibilitäts-Vertrag (neues Feld = `Config` + `Default`, fehlend → Default
+  via `#[serde(default)]`, Legacy-Migration in `Config::parse()`, Deprecation
+  statt stillem Break); jede nutzersichtbare Änderung bekommt einen CHANGELOG-Eintrag
   im selben PR; Breaking Changes werden explizit markiert.
 
 ## Scope & Stack (hart)
