@@ -33,6 +33,10 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Added
 
+- `make cert`: legt einmalig das selbstsignierte Codesign-Zertifikat
+  `talker-dev` an, damit die macOS-Permissions (Bedienungshilfen, Mikrofon)
+  Updates überleben — ohne Zertifikat signiert der Build ad-hoc und macOS
+  behandelt jede neue Installation als neue App (Known Issue im README).
 - Modell-Downloader: talker lädt Parakeet (sherpa-onnx-Release) und gemma
   (ggml-org GGUF) beim Erst-Start selbst — SHA-256-verifiziert gegen gepinnte
   Hashes, mit Fortschritt und Retry bei Fehler/Checksum-Mismatch. Downloads
