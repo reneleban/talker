@@ -51,8 +51,6 @@ pub struct SettingsApp {
     /// Geteilter Modell-Zustand (Ticket-0028/0029): Setup-Gate + Live-Status.
     models_state: Arc<ModelsState>,
     models_root: std::path::PathBuf,
-    /// Zuletzt ans Tray gemeldeter Setup-Zustand (nur Änderungen senden).
-    tray_setup: bool,
 }
 
 impl SettingsApp {
@@ -91,7 +89,6 @@ impl SettingsApp {
             running_apps: injection::running_apps(),
             models_state,
             models_root,
-            tray_setup: false,
         }
     }
 
@@ -954,29 +951,8 @@ impl eframe::App for SettingsApp {
             ind.set_preview(true, Instant::now());
         }
 
-        // Tray spiegelt den Modus aus der Config (idempotent) — egal ob die
-        // Änderung aus dem Settings-Dropdown oder dem Tray selbst kam.
-        if let Ok(cfg) = self.config.read() {
-            let mode = cfg.cleanup_mode;
-            crate::tray::with_instance(|t| t.sync_mode(mode));
-        }
-
-        // Tray spiegelt den Aufnahme-Status aus der Indicator-Phase (Ticket-0035)
-        // — nach sync_mode, damit ein Modus-Wechsel während der Aufnahme das
-        // rote Icon nicht überschreibt. Idempotent, Besitzer ist der Indicator.
-        if let Ok(ind) = self.indicator.lock() {
-            let phase = ind.phase().clone();
-            drop(ind);
-            crate::tray::with_instance(|t| t.sync_recording(&phase));
-        }
-
-        // Tray-Setup-Icon (Ticket-0029): durchgestrichen, solange die
-        // Spracherkennung fehlt — nur bei Zustands-Wechsel neu setzen.
-        let setup_active = !self.models_state.stt_ready();
-        if setup_active != self.tray_setup {
-            self.tray_setup = setup_active;
-            crate::tray::with_instance(|t| t.set_setup(setup_active));
-        }
+        // Tray-Sync (Modus/Aufnahme/Setup) läuft im 60-fps-Main-RunLoop-Timer
+        // (main.rs, Ticket-0037) — hier nichts mehr zu tun.
 
         ctx.request_repaint_after(Duration::from_millis(250));
     }

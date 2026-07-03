@@ -188,7 +188,9 @@ fn main() -> ExitCode {
             let initial_mode = config.read().map(|c| c.cleanup_mode).unwrap_or_default();
             let tray = Rc::new(tray::Tray::new(initial_mode)?);
 
-            // Natives Overlay + 60-fps-Animations-Timer auf dem Main-RunLoop.
+            // Natives Overlay + Tray-Sync + 60-fps-Animations-Timer auf dem
+            // Main-RunLoop — Tray-Sync ist idempotent (Cell-Diff in Tray::sync),
+            // häufiges Aufrufen kostet nur Lesezugriffe (Ticket-0037).
             {
                 use objc2::MainThreadMarker;
                 use objc2_foundation::NSTimer;
@@ -196,10 +198,16 @@ fn main() -> ExitCode {
                 let overlay = Rc::new(overlay::Overlay::new(mtm));
                 let ind = Arc::clone(&indicator);
                 let cfg = Arc::clone(&config);
+                let tray_sync = Rc::clone(&tray);
+                let models_sync = Arc::clone(&models_state);
                 // Soundness: Timer wird auf dem Main-RunLoop geplant und feuert
                 // ausschließlich dort — der nicht-Send-Block verlässt den Thread nie.
                 let block = block2::RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
                     overlay.tick(&ind, &cfg);
+                    let mode = cfg.read().map(|c| c.cleanup_mode).unwrap_or_default();
+                    if let Ok(indicator) = ind.lock() {
+                        tray_sync.sync(mode, indicator.phase(), models_sync.stt_ready());
+                    }
                 });
                 let timer = unsafe {
                     NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0 / 60.0, true, &block)
