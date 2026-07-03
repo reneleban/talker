@@ -3,7 +3,6 @@
 //! eframe besitzt den Main-Loop (Settings-Fenster, ADR-0002); Tray + Event-Tap
 //! hängen am selben Main-RunLoop.
 
-use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -12,18 +11,9 @@ use std::time::Instant;
 
 use talker::indicator::Indicator;
 use talker::{
-    audio, cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline,
-    stt, tray, ui,
+    cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline, stt,
+    tray, ui,
 };
-
-thread_local! {
-    /// Laufende Aufnahme zwischen PTT-Druck und -Loslassen (nur Main-Thread,
-    /// da die Hotkey-Callbacks auf dem Main-RunLoop laufen).
-    static RECORDING: RefCell<Option<audio::Recording>> = const { RefCell::new(None) };
-    /// Frontmost-App beim Utterance-START (Ticket-0026) — beim Druck erfasst,
-    /// damit ein App-Wechsel während der Aufnahme den Modus nicht ändert.
-    static FRONTMOST: RefCell<Option<String>> = const { RefCell::new(None) };
-}
 
 /// Lädt das Cleanup-Modell; das zweite Element meldet den Fehlschlag
 /// (Fehler-Cache: bis zum Moduswechsel nicht erneut versuchen).
@@ -247,68 +237,66 @@ fn main() -> ExitCode {
                     let ctx_release = egui_ctx.clone();
                     let stt_tx = stt_tx.clone();
                     let models_press = Arc::clone(&models_state);
+                    // Eine PttSession pro (erfolgreich) installiertem Tap — ersetzt
+                    // die früheren thread_local!-Zellen (Ticket-0038). Ein Retry
+                    // dieser Factory (permissions::should_relaunch_for_tap) findet
+                    // nie eine laufende Aufnahme vor, weil der alte Tap dafür schon
+                    // aktiv gewesen sein müsste.
+                    let session_press = Arc::new(Mutex::new(pipeline::PttSession::new()));
+                    let session_release = Arc::clone(&session_press);
                     hotkey::install(
                         Arc::clone(&config),
                         move || {
-                            // PTT gesperrt bis Parakeet ready (Ticket-0029):
-                            // kurzer Hinweis mit Fortschritt statt Aufnahme.
-                            if let Some(hint) =
-                                models_press.get(models::ModelId::Parakeet).setup_hint()
-                            {
-                                eprintln!("talker: PTT gesperrt — {hint}");
-                                if let Ok(mut ind) = ind_press.lock() {
-                                    ind.fail(Instant::now(), hint);
+                            let cfg = mic_config.read().map(|c| c.clone()).unwrap_or_default();
+                            let outcome = session_press
+                                .lock()
+                                .map(|mut s| s.press(&cfg, &models_press))
+                                .unwrap_or(pipeline::PressOutcome::Failed(
+                                    talker::error::TalkerError::Audio(
+                                        "Session-Lock poisoned".into(),
+                                    ),
+                                ));
+                            match outcome {
+                                pipeline::PressOutcome::Blocked(hint) => {
+                                    eprintln!("talker: PTT gesperrt — {hint}");
+                                    if let Ok(mut ind) = ind_press.lock() {
+                                        ind.fail(Instant::now(), hint);
+                                    }
+                                    ctx_press.request_repaint();
                                 }
-                                ctx_press.request_repaint();
-                                return;
-                            }
-                            // Frontmost-App beim Utterance-START erfassen (Ticket-0026):
-                            // stabil, auch wenn während der Aufnahme die App wechselt.
-                            let frontmost = injection::frontmost_bundle_id();
-                            let resolved = mic_config
-                                .read()
-                                .map(|c| pipeline::resolve_mode(&c, frontmost.as_deref()))
-                                .unwrap_or_default();
-                            FRONTMOST.with(|f| *f.borrow_mut() = frontmost);
-                            let device = mic_config.read().ok().and_then(|c| c.mic_device.clone());
-                            match audio::start(device.as_deref()) {
-                                Ok(rec) => {
+                                pipeline::PressOutcome::Started { level, mode } => {
                                     // Der Indicator besitzt den Aufnahme-Status
                                     // (inkl. aufgelöstem Modus); das Tray leitet
                                     // sein Icon daraus ab (Ticket-0035).
                                     if let Ok(mut ind) = ind_press.lock() {
-                                        ind.start_recording(Instant::now(), rec.level(), resolved);
+                                        ind.start_recording(Instant::now(), level, mode);
                                     }
                                     ctx_press.request_repaint();
-                                    RECORDING.with(|r| *r.borrow_mut() = Some(rec));
                                 }
-                                Err(e) => {
+                                pipeline::PressOutcome::Failed(e) => {
                                     eprintln!("talker: {e}");
                                     tray::with_instance(|t| t.set_permission_warning());
                                 }
                             }
                         },
                         move || {
-                            let frontmost = FRONTMOST.with(|f| f.borrow_mut().take());
-                            let Some(rec) = RECORDING.with(|r| r.borrow_mut().take()) else {
-                                return; // Aufnahme kam nie zustande (z.B. Permission fehlte)
-                            };
+                            let outcome = session_release
+                                .lock()
+                                .map(|mut s| s.release())
+                                .unwrap_or(pipeline::ReleaseOutcome::NoRecording);
                             let update = |f: &dyn Fn(&mut Indicator)| {
                                 if let Ok(mut ind) = ind_release.lock() {
                                     f(&mut ind);
                                 }
                                 ctx_release.request_repaint();
                             };
-                            match rec.stop() {
-                                Ok(pcm) => {
-                                    let ms = audio::duration_ms(&pcm);
-                                    if ms < audio::MIN_UTTERANCE_MS {
-                                        eprintln!(
-                                            "talker: Utterance zu kurz ({ms} ms) — verworfen."
-                                        );
-                                        update(&|ind| ind.cancel());
-                                        return;
-                                    }
+                            match outcome {
+                                pipeline::ReleaseOutcome::NoRecording => {}
+                                pipeline::ReleaseOutcome::TooShort { ms } => {
+                                    eprintln!("talker: Utterance zu kurz ({ms} ms) — verworfen.");
+                                    update(&|ind| ind.cancel());
+                                }
+                                pipeline::ReleaseOutcome::Ready { pcm, frontmost, ms } => {
                                     eprintln!(
                                         "talker: Utterance aufgenommen: {ms} ms, {} Samples @16 kHz.",
                                         pcm.len()
@@ -324,7 +312,7 @@ fn main() -> ExitCode {
                                         update(&|ind| ind.transcribing(Instant::now()));
                                     }
                                 }
-                                Err(e) => {
+                                pipeline::ReleaseOutcome::StopFailed(e) => {
                                     eprintln!("talker: {e}");
                                     update(&|ind| {
                                         ind.fail(Instant::now(), "Aufnahme fehlgeschlagen")

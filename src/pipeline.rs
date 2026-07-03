@@ -12,7 +12,8 @@ use std::time::Instant;
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
 use crate::config::Config;
 use crate::error::TalkerError;
-use crate::models::ModelsState;
+use crate::injection;
+use crate::models::{ModelId, ModelsState};
 use crate::stt::Transcriber;
 use crate::{audio, vocab_match};
 
@@ -258,6 +259,92 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
         .unwrap_or(cfg.cleanup_mode)
 }
 
+/// Zustand einer laufenden PTT-Utterance zwischen Tastendruck und Loslassen —
+/// ersetzt die früheren `thread_local!`-Zellen in `main.rs` (Ticket-0038).
+/// Läuft ausschließlich auf dem Main-Thread (Hotkey-Callbacks), geteilt über
+/// `Arc<Mutex<PttSession>>`, weil `hotkey::install` `Send`-Closures verlangt.
+#[derive(Default)]
+pub struct PttSession {
+    recording: Option<audio::Recording>,
+    frontmost: Option<String>,
+}
+
+/// Ergebnis von [`PttSession::press`].
+pub enum PressOutcome {
+    /// PTT gesperrt (Setup-Gate, AK 3) — Grund als sichtbarer Hinweis.
+    Blocked(String),
+    /// Aufnahme gestartet, mit dem für diese Utterance aufgelösten Modus.
+    Started {
+        level: audio::LevelHandle,
+        mode: CleanupMode,
+    },
+    /// Mikrofon-Start fehlgeschlagen (z.B. fehlende Permission).
+    Failed(TalkerError),
+}
+
+/// Ergebnis von [`PttSession::release`].
+#[derive(Debug)]
+pub enum ReleaseOutcome {
+    /// Keine laufende Aufnahme (Press war gesperrt oder scheiterte).
+    NoRecording,
+    /// Utterance zu kurz — gilt als versehentlicher Tastendruck, verworfen.
+    TooShort { ms: u64 },
+    /// PCM + der bei Press erfasste Frontmost, bereit für den STT-Worker.
+    Ready {
+        pcm: Vec<f32>,
+        frontmost: Option<String>,
+        ms: u64,
+    },
+    /// Stop der Aufnahme fehlgeschlagen.
+    StopFailed(TalkerError),
+}
+
+impl PttSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// PTT gedrückt: Setup-Gate prüfen, Frontmost-App VOR Aufnahmestart
+    /// erfassen (Kontext-Awareness, Ticket-0026 — bleibt stabil, auch wenn
+    /// die App während der Utterance wechselt), Mikrofon starten.
+    pub fn press(&mut self, cfg: &Config, models: &ModelsState) -> PressOutcome {
+        if let Some(hint) = models.get(ModelId::Parakeet).setup_hint() {
+            return PressOutcome::Blocked(hint);
+        }
+        let frontmost = injection::frontmost_bundle_id();
+        let mode = resolve_mode(cfg, frontmost.as_deref());
+        match audio::start(cfg.mic_device.as_deref()) {
+            Ok(rec) => {
+                let level = rec.level();
+                self.frontmost = frontmost;
+                self.recording = Some(rec);
+                PressOutcome::Started { level, mode }
+            }
+            Err(e) => PressOutcome::Failed(e),
+        }
+    }
+
+    /// PTT losgelassen: Aufnahme stoppen, Mindestlänge prüfen (versehentlicher
+    /// Tastendruck), sonst PCM + Frontmost zum Senden an den STT-Worker freigeben.
+    pub fn release(&mut self) -> ReleaseOutcome {
+        let frontmost = self.frontmost.take();
+        let Some(rec) = self.recording.take() else {
+            return ReleaseOutcome::NoRecording;
+        };
+        match rec.stop() {
+            Ok(pcm) => {
+                let ms = audio::duration_ms(&pcm);
+                if ms < audio::MIN_UTTERANCE_MS {
+                    ReleaseOutcome::TooShort { ms }
+                } else {
+                    ReleaseOutcome::Ready { pcm, frontmost, ms }
+                }
+            }
+            Err(e) => ReleaseOutcome::StopFailed(e),
+        }
+    }
+}
+
 /// Kann diese Config überhaupt einen LLM-Cleanup brauchen? (Fallback-Modus
 /// oder irgendeine aktive Kontext-Regel.) Steuert Vorladen/Entladen des
 /// Modells im Worker — pro Utterance entscheidet `resolve_mode`.
@@ -463,6 +550,29 @@ mod tests {
             resolve_mode(&cfg, Some("com.apple.Terminal")),
             CleanupMode::Raw
         );
+    }
+
+    // PttSession: press()/release() rühren nur dann echte Hardware an (Audio,
+    // Frontmost-App), wenn das Setup-Gate offen ist bzw. eine Aufnahme läuft —
+    // beides ohne Hardware nicht fakebar (kein Trait dafür, reduzierter Scope,
+    // Ticket-0038). Getestet wird deshalb nur, was ohne Hardware entscheidbar
+    // ist: das Setup-Gate selbst und der Leerlauf-Fall von `release()`.
+
+    #[test]
+    fn press_blocked_by_setup_gate_never_touches_audio() {
+        let models = ModelsState::new(ModelState::Missing, ModelState::Missing);
+        let mut session = PttSession::new();
+
+        let outcome = session.press(&Config::default(), &models);
+
+        assert!(matches!(outcome, PressOutcome::Blocked(_)));
+    }
+
+    #[test]
+    fn release_without_a_press_reports_no_recording() {
+        let mut session = PttSession::new();
+
+        assert!(matches!(session.release(), ReleaseOutcome::NoRecording));
     }
 
     #[test]
