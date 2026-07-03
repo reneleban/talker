@@ -89,6 +89,42 @@ fn cleans_filler_words_without_thinking_leak_and_passes_empty_through() {
     for marker in ["<end_of", "<start_of", "<<<"] {
         assert!(!prompt_out.contains(marker), "Marker-Leak: {prompt_out:?}");
     }
+    // Modus »Natürlich«: echte Mengenangaben (auch klein/eingebettet) werden
+    // zu Ziffern, im selben Format wie Geschäftlich (PRD-0001).
+    cleaner.set_mode(CleanupMode::Casual);
+    let numbers = cleaner
+        .clean("ich hab zwölftausendfünfhundert euro budget und noch zwei andere ideen dazu")
+        .unwrap();
+    println!("Natürlich (Zahlen) → {numbers:?}");
+    assert!(
+        numbers.contains("12.500") || numbers.contains("12500"),
+        "Kompositum-Zahl nicht zu Ziffern konvertiert: {numbers:?}"
+    );
+    assert!(
+        !numbers.to_lowercase().contains("zwölftausendfünfhundert"),
+        "Zahlwort nicht entfernt: {numbers:?}"
+    );
+    assert!(
+        numbers.contains('2') && !numbers.to_lowercase().contains(" zwei "),
+        "kleine eingebettete Zahl nicht konvertiert: {numbers:?}"
+    );
+
+    // Ordinalzahlen und Redewendungen mit Zahlwörtern bleiben Wort (PRD-0001
+    // — Ziffern-Ordinalzahlen wie »2.« oder »2te« wirken unnatürlich).
+    let ordinal = cleaner
+        .clean("das ist meine zweite idee dazu, das gehen wir schritt für schritt an")
+        .unwrap();
+    println!("Natürlich (Ordinal/Redewendung) → {ordinal:?}");
+    let ol = ordinal.to_lowercase();
+    assert!(
+        ol.contains("zweite"),
+        "Ordinalzahl fälschlich konvertiert: {ordinal:?}"
+    );
+    assert!(
+        ol.contains("schritt für schritt"),
+        "Redewendung verändert: {ordinal:?}"
+    );
+
     cleaner.set_mode(CleanupMode::Business);
 
     // Vokabular korrigiert auch stark eingedeutschte Verhörer (Field-Test 0012:

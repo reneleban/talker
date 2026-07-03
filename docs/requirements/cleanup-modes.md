@@ -18,7 +18,8 @@ Raw/Cleaned Transcript) in [`CONTEXT.md`](../../CONTEXT.md).
   Ticket-0010 AK)
 - **REQ-CLEAN-004**: WENN der Modus Natürlich aktiv ist, soll das System nur
   Füllwörter sowie Interpunktion/Groß-Kleinschreibung korrigieren und dabei
-  Wortwahl, Ton und Sprachstil des Sprechers unverändert erhalten.
+  Wortwahl, Ton und Sprachstil des Sprechers unverändert erhalten. Ausnahme:
+  siehe REQ-CLEAN-031 (Zahlen-Normalisierung).
   (`src/cleanup.rs:mode_instruction`, CONTEXT.md „Cleanup-Modus")
 - **REQ-CLEAN-005**: WENN der Modus LLM-optimiert aktiv ist, soll das System
   aus dem Diktat einen klaren, copy-paste-fertigen Prompt formen (Rambling
@@ -129,3 +130,15 @@ Raw/Cleaned Transcript) in [`CONTEXT.md`](../../CONTEXT.md).
 - **REQ-CLEAN-030**: Das System soll jedem der vier Modi ein eindeutiges,
   nicht-leeres Badge-Bitmap zuordnen. (`src/tray.rs:badge_bitmap`, Test
   `mode_badges_are_distinct_and_have_bitmaps`)
+
+## Zahlen-Normalisierung (Natürlich)
+
+- **REQ-CLEAN-031**: WENN der Modus Natürlich aktiv ist, soll das System echte
+  Mengen-, Datums- und Zeitangaben — auch kleine, in normale Sätze
+  eingebettete Zahlen — von Zahlwort zu Ziffer konvertieren, im selben
+  Zahlenformat wie der Modus Geschäftlich (deutsches Tausenderpunkt-Format,
+  z. B. „zwölftausendfünfhundert" → „12.500"). Ordinalzahlen („die zweite
+  Idee") und feste Redewendungen mit Zahlwörtern („eins zu eins", „Schritt
+  für Schritt") bleiben unverändert Wort. (`src/cleanup.rs:mode_instruction`,
+  `mode_examples`, PRD-0001, Test
+  `cleans_filler_words_without_thinking_leak_and_passes_empty_through`)

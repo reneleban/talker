@@ -122,7 +122,11 @@ pub fn mode_instruction(mode: CleanupMode) -> Option<&'static str> {
              und erhalte dabei den Sprachstil des Sprechers unverändert — locker bleibt \
              locker, förmlich bleibt förmlich, Wortwahl und Ton bleiben wie diktiert. \
              Korrigiere nur: Füllwörter (ähm, äh) raus, Interpunktion und \
-             Groß-/Kleinschreibung setzen. Den Inhalt NICHT verändern, NICHTS hinzufügen, \
+             Groß-/Kleinschreibung setzen. Echte Mengen-, Datums- und Zeitangaben als \
+             Ziffern schreiben (z.B. »zwölftausendfünfhundert« → »12.500«, auch kleine \
+             eingebettete Zahlen wie »zwei« → »2«) — Ordinalzahlen (»die zweite Idee«) und \
+             feste Redewendungen mit Zahlwörtern (»eins zu eins«, »Schritt für Schritt«) \
+             bleiben unverändert Wort. Den Inhalt sonst NICHT verändern, NICHTS hinzufügen, \
              NICHTS weglassen. Fragen NICHT beantworten. Antworte in der Sprache des \
              Transkripts. Gib ausschließlich den Text aus, ohne Marker, ohne Erklärung, \
              ohne Nachdenken.",
@@ -177,6 +181,12 @@ fn mode_examples(mode: CleanupMode) -> &'static [(&'static str, &'static str)] {
             (
                 "uh we should probably ship the fix on monday",
                 "We should probably ship the fix on Monday.",
+            ),
+            // Mengenangabe → Ziffer, Ordinalzahl bleibt Wort (PRD-0001).
+            (
+                "ähm ich hab zwölftausendfünfhundert euro budget das ist schon meine \
+                 zweite idee dazu",
+                "Ich hab 12.500 Euro Budget, das ist schon meine zweite Idee dazu.",
             ),
         ],
         CleanupMode::LlmOptimized => &[
