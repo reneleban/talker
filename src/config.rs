@@ -2,8 +2,9 @@
 //! Fehlende/kaputte Datei oder Teilfelder → sinnvolle Defaults, kein Crash.
 //!
 //! Das Format ist ein Kompatibilitäts-Vertrag (`docs/stability.md`): jedes
-//! neue Feld berührt Config, RawConfig, Default und From<RawConfig>;
-//! Deprecation statt stillem Break (Referenz: cleanup_enabled → cleanup_mode).
+//! neue Feld berührt Config + Default — fehlende Felder füllt `#[serde(default)]`,
+//! falscher Typ ist ein Parse-Fehler. Deprecation statt stillem Break:
+//! Legacy-Felder migriert `parse()` (Referenz: cleanup_enabled → cleanup_mode).
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,8 @@ pub enum OverlayPosition {
     Bottom,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// PTT-Taste (macOS-Keycode eines Modifiers, Default Fn/🌐 = 63).
     pub hotkey_keycode: i64,
@@ -93,85 +95,6 @@ pub mod overlay_limits {
     }
 }
 
-/// Roh-Form fürs Laden: kennt zusätzlich das Legacy-Feld `cleanup_enabled`
-/// (bool, bis Ticket-0010) und migriert es beim Einlesen.
-#[derive(Deserialize)]
-#[serde(default)]
-struct RawConfig {
-    hotkey_keycode: i64,
-    stt_model_dir: PathBuf,
-    cleanup_mode: Option<CleanupMode>,
-    cleanup_enabled: Option<bool>,
-    mic_device: Option<String>,
-    overlay_position: OverlayPosition,
-    overlay_width_pct: u8,
-    vocabulary: Vec<String>,
-    phonetic_matching: bool,
-    overlay_gain: f32,
-    overlay_speed: f32,
-    overlay_trail_len: u8,
-    overlay_trail_decay: f32,
-    overlay_colors: Vec<[u8; 3]>,
-    context_aware_enabled: bool,
-    context_rules: Vec<(String, CleanupMode)>,
-    model_download_consent: bool,
-}
-
-impl Default for RawConfig {
-    fn default() -> Self {
-        let d = Config::default();
-        Self {
-            hotkey_keycode: d.hotkey_keycode,
-            stt_model_dir: d.stt_model_dir,
-            cleanup_mode: None,
-            cleanup_enabled: None,
-            mic_device: d.mic_device,
-            overlay_position: d.overlay_position,
-            overlay_width_pct: d.overlay_width_pct,
-            vocabulary: d.vocabulary,
-            phonetic_matching: d.phonetic_matching,
-            overlay_gain: d.overlay_gain,
-            overlay_speed: d.overlay_speed,
-            overlay_trail_len: d.overlay_trail_len,
-            overlay_trail_decay: d.overlay_trail_decay,
-            overlay_colors: d.overlay_colors,
-            context_aware_enabled: d.context_aware_enabled,
-            context_rules: d.context_rules,
-            model_download_consent: d.model_download_consent,
-        }
-    }
-}
-
-impl From<RawConfig> for Config {
-    fn from(raw: RawConfig) -> Self {
-        // Explizites cleanup_mode gewinnt; sonst Legacy-Bool migrieren:
-        // false → Roh, true → Geschäftlich; beides fehlend → Default.
-        let cleanup_mode = raw.cleanup_mode.unwrap_or(match raw.cleanup_enabled {
-            Some(false) => CleanupMode::Raw,
-            Some(true) => CleanupMode::Business,
-            None => CleanupMode::default(),
-        });
-        Self {
-            hotkey_keycode: raw.hotkey_keycode,
-            stt_model_dir: raw.stt_model_dir,
-            cleanup_mode,
-            mic_device: raw.mic_device,
-            overlay_position: raw.overlay_position,
-            overlay_width_pct: raw.overlay_width_pct,
-            vocabulary: raw.vocabulary,
-            phonetic_matching: raw.phonetic_matching,
-            overlay_gain: raw.overlay_gain,
-            overlay_speed: raw.overlay_speed,
-            overlay_trail_len: raw.overlay_trail_len,
-            overlay_trail_decay: raw.overlay_trail_decay,
-            overlay_colors: raw.overlay_colors,
-            context_aware_enabled: raw.context_aware_enabled,
-            context_rules: raw.context_rules,
-            model_download_consent: raw.model_download_consent,
-        }
-    }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -240,8 +163,36 @@ impl Config {
         Ok(())
     }
 
+    /// Parst TOML tolerant: fehlende Felder → Default (`#[serde(default)]`),
+    /// falscher Typ in einem bekannten Feld → Fehler, unbekannte Felder werden
+    /// toleriert. Migriert vorab das Legacy-Feld `cleanup_enabled` (bool, bis
+    /// Ticket-0010): false → Roh, true → Geschäftlich — ein explizit gesetztes
+    /// `cleanup_mode` gewinnt.
     fn parse(text: &str) -> std::result::Result<Self, toml::de::Error> {
-        toml::from_str::<RawConfig>(text).map(Config::from)
+        use serde::de::Error as _;
+        let mut value: toml::Value = toml::from_str(text)?;
+        if let Some(table) = value.as_table_mut() {
+            match table.remove("cleanup_enabled") {
+                None => {}
+                Some(toml::Value::Boolean(enabled)) => {
+                    let mode = if enabled {
+                        CleanupMode::Business
+                    } else {
+                        CleanupMode::Raw
+                    };
+                    let mode = toml::Value::try_from(mode).map_err(toml::de::Error::custom)?;
+                    table.entry("cleanup_mode").or_insert(mode);
+                }
+                // Kein stiller Fallback: falscher Typ ist ein Fehler.
+                Some(other) => {
+                    return Err(toml::de::Error::custom(format!(
+                        "cleanup_enabled: bool erwartet, fand {}",
+                        other.type_str()
+                    )));
+                }
+            }
+        }
+        value.try_into()
     }
 
     fn serialize(&self) -> std::result::Result<String, toml::ser::Error> {
