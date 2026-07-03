@@ -22,7 +22,7 @@ clippy: ## Lint, Warnungen sind Fehler
 	cargo clippy --all-targets -- -D warnings
 
 bundle: ## talker.app bauen (signiert mit talker-dev, sonst ad-hoc)
-	scripts/bundle.sh
+	bash scripts/bundle.sh
 
 install: bundle ## Bundle bauen + installieren (ERSETZT das alte Bundle — nie überkopieren!)
 	@if [ -d "$(APP_DEST)/talker.app" ]; then \
