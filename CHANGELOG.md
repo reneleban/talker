@@ -18,6 +18,12 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Added
 
+- Modell-Downloader (Kern): talker kann Parakeet (sherpa-onnx-Release) und
+  gemma (ggml-org GGUF) selbst laden — SHA-256-verifiziert gegen gepinnte
+  Hashes, mit Fortschritt, Retry bei Fehler/Checksum-Mismatch und
+  Live-Freischaltung der Nicht-Roh-Modi, sobald gemma bereit ist. Downloads
+  passieren nur nach Lizenz-Zustimmung (neues Config-Feld
+  `model_download_consent`, Default aus). Die Erst-Start-UI dazu folgt.
 - Kontext-Awareness (opt-in, Default aus): talker wählt den Cleanup-Modus
   automatisch je fokussierter App (Regeln bundle-id → Modus in der Config,
   `context_aware_enabled` + `context_rules`); ohne Regel-Treffer gilt der
