@@ -1,0 +1,1 @@
+Leg einen neuen Branch an, implementiere die Validierung im Config-Modul und schreib einen Test dazu.

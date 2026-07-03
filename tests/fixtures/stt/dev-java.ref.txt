@@ -1,0 +1,1 @@
+Die Spring Boot Anwendung wirft eine NullPointerException im UserService.

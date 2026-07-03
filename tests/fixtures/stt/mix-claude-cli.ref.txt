@@ -1,0 +1,1 @@
+Öffne die Claude CLI und starte den Befehl noch einmal.

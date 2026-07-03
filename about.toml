@@ -1,0 +1,21 @@
+# cargo-about — generiert THIRD-PARTY.html (Ticket-0021).
+# Reproduzieren: cargo about generate about.hbs -o THIRD-PARTY.html
+# Akzeptierte Lizenzen konsistent zu deny.toml halten.
+
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+# Nur das reale Build-Target (macOS/Apple Silicon), wie in deny.toml.
+targets = ["aarch64-apple-darwin"]

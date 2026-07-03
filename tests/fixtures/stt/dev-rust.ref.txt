@@ -1,0 +1,1 @@
+Der Borrow Checker meckert, weil die Lifetime der Referenz zu kurz ist.

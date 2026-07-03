@@ -1,0 +1,40 @@
+[package]
+name = "talker"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+block2 = "0.6.2"
+core-foundation = "0.10.1"
+core-graphics = "0.25.0"
+cpal = "0.18.1"
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+encoding_rs = "0.8.35"
+llama-cpp-2 = "0.1.150"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSPasteboard", "NSPasteboardItem", "NSApplication", "NSButton", "NSControl", "NSView", "NSResponder", "NSRunningApplication", "NSScreen", "NSWindow", "NSColor", "NSGraphics", "NSWorkspace"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat"] }
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-core-image = { version = "0.3.2", features = ["CIFilter"] }
+objc2-foundation = { version = "0.3.2", features = ["NSTimer", "block2", "NSDate", "NSBundle", "NSKeyValueCoding", "NSValue"] }
+objc2-quartz-core = { version = "0.3.2", features = ["CALayer", "CAShapeLayer", "CATextLayer", "CAMediaTiming", "objc2-core-foundation", "CATransaction", "CAGradientLayer"] }
+objc2-service-management = { version = "0.3.2", features = ["SMAppService"] }
+rubato = "3.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+thiserror = "2.0.18"
+toml = "1.1.2"
+tray-icon = "0.24.1"
+winit = "0.30"
+
+[dev-dependencies]
+# Installiert den pre-commit-Hook aus .cargo-husky/hooks/ beim `cargo test`
+cargo-husky = { version = "1.5.0", default-features = false, features = ["user-hooks"] }
+hound = "3.5.1"
+png = "0.18.1"
+
+[lints.clippy]
+all = "warn"

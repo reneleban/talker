@@ -1,0 +1,1 @@
+Der useEffect Hook feuert doppelt, weil die Dependency Liste falsch ist.

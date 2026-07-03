@@ -1,0 +1,1 @@
+Füge dem Dockerfile einen Healthcheck hinzu und begrenze den Speicher des Containers auf fünfhundert Megabyte.

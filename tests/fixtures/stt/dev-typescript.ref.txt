@@ -1,0 +1,1 @@
+Ich habe das Interface in TypeScript um ein optionales Feld erweitert und den Type Guard angepasst.

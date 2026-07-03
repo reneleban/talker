@@ -1,0 +1,29 @@
+name: Feature Request
+description: Vorschlag für eine neue Fähigkeit oder Verbesserung
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Welches Problem löst das Feature?
+      description: Ausgangslage/Use-Case, nicht nur die Lösung.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Vorgeschlagene Lösung
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativen
+      description: Was hast du erwogen oder als Workaround benutzt?
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope-Check
+      options:
+        - label: Das Feature ist mit „nur macOS, 100 % lokal" vereinbar (kein Cloud-Anteil).
+          required: true

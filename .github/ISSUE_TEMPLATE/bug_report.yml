@@ -1,0 +1,48 @@
+name: Bug Report
+description: Ein reproduzierbarer Fehler in talker
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Was ist passiert?
+      description: Erwartetes vs. tatsächliches Verhalten.
+      placeholder: "Erwartet: … Tatsächlich: …"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduktionsschritte
+      placeholder: |
+        1. PTT-Taste halten
+        2. …
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Umgebung
+      description: macOS-Version, Chip, talker-Version/Commit
+      placeholder: "macOS 26.x, M4, talker 0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Betroffener Bereich
+      options:
+        - Aufnahme / PTT-Hotkey
+        - Spracherkennung (STT)
+        - Cleanup (LLM)
+        - Injection / Clipboard
+        - Einstellungen / UI
+        - Permissions / Onboarding
+        - Sonstiges
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Screenshots
+      description: Falls vorhanden. Keine sensiblen Transkripte posten.

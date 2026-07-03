@@ -1,0 +1,1 @@
+Setz das Flexbox Layout auf space between und gib dem Container mehr Padding.

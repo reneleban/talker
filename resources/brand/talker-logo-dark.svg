@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 88" width="300" height="88" role="img" aria-label="talker">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262454"/>
+      <stop offset="1" stop-color="#181630"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#59D9FF"/>
+      <stop offset="0.5" stop-color="#4073FF"/>
+      <stop offset="1" stop-color="#9E66FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Bildmarke: Squircle + Mikrofon-Glyph, identische Geometrie wie App-Icon
+       (examples/gen_icon.rs, 44er-Raster). Auf dunklem Grund hebt eine feine
+       Kontur den Squircle vom Hintergrund ab. -->
+  <g transform="translate(8,8) scale(1.6364)">
+    <rect x="0" y="0" width="44" height="44" rx="9.9" fill="url(#bg)" stroke="#3D3A78" stroke-width="1"/>
+    <g fill="none" stroke="#F5F5F5" stroke-width="2.8" stroke-linecap="round">
+      <rect x="16" y="6" width="12" height="18" rx="6" fill="#F5F5F5" stroke="none"/>
+      <path d="M12 20 a10 10 0 0 0 20 0"/>
+      <path d="M22 30 V34.5"/>
+      <path d="M15.5 36.5 H28.5"/>
+    </g>
+  </g>
+
+  <!-- Wortmarke -->
+  <text x="96" y="61" font-family="-apple-system, 'SF Pro Display', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="52" font-weight="600" letter-spacing="-1" fill="#F2F7FF">talker</text>
+  <rect x="98" y="70" width="146" height="4" rx="2" fill="url(#accent)"/>
+</svg>

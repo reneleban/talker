@@ -1,0 +1,17 @@
+#!/bin/sh
+# verify:fast als pre-commit-Gate (Ticket-0023).
+# Bewusst OHNE die modell-schweren Integrationstests (tests/cleanup_gemma.rs,
+# tests/stt_parakeet.rs) — die laufen via `make verify` bzw. später in CI.
+# Bewusst überspringen (Ausnahmefall!): git commit --no-verify
+set -eu
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --check
+
+echo "pre-commit: cargo clippy -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit: Unit-Tests"
+cargo test --lib --bins --examples
+
+echo "pre-commit: ok"

@@ -1,0 +1,1 @@
+Bau das Docker Image neu und push es in die Registry, sonst startet der Container nicht.

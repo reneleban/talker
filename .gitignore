@@ -1,0 +1,10 @@
+/target
+.DS_Store
+# Modelldateien nie einchecken (liegen lokal unter $HOME, siehe README)
+*.gguf
+*.onnx
+# Interne Workflow-Artefakte — lokal behalten, nicht veröffentlichen
+/docs/plan
+/docs/ticket
+/docs/prompt
+/docs/eval

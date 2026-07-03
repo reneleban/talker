@@ -1,0 +1,1 @@
+Das Deployment in Kubernetes hängt, weil das Pod Limit erreicht ist.

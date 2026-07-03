@@ -1,0 +1,1 @@
+Ändere die Hintergrundfarbe des Buttons auf blau und erhöhe das Padding auf zwölf Pixel.

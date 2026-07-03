@@ -1,0 +1,1 @@
+Die REST API liefert einen 404, weil die Route nicht registriert ist.

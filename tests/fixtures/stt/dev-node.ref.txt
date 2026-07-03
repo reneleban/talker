@@ -1,0 +1,1 @@
+Der Node Server crasht beim npm install wegen einer kaputten package lock.
