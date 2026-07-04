@@ -30,6 +30,12 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
   Inhalt verloren.
 - Interne Fehler (Config-Lock, Tray-Icon) werden sichtbar gemeldet bzw.
   geloggt statt still verschluckt.
+- Cleanup-Modus Natürlich normalisiert jetzt echte Mengen-, Datums- und
+  Zeitangaben zu Ziffern (z. B. „zwölftausendfünfhundert" → „12.500", auch
+  kleine eingebettete Zahlen wie „zwei" → „2") — im selben Format, das der
+  Modus Geschäftlich schon produziert. Ordinalzahlen und feste Redewendungen
+  mit Zahlwörtern („eins zu eins", „Schritt für Schritt") bleiben unverändert
+  Wort.
 
 ### Added
 
