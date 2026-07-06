@@ -46,6 +46,7 @@ else
   SIGN_ID="-"
   echo "⚠ kein talker-dev-Zertifikat — Ad-hoc-Signatur: Bedienungshilfen/Mikrofon"
   echo "  müssen nach JEDEM install neu erteilt werden. Fix (einmalig): make cert"
+  sleep 5
 fi
 echo "→ Signatur ($SIGN_ID) …"
 codesign --force -s "$SIGN_ID" "$APP/Contents/Frameworks/"*.dylib
