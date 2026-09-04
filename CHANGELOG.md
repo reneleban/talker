@@ -8,6 +8,14 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ## [Unreleased]
 
+### Security
+
+- `webbrowser` auf 1.2.2 aktualisiert (RUSTSEC-2026-0257): auf Unix setzte die alte
+  Version die URL in das `BROWSER`-Template ein und tokenisierte erst danach — eine
+  URL mit Leerzeichen konnte so zu zusätzlichen Browser-Argumenten werden
+  (z. B. `--remote-debugging-port`, `--proxy-server`). Transitiv über
+  eframe → egui-winit; nur `Cargo.lock`, kein API-Wechsel.
+
 ### Fixed
 
 - Vokabular-Korrektur greift nicht mehr zu hart: häufige Wörter werden nicht
