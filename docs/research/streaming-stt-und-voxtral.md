@@ -123,3 +123,20 @@ Dies sind Designvorschläge, keine Fakten aus Quellen.
 - Voxtral: Encoder-Größe (970M vs. 0,6B), Whisper-Vergleichswerte Deutsch, Runtime-RAM auf Mac, Reife der Rust-/audio.cpp-Implementierungen.
 - Migrationsaufwand `sherpa-rs` → `sherpa-onnx` (Binary-Download, Linking unter macOS, Feature-Parität für `TransducerRecognizer`).
 - Paraformer-Streaming für Deutsch: nichts gefunden, Nichtexistenz nicht belegt.
+
+## Nachtrag: PoC-Messung (2026-10-25)
+
+Aufbau: Wegwerf-Crate `poc-streaming/` (Branch `poc/streaming-nemotron`, nicht für `main`), `sherpa-onnx` 2.0.0. Modelle: `sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11` (Download 475 MB, SHA-256 `c6bf5e0d…05ae3a` identisch mit dem GitHub-Release-Digest, entpackt 667 MB) und das vorhandene Parakeet TDT 0.6b v3 int8 (OfflineRecognizer, `model_type = nemo_transducer`). Testdaten: die 24 TTS-Fixtures aus `tests/fixtures/stt/` (synthetische Stimme, ein Sprecher — nur indikativ), dieselbe WER-Funktion wie `examples/stt_eval.rs` (Kleinschreibung, ohne Satzzeichen). Hardware: der Mac des Entwicklers (Chip nicht erfasst). Nemotron: Audio in 200-ms-Stücken, 0,4 s Vorlauf-Stille, 1,2 s Nachlauf-Stille.
+
+| Kriterium (Annahme aus dem Grilling) | Messung | Urteil |
+|---|---|---|
+| Tempo: Partial ca. 1 s nach dem Wort | Erstes Partial bei 1,4 s Audio-Zeit, davon 0,4 s Vorlauf → ca. 1,0 s nach Sprechbeginn (vereinzelt 1,4–1,8 s). Nach Audio-Ende ca. 0,2–0,3 s bis zum Endtext. Chunk-Größe des Pakets fest 560 ms. | Grenzwertig erfüllt |
+| RAM: Nemotron zusätzlich höchstens ca. 1 GB | Spitzen-RSS des Prozesses: Nemotron allein 1,23 GB, Parakeet allein 1,26 GB. Beide gleichzeitig nicht gemessen; grob ca. 2,5 GB (Annahme, nicht belegt). Ruhe-RAM nach dem Laden nicht gemessen. | Als Zusatz zu Parakeet voraussichtlich verfehlt |
+| Qualität nahe Parakeet | Mittlere WER Nemotron 17,1 % (`language=de`; 17,3 % bei `auto`) vs. Parakeet 15,0 %. Parakeet schreibt Ziffern („12.500", „404", „12 Pixel") gegen Zahlwort-Referenzen; ohne die 4 betroffenen Fälle: Nemotron 19,2 %, Parakeet 14,0 %. Nemotron schreibt Zahlen als Wörter und liefert Interpunktion. Auffällig: „mergen" → „müdischen", „Claude CLI" → „Klaud Klei", „TOML" → „Tommel" (Parakeet: „Clot Klee", „Tommel"). | Parakeet besser, ca. 5 Punkte; „nahe genug" entscheidet der Nutzer |
+| Technik: Einrichtung ohne Hacks | Läuft über `OnlineTransducerModelConfig` (encoder/decoder/joiner/tokens, `greedy_search`), Sprache per `stream.set_option("language", "de")`. Parakeet läuft in `sherpa-onnx` über den `OfflineRecognizer` mit denselben Ergebnissen wie heute. | Erfüllt |
+
+Weitere Befunde:
+- **Kein Mischbetrieb:** `sherpa-rs-sys` und `sherpa-onnx-sys` 2.x bringen je eine statische sherpa-onnx-Bibliothek mit; im selben Binary fehlen beim Linken C++-Symbole (`OfflineRecognizer…`). Eine Migration muss `sherpa-rs` komplett ersetzen, ein schrittweiser Umstieg ist nicht möglich.
+- **Stille am Rand nötig:** Mit nur 0,3 s Nachlauf fehlten die letzten Wörter („gespro", „Lok"), ohne Vorlauf-Stille fehlte der Satzanfang. Für einen Live-Pfad braucht der Stream am Ende (PTT-Loslassen) mindestens ca. 1,2 s Stille; beim Start hilft Vorlauf.
+- Modell-Ladezeit 653 ms (Nemotron).
+- Nicht gemessen: Mikrofon-Betrieb, echte Stimmen, andere Chunk-Pakete (80/160/320/1120 ms), CPU-/Energie-Last, RAM beider Modelle zugleich.
