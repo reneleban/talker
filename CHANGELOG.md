@@ -10,6 +10,13 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Security
 
+- TLS-Stack aktualisiert (`rustls` 0.23.46, `rustls-webpki` 0.103.16,
+  `webpki-roots` 1.0.11): behebt mehrere RUSTSEC-Advisories (u. a. RUSTSEC-2026-0285,
+  RUSTSEC-2026-0346) — angenommene TLS-1.3-Handshake-Nachrichten auf der falschen
+  Verschlüsselungsstufe, `Debug`-Ausgabe mit TLS-Secrets, Brotli-Dekompression mit
+  bis zu 1 GiB Speicher vor der Authentifizierung, Downgrade durch unauthentifiziertes
+  ServerHello sowie Vertrauen in nicht mehr vertrauenswürdige Zwischenzertifikate.
+  Betrifft den Modell-Downloader (`ureq`). Nur `Cargo.lock`, kein API-Wechsel.
 - `webbrowser` auf 1.2.2 aktualisiert (RUSTSEC-2026-0257): auf Unix setzte die alte
   Version die URL in das `BROWSER`-Template ein und tokenisierte erst danach — eine
   URL mit Leerzeichen konnte so zu zusätzlichen Browser-Argumenten werden
