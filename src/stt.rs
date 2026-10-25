@@ -1,11 +1,13 @@
 //! stt: 16 kHz mono PCM → Raw Transcript.
 //!
 //! Engine hinter dem `Transcriber`-Trait (ADR-0001). Primäre Impl:
-//! Parakeet TDT 0.6b v3 (multilingual, de/en) via sherpa-onnx, on-device.
+//! Parakeet TDT 0.6b v3 (multilingual, de/en) via sherpa-onnx (Crate `sherpa-onnx`), on-device.
 
 use std::path::{Path, PathBuf};
 
-use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
+use sherpa_onnx::{
+    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+};
 
 use crate::error::{Result, TalkerError};
 
@@ -15,7 +17,7 @@ pub trait Transcriber {
 }
 
 pub struct ParakeetTranscriber {
-    inner: TransducerRecognizer,
+    inner: OfflineRecognizer,
 }
 
 const MODEL_FILES: [&str; 4] = [
@@ -39,21 +41,24 @@ impl ParakeetTranscriber {
                 )));
             }
         }
-        let path_str = |file: &str| model_dir.join(file).to_string_lossy().into_owned();
-        let config = TransducerConfig {
-            encoder: path_str("encoder.int8.onnx"),
-            decoder: path_str("decoder.int8.onnx"),
-            joiner: path_str("joiner.int8.onnx"),
-            tokens: path_str("tokens.txt"),
-            model_type: "nemo_transducer".into(),
-            decoding_method: "greedy_search".into(),
-            num_threads: 4,
-            sample_rate: crate::audio::TARGET_SAMPLE_RATE as i32,
-            feature_dim: 80,
+        let path = |file: &str| Some(model_dir.join(file).to_string_lossy().into_owned());
+        let config = OfflineRecognizerConfig {
+            model_config: OfflineModelConfig {
+                transducer: OfflineTransducerModelConfig {
+                    encoder: path("encoder.int8.onnx"),
+                    decoder: path("decoder.int8.onnx"),
+                    joiner: path("joiner.int8.onnx"),
+                },
+                tokens: path("tokens.txt"),
+                model_type: Some("nemo_transducer".into()),
+                num_threads: 4,
+                ..Default::default()
+            },
+            decoding_method: Some("greedy_search".into()),
             ..Default::default()
         };
-        let inner = TransducerRecognizer::new(config)
-            .map_err(|e| TalkerError::Stt(format!("Modell laden fehlgeschlagen: {e}")))?;
+        let inner = OfflineRecognizer::create(&config)
+            .ok_or_else(|| TalkerError::Stt("Modell laden fehlgeschlagen".into()))?;
         Ok(Self { inner })
     }
 
@@ -73,9 +78,10 @@ impl Transcriber for ParakeetTranscriber {
         if pcm_16k_mono.is_empty() {
             return Ok(String::new());
         }
-        let text = self
-            .inner
-            .transcribe(crate::audio::TARGET_SAMPLE_RATE, pcm_16k_mono);
+        let stream = self.inner.create_stream();
+        stream.accept_waveform(crate::audio::TARGET_SAMPLE_RATE as i32, pcm_16k_mono);
+        self.inner.decode(&stream);
+        let text = stream.get_result().map(|r| r.text).unwrap_or_default();
         Ok(text.trim().to_string())
     }
 }

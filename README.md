@@ -70,7 +70,7 @@ make install  # baut talker.app und installiert nach ~/Applications
      installiert `cargo`. `rust-toolchain.toml` zieht dann automatisch die gepinnte
      Version (1.94.1) inkl. `rustfmt`/`clippy`.
    - **cmake**: `brew install cmake` — baut das eingebettete llama.cpp (`llama-cpp-2`).
-   - **Netzwerk beim ersten Build**: `sherpa-rs` lädt vorgebaute onnxruntime-/sherpa-Dylibs.
+   - **Netzwerk beim ersten Build**: `sherpa-onnx-sys` lädt vorgebaute, statisch gelinkte onnxruntime-/sherpa-Bibliotheken.
 2. **Modelle laden** nach `~/Library/Application Support/talker/models/`
    (talker bundlet keine Modelle; sie stehen unter eigenen Lizenz-Terms —
    siehe [`docs/licensing.md`](docs/licensing.md)):

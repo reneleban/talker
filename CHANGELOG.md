@@ -8,6 +8,16 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ## [Unreleased]
 
+### Changed
+
+- Spracherkennung läuft jetzt über den offiziellen Crate `sherpa-onnx` 2.0.0
+  statt über das archivierte `sherpa-rs`. Modell (Parakeet TDT 0.6b v3), Trait
+  `Transcriber` und Config bleiben unverändert; einzelne Sätze werden durch die
+  neuere eingebettete Laufzeit minimal anders erkannt (24-Fälle-Testreihe:
+  mittlere WER 15,0 % statt 16,0 %, Begriff-Treffer unverändert 19/29). Die App
+  bringt keine losen Dylibs mehr mit (statisch gelinkt, Bundle ohne `Frameworks/`).
+  Grundlage für spätere Streaming-Modelle, siehe `docs/research/`.
+
 ### Security
 
 - TLS-Stack aktualisiert (`rustls` 0.23.46, `rustls-webpki` 0.103.16,

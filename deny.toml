@@ -25,8 +25,11 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
     # webpki-roots (CA-Zertifikat-Daten) — nur Build-Dependency von
-    # sherpa-rs-sys (ureq für den Binary-Download beim Build), nicht im Binary.
+    # sherpa-onnx-sys (ureq für den Binary-Download beim Build), nicht im Binary.
     "CDLA-Permissive-2.0",
+    # ppmd-rust (zip-Entpacken beim Build von sherpa-onnx-sys): „CC0-1.0 OR MIT-0",
+    # beide public-domain-artig; nur Build-Dependency.
+    "MIT-0",
     # epaint default_fonts (eingebettete UI-Fonts in egui): Font-Lizenzen,
     # erlauben Einbettung und Weitergabe.
     "OFL-1.1",
