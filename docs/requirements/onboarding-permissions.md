@@ -20,7 +20,7 @@ Funktionen, nicht auf Zeilennummern (bleiben über Refactors hinweg stabil).
   verweigert und das STT-Modell bereit ist, soll das System das
   Settings-Fenster unsichtbar starten (kein Onboarding nötig).
   (`src/main.rs:main` — `show_onboarding`, `src/ui.rs:SettingsApp::logic` — `hide_on_start`)
-- **REQ-ONBOARD-004**: WÄHREND das STT-Modell (Parakeet) noch nicht bereit ist,
+- **REQ-ONBOARD-004**: WÄHREND das STT-Modell (Nemotron) noch nicht bereit ist,
   soll das System im Settings-Fenster anstelle der regulären Tabs die
   Erst-Start-Einrichtung anzeigen (Lizenz-Consent → Download-Fortschritt →
   ggf. Fehleranzeige). (`src/ui.rs:SettingsApp::ui` — Setup-Gate, `src/ui.rs:setup_stage`)
@@ -28,7 +28,7 @@ Funktionen, nicht auf Zeilennummern (bleiben über Refactors hinweg stabil).
   und Modelle laden" klickt, soll das System den Modell-Download-Consent in
   der Config persistieren und die nötigen Modell-Downloads starten.
   (`src/ui.rs:SettingsApp::setup_view` — `SetupStage::Consent`)
-- **REQ-ONBOARD-006**: FALLS der Parakeet-Modell-Download fehlschlägt, DANN
+- **REQ-ONBOARD-006**: FALLS der STT-Modell-Download fehlschlägt, DANN
   soll das System die Fehlermeldung sichtbar anzeigen und einen
   „Erneut versuchen"-Button anbieten, der den Download neu startet.
   (`src/ui.rs:SettingsApp::setup_view` — `SetupStage::Failed`)

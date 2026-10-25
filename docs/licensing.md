@@ -36,11 +36,11 @@ Lizenzpflichten liegen beim Nutzer und gelten ab Download:
 | Modell | Quelle | Lizenz |
 |---|---|---|
 | gemma4:e2b (GGUF) | `ggml-org/gemma-4-E2B-it-GGUF` (Hugging Face) | [Google Gemma Terms of Use](https://ai.google.dev/gemma/terms) — kein OSS; Nutzungsbedingungen inkl. Prohibited-Use-Policy akzeptiert der Nutzer beim Download |
-| Parakeet TDT 0.6b v3 (int8, sherpa-onnx-Konvertierung) | k2-fsa/sherpa-onnx Releases, Original `nvidia/parakeet-tdt-0.6b-v3` | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) — Namensnennung NVIDIA erforderlich |
+| Nemotron 3.5 ASR Streaming 0.6b (int8, sherpa-onnx-Konvertierung) | k2-fsa/sherpa-onnx Releases, Original `nvidia/nemotron-3.5-asr-streaming-0.6b` | OpenMDW-1.1 laut [Model Card](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) („ready for commercial use"); Lizenztext und Pflichten vor einer Weitergabe prüfen |
 
-Hinweis zur Ticket-Annahme: Parakeet TDT 0.6b v3 steht laut Model Card auf
-Hugging Face unter **CC-BY-4.0**, nicht unter einer proprietären
-NVIDIA-Modell-Lizenz (geprüft 2026-07-03).
+Hinweis: Bis zum Modellwechsel (ADR-0008) nutzte talker Parakeet TDT 0.6b v3
+(CC-BY-4.0). Die OpenMDW-1.1-Angabe für Nemotron stammt aus der Model Card
+(2026-10-25); der Lizenztext selbst wurde nicht im Volltext geprüft.
 
 **Kopplung an einen künftigen App-Downloader:** sollte talker je Modelle
 selbst herunterladen, muss der Download-Flow die jeweiligen Terms anzeigen

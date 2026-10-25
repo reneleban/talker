@@ -1,9 +1,9 @@
-//! Integrationstest: Parakeet-Impl gegen fixe Audio-Samples (de + en).
-//! Benötigt das Modell unter dem Default-Pfad (siehe stt::ParakeetTranscriber).
+//! Integrationstest: Nemotron-Impl gegen fixe Audio-Samples (de + en).
+//! Benötigt das Modell unter dem Default-Pfad (siehe stt::NemotronTranscriber).
 
 use std::time::Instant;
 
-use talker::stt::{ParakeetTranscriber, Transcriber};
+use talker::stt::{NemotronTranscriber, Transcriber};
 
 fn read_wav_16k_mono(path: &str) -> Vec<f32> {
     let mut reader = hound::WavReader::open(path).expect("Fixture nicht lesbar");
@@ -16,9 +16,9 @@ fn read_wav_16k_mono(path: &str) -> Vec<f32> {
         .collect()
 }
 
-fn transcriber() -> ParakeetTranscriber {
-    ParakeetTranscriber::new(&ParakeetTranscriber::default_model_dir())
-        .expect("Parakeet-Modell fehlt — siehe Fehlermeldung für Download-Hinweis")
+fn transcriber() -> NemotronTranscriber {
+    NemotronTranscriber::new(&NemotronTranscriber::default_model_dir())
+        .expect("Nemotron-Modell fehlt — siehe Fehlermeldung für Download-Hinweis")
 }
 
 #[test]

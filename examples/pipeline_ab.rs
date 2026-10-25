@@ -1,6 +1,6 @@
 //! A/B/C-Vergleich der Pipelines auf den STT-Fixtures:
-//!   A: nur Parakeet (Raw Transcript)
-//!   B: Parakeet + Gemma-Cleanup (Geschäftlich; Anweisungs-Fälle zusätzlich LLM-Modus)
+//!   A: nur Nemotron (Raw Transcript)
+//!   B: Nemotron + Gemma-Cleanup (Geschäftlich; Anweisungs-Fälle zusätzlich LLM-Modus)
 //!   C: nur Gemma (Audio direkt via llama-mtmd-cli, Thinking nicht abschaltbar)
 //! Aufruf: make pipeline-ab
 
@@ -9,7 +9,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use talker::cleanup::{CleanupMode, GemmaCleaner, LlmCleaner};
-use talker::stt::{ParakeetTranscriber, Transcriber};
+use talker::stt::{NemotronTranscriber, Transcriber};
 
 fn normalize(text: &str) -> Vec<String> {
     text.to_lowercase()
@@ -110,8 +110,8 @@ fn main() {
         .map(str::to_string)
         .collect();
 
-    let mut stt = ParakeetTranscriber::new(&ParakeetTranscriber::default_model_dir())
-        .expect("Parakeet fehlt");
+    let mut stt = NemotronTranscriber::new(&NemotronTranscriber::default_model_dir())
+        .expect("Nemotron fehlt");
     let mut cleaner = GemmaCleaner::new(&GemmaCleaner::default_model_path()).expect("Gemma fehlt");
     cleaner.set_mode(CleanupMode::Business);
     // terms.txt = Nutzer-Vokabular (Ticket-0012): misst den Dictionary-Effekt.
@@ -122,7 +122,7 @@ fn main() {
     }
 
     println!(
-        "| Fall | WER A (Parakeet) | WER B (P+Gemma) | WER C (Gemma-Audio) | Lat. A | Lat. B | Lat. C* |"
+        "| Fall | WER A (Nemotron) | WER B (N+Gemma) | WER C (Gemma-Audio) | Lat. A | Lat. B | Lat. C* |"
     );
     println!("|---|---|---|---|---|---|---|");
     let mut sums = [(0.0, 0usize), (0.0, 0), (0.0, 0)];
@@ -197,7 +197,7 @@ fn main() {
     }
 
     println!();
-    for (label, i) in [("A Parakeet", 0), ("B P+Gemma", 1), ("C Gemma-Audio", 2)] {
+    for (label, i) in [("A Nemotron", 0), ("B N+Gemma", 1), ("C Gemma-Audio", 2)] {
         if sums[i].1 > 0 {
             println!(
                 "**{label}:** mittlere WER {:.1} %, Begriffe {}/{}",

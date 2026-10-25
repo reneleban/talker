@@ -154,5 +154,5 @@ flowchart LR
 Kein laufender Netzwerk-Egress außer dem einmaligen, zustimmungspflichtigen
 Modell-Download — Audio und Transkripte verlassen den Rechner nie
 (Nachweis: [`docs/security-audit.md`](../security-audit.md)). STT
-(`ParakeetTranscriber`) und Cleanup (`GemmaCleaner`) laufen beide in-process,
+(`NemotronTranscriber`) und Cleanup (`GemmaCleaner`) laufen beide in-process,
 kein Server, kein Daemon (ADR-0001, ADR-0003).

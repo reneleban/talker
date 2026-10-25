@@ -58,7 +58,7 @@ fn spawn_stt_worker(
         let mut worker = pipeline::DictationWorker::new(
             &cfg,
             models_state,
-            Box::new(|dir: &std::path::Path| stt::ParakeetTranscriber::new(dir)),
+            Box::new(|dir: &std::path::Path| stt::NemotronTranscriber::new(dir)),
             Box::new(try_load_cleaner),
         );
         report(&|ind| ind.ready(Instant::now()));
@@ -127,10 +127,7 @@ fn main() -> ExitCode {
     // Checksum-Check läuft im Hintergrund nach), unfertige Downloads bei
     // vorhandenem Consent direkt wieder anstoßen.
     let models_root = models::default_models_root();
-    let consent = config
-        .read()
-        .map(|c| c.model_download_consent)
-        .unwrap_or(false);
+    let consent = config.read().map(|c| c.models_consent()).unwrap_or(false);
     let models_state = Arc::new(models::ModelsState::from_disk_quick(&models_root, consent));
     models::spawn_integrity_check(Arc::clone(&models_state), models_root.clone());
     models::start_needed_downloads(&models_state, &models_root, consent);

@@ -2,7 +2,7 @@
 //! Download hinter mockbarem Trait, State-Maschine je Modell, Live-Aktivierung.
 //!
 //! Kein Download ohne Consent (Lizenz-Zustimmung, Flag in der Config).
-//! Parakeet lädt der Aufrufer blockierend (STT = Kern), gemma läuft als
+//! Das STT-Modell lädt der Aufrufer blockierend (STT = Kern), gemma läuft als
 //! Hintergrund-Task; wird gemma `ready`, schaltet der geteilte `ModelsState`
 //! die Nicht-Roh-Modi ohne Neustart frei. Die UI dazu liefert Ticket-0029.
 
@@ -16,32 +16,33 @@ use sha2::{Digest, Sha256};
 use crate::cleanup::CleanupMode;
 use crate::error::{Result, TalkerError};
 
-/// Parakeet TDT 0.6b v3 int8 — nicht-gated sherpa-onnx-Release (keine HF-Auth).
-pub const PARAKEET_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2";
-/// SHA-256 des Release-Tarballs (upstream unpubliziert — einmal geladen,
-/// berechnet und gepinnt, 2026-07-03).
-pub const PARAKEET_ARCHIVE_SHA256: &str =
-    "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf";
+/// Nemotron 3.5 ASR Streaming 0.6b (560-ms-Chunks) int8 — nicht-gated
+/// sherpa-onnx-Release (keine HF-Auth). Lizenz: NVIDIA OpenMDW-1.1.
+pub const STT_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2";
+/// SHA-256 des Release-Tarballs (475.271.763 Bytes; deckt sich mit dem
+/// Digest des GitHub-Releases, geladen und geprüft am 2026-10-25).
+pub const STT_ARCHIVE_SHA256: &str =
+    "c6bf5e0df765f9d5b43bc9e0536d4b4b3e7d40bdf5ecf13e45f134c51c05ae3a";
 /// Verzeichnisname im Tarball = erwarteter `stt_model_dir`-Name.
-pub const PARAKEET_DIR_NAME: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+pub const STT_DIR_NAME: &str = "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11";
 /// Die vier Modell-Dateien mit gepinnten SHA-256 (aus dem verifizierten
 /// Tarball berechnet) — Basis des Integritäts-Checks beim Laden.
-pub const PARAKEET_FILES: [(&str, &str); 4] = [
+pub const STT_FILES: [(&str, &str); 4] = [
     (
         "encoder.int8.onnx",
-        "acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247",
+        "012e9321373af99021415e0b0eb3ec827b4be3153be6f30d9b448fe65e896e68",
     ),
     (
         "decoder.int8.onnx",
-        "179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e",
+        "19f9c98fc6d0a2c33a65a43b36fdb2e914c26c0aa9764be3aebc502a1e982fb0",
     ),
     (
         "joiner.int8.onnx",
-        "3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3",
+        "4101c7c679a0bc30483794b27a059e34e79232aa2068d78d51231a22c8b0d7ce",
     ),
     (
         "tokens.txt",
-        "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+        "729cc103155bafa785f9cd45746cd41cabe97eab7182fc04d594129587958f8a",
     ),
 ];
 
@@ -52,10 +53,10 @@ pub const GEMMA_FILE_NAME: &str = "gemma-4-E2B-it-Q8_0.gguf";
 /// SHA-256 des GGUF (Grill 2026-07-03; deckt sich mit dem HF-ETag).
 pub const GEMMA_SHA256: &str = "e049411c01fb7a81161768c52e38828970e55a64e22738957adcbe51d20f1c8e";
 
-/// Beide Modelle des Features. Parakeet = Pflicht/blockierend, gemma = Hintergrund.
+/// Beide Modelle des Features. STT = Pflicht/blockierend, gemma = Hintergrund.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelId {
-    Parakeet,
+    Stt,
     Gemma,
 }
 
@@ -132,7 +133,7 @@ pub enum ModelSpec {
         sha256: String,
         dest: PathBuf,
     },
-    /// tar.bz2-Archiv (Parakeet): laden → verifizieren → nach `root` entpacken;
+    /// tar.bz2-Archiv (STT-Modell): laden → verifizieren → nach `root` entpacken;
     /// `files` = erwartete Dateien mit gepinnten Hashes (Post-Extract-Check).
     Archive {
         url: String,
@@ -153,15 +154,15 @@ pub fn default_models_root() -> PathBuf {
 /// Spec eines Modells unterhalb von `models_root` (Produktions-Konstanten).
 pub fn spec_for(id: ModelId, models_root: &Path) -> ModelSpec {
     match id {
-        ModelId::Parakeet => ModelSpec::Archive {
-            url: PARAKEET_URL.into(),
-            sha256: PARAKEET_ARCHIVE_SHA256.into(),
+        ModelId::Stt => ModelSpec::Archive {
+            url: STT_URL.into(),
+            sha256: STT_ARCHIVE_SHA256.into(),
             root: models_root.to_path_buf(),
-            files: PARAKEET_FILES
+            files: STT_FILES
                 .iter()
                 .map(|(name, sha)| {
                     (
-                        models_root.join(PARAKEET_DIR_NAME).join(name),
+                        models_root.join(STT_DIR_NAME).join(name),
                         (*sha).to_string(),
                     )
                 })
@@ -376,14 +377,14 @@ impl ModelFetcher for HttpFetcher {
 /// Geteilter Zustand beider Modelle — Kern der Live-Aktivierung (AK 4):
 /// Pipeline/UI lesen hier, der Download-Runner schreibt.
 pub struct ModelsState {
-    parakeet: Mutex<ModelState>,
+    stt: Mutex<ModelState>,
     gemma: Mutex<ModelState>,
 }
 
 impl ModelsState {
-    pub fn new(parakeet: ModelState, gemma: ModelState) -> Self {
+    pub fn new(stt: ModelState, gemma: ModelState) -> Self {
         Self {
-            parakeet: Mutex::new(parakeet),
+            stt: Mutex::new(stt),
             gemma: Mutex::new(gemma),
         }
     }
@@ -391,19 +392,19 @@ impl ModelsState {
     /// Zustand aus dem Disk-Befund unter `models_root` + Consent-Flag.
     pub fn from_disk(models_root: &Path, consent: bool) -> Self {
         let state = |id| initial_state(check(&spec_for(id, models_root)), consent);
-        Self::new(state(ModelId::Parakeet), state(ModelId::Gemma))
+        Self::new(state(ModelId::Stt), state(ModelId::Gemma))
     }
 
     /// Wie `from_disk`, aber nur Präsenz (kein Hashing) — Start-Pfad;
     /// danach `spawn_integrity_check` fürs volle Checksum-Urteil starten.
     pub fn from_disk_quick(models_root: &Path, consent: bool) -> Self {
         let state = |id| initial_state(check_presence(&spec_for(id, models_root)), consent);
-        Self::new(state(ModelId::Parakeet), state(ModelId::Gemma))
+        Self::new(state(ModelId::Stt), state(ModelId::Gemma))
     }
 
     fn slot(&self, id: ModelId) -> &Mutex<ModelState> {
         match id {
-            ModelId::Parakeet => &self.parakeet,
+            ModelId::Stt => &self.stt,
             ModelId::Gemma => &self.gemma,
         }
     }
@@ -422,15 +423,15 @@ impl ModelsState {
         }
     }
 
-    /// PTT/STT nutzbar? Nur wenn Parakeet installiert und verifiziert ist.
+    /// PTT/STT nutzbar? Nur wenn das STT-Modell installiert und verifiziert ist.
     pub fn stt_ready(&self) -> bool {
-        self.get(ModelId::Parakeet) == ModelState::Ready
+        self.get(ModelId::Stt) == ModelState::Ready
     }
 
     /// Läuft gerade ein Download/Verify? (Ticket-0030: Self-Relaunch wartet,
     /// statt einen laufenden Modell-Download abzubrechen.)
     pub fn any_download_running(&self) -> bool {
-        [ModelId::Parakeet, ModelId::Gemma].into_iter().any(|id| {
+        [ModelId::Stt, ModelId::Gemma].into_iter().any(|id| {
             matches!(
                 self.get(id),
                 ModelState::Downloading { .. } | ModelState::Verifying
@@ -583,7 +584,7 @@ pub fn start_download(state: &Arc<ModelsState>, id: ModelId, models_root: &Path,
 /// Stößt alle nötigen Downloads an (Erst-Start nach Consent bzw. App-Start
 /// mit unvollständigem Setup). Ohne Consent passiert nichts.
 pub fn start_needed_downloads(state: &Arc<ModelsState>, models_root: &Path, consent: bool) {
-    for id in [ModelId::Parakeet, ModelId::Gemma] {
+    for id in [ModelId::Stt, ModelId::Gemma] {
         start_download(state, id, models_root, consent);
     }
 }
@@ -596,7 +597,7 @@ pub fn spawn_integrity_check(
     models_root: PathBuf,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        for id in [ModelId::Parakeet, ModelId::Gemma] {
+        for id in [ModelId::Stt, ModelId::Gemma] {
             if state.get(id) != ModelState::Ready {
                 continue;
             }
@@ -873,7 +874,7 @@ mod tests {
             check_files(&[(good.clone(), sha_of(b"anderer inhalt"))]),
             ModelStatus::Corrupt
         );
-        // Teilweise da (Parakeet: 3 von 4 Dateien) → Corrupt, nicht Missing.
+        // Teilweise da (STT-Modell: 3 von 4 Dateien) → Corrupt, nicht Missing.
         assert_eq!(
             check_files(&[(good, sha.clone()), (dir.path("fehlt.bin"), sha)]),
             ModelStatus::Corrupt
@@ -898,15 +899,13 @@ mod tests {
     #[test]
     fn spec_for_builds_paths_under_models_root() {
         let root = Path::new("/tmp/wurzel");
-        let ModelSpec::Archive { files, .. } = spec_for(ModelId::Parakeet, root) else {
-            panic!("Parakeet muss ein Archiv sein");
+        let ModelSpec::Archive { files, .. } = spec_for(ModelId::Stt, root) else {
+            panic!("STT-Modell muss ein Archiv sein");
         };
         assert_eq!(files.len(), 4);
-        assert!(
-            files[0]
-                .0
-                .starts_with("/tmp/wurzel/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
-        );
+        assert!(files[0].0.starts_with(
+            "/tmp/wurzel/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11"
+        ));
         let ModelSpec::File { dest, sha256, .. } = spec_for(ModelId::Gemma, root) else {
             panic!("gemma muss eine Einzeldatei sein");
         };
@@ -1087,7 +1086,7 @@ mod tests {
         assert_eq!(state.get(ModelId::Gemma), ModelState::Ready);
     }
 
-    // --- AK 2: Archiv-Pfad (Parakeet) ----------------------------------------
+    // --- AK 2: Archiv-Pfad (STT-Modell) ----------------------------------------
 
     #[test]
     fn archive_download_extracts_and_passes_integrity_check() {
@@ -1098,9 +1097,9 @@ mod tests {
         let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(archive.clone())]);
         let state = ModelsState::new(ModelState::Missing, ModelState::Ready);
 
-        run_download(&state, ModelId::Parakeet, &spec, &fetcher, true).unwrap();
+        run_download(&state, ModelId::Stt, &spec, &fetcher, true).unwrap();
 
-        assert_eq!(state.get(ModelId::Parakeet), ModelState::Ready);
+        assert_eq!(state.get(ModelId::Stt), ModelState::Ready);
         assert_eq!(fs::read(dir.path("m/tokens.txt")).unwrap(), b"a b c");
         assert!(!spec.partial_path().exists(), "Tarball muss entfernt sein");
         assert_eq!(check(&spec), ModelStatus::Ready);
@@ -1122,10 +1121,10 @@ mod tests {
         let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(archive)]);
         let state = ModelsState::new(ModelState::Missing, ModelState::Ready);
 
-        let err = run_download(&state, ModelId::Parakeet, &spec, &fetcher, true).unwrap_err();
+        let err = run_download(&state, ModelId::Stt, &spec, &fetcher, true).unwrap_err();
 
         assert!(err.to_string().contains("Integritäts-Check"));
-        assert_eq!(state.get(ModelId::Parakeet), ModelState::Corrupt);
+        assert_eq!(state.get(ModelId::Stt), ModelState::Corrupt);
     }
 
     #[test]
@@ -1143,8 +1142,8 @@ mod tests {
         let fetcher = FakeFetcher::new(vec![FakeStep::Deliver(broken)]);
         let state = ModelsState::new(ModelState::Missing, ModelState::Ready);
 
-        assert!(run_download(&state, ModelId::Parakeet, &spec, &fetcher, true).is_err());
-        assert!(matches!(state.get(ModelId::Parakeet), ModelState::Error(_)));
+        assert!(run_download(&state, ModelId::Stt, &spec, &fetcher, true).is_err());
+        assert!(matches!(state.get(ModelId::Stt), ModelState::Error(_)));
         assert!(!spec.partial_path().exists());
     }
 
@@ -1178,9 +1177,9 @@ mod tests {
     }
 
     #[test]
-    fn stt_gating_only_ready_parakeet_allows_ptt() {
-        // Nur Roh/kein PTT solange Parakeet nicht ready (AK 5, Gating-Signal).
-        for (parakeet, expected) in [
+    fn stt_gating_only_ready_stt_model_allows_ptt() {
+        // Nur Roh/kein PTT solange das STT-Modell nicht ready ist (AK 5, Gating-Signal).
+        for (stt, expected) in [
             (ModelState::Missing, false),
             (ModelState::ConsentPending, false),
             (ModelState::Downloading { pct: 99 }, false),
@@ -1189,8 +1188,8 @@ mod tests {
             (ModelState::Error("x".into()), false),
             (ModelState::Ready, true),
         ] {
-            let state = ModelsState::new(parakeet.clone(), ModelState::Missing);
-            assert_eq!(state.stt_ready(), expected, "{parakeet:?}");
+            let state = ModelsState::new(stt.clone(), ModelState::Missing);
+            assert_eq!(state.stt_ready(), expected, "{stt:?}");
         }
     }
 
@@ -1396,7 +1395,7 @@ mod tests {
 
         assert_eq!(state.get(ModelId::Gemma), ModelState::Corrupt);
         assert_eq!(
-            state.get(ModelId::Parakeet),
+            state.get(ModelId::Stt),
             ModelState::Missing,
             "fehlende Modelle bleiben unberührt"
         );
@@ -1410,9 +1409,9 @@ mod tests {
             ModelState::Ready,
             ModelState::Downloading { pct: 40 },
         ));
-        start_download(&state, ModelId::Parakeet, &dir.0, true);
+        start_download(&state, ModelId::Stt, &dir.0, true);
         start_download(&state, ModelId::Gemma, &dir.0, true);
-        assert_eq!(state.get(ModelId::Parakeet), ModelState::Ready);
+        assert_eq!(state.get(ModelId::Stt), ModelState::Ready);
         assert_eq!(
             state.get(ModelId::Gemma),
             ModelState::Downloading { pct: 40 }
@@ -1420,7 +1419,7 @@ mod tests {
         // Ohne Consent auch bei Bedarf kein Anstoß.
         let state = Arc::new(ModelsState::new(ModelState::Missing, ModelState::Missing));
         start_needed_downloads(&state, &dir.0, false);
-        assert_eq!(state.get(ModelId::Parakeet), ModelState::Missing);
+        assert_eq!(state.get(ModelId::Stt), ModelState::Missing);
         assert_eq!(state.get(ModelId::Gemma), ModelState::Missing);
     }
 
@@ -1437,7 +1436,7 @@ mod tests {
             let state = ModelsState::new(ModelState::Ready, gemma.clone());
             assert_eq!(state.any_download_running(), expected, "{gemma:?}");
         }
-        // Beide Slots zählen — auch Parakeet allein.
+        // Beide Slots zählen — auch das STT-Modell allein.
         let state = ModelsState::new(ModelState::Downloading { pct: 9 }, ModelState::Missing);
         assert!(state.any_download_running());
     }
@@ -1447,11 +1446,11 @@ mod tests {
         let dir = TempDir::new("from-disk");
         // Nichts installiert, kein Consent → beide consent-pending.
         let state = ModelsState::from_disk(&dir.0, false);
-        assert_eq!(state.get(ModelId::Parakeet), ModelState::ConsentPending);
+        assert_eq!(state.get(ModelId::Stt), ModelState::ConsentPending);
         assert_eq!(state.get(ModelId::Gemma), ModelState::ConsentPending);
         // Mit Consent → beide missing (bereit zum Download).
         let state = ModelsState::from_disk(&dir.0, true);
-        assert_eq!(state.get(ModelId::Parakeet), ModelState::Missing);
+        assert_eq!(state.get(ModelId::Stt), ModelState::Missing);
         assert_eq!(state.get(ModelId::Gemma), ModelState::Missing);
     }
 }

@@ -348,7 +348,7 @@ impl SettingsApp {
             // Status je Modell + Neu laden/Reparieren (Ticket-0029, AK 4/5);
             // gemma-Hintergrund-Fortschritt erscheint als Balken unter der Zeile.
             for (id, label) in [
-                (ModelId::Parakeet, "Spracherkennung (Parakeet)"),
+                (ModelId::Stt, "Spracherkennung (Nemotron)"),
                 (ModelId::Gemma, "Cleanup-LLM (gemma4:e2b)"),
             ] {
                 let state = self.models_state.get(id);
@@ -357,7 +357,7 @@ impl SettingsApp {
                     if let Some(button_label) = action
                         && ui.button(button_label).clicked()
                     {
-                        if snapshot.model_download_consent {
+                        if snapshot.models_consent() {
                             models::start_download(&self.models_state, id, &self.models_root, true);
                         } else {
                             self.save_note =
@@ -784,7 +784,7 @@ impl SettingsApp {
         });
     }
 
-    /// Erst-Start-Setup (Ticket-0029): Lizenz-Consent → Parakeet-Fortschritt
+    /// Erst-Start-Setup (Ticket-0029): Lizenz-Consent → STT-Fortschritt
     /// (blockiert die Nutzung) → bei Fehler sichtbar + Retry.
     fn setup_view(&mut self, ui: &mut egui::Ui, stage: SetupStage) {
         Self::section_title(ui, "EINRICHTUNG");
@@ -795,12 +795,12 @@ impl SettingsApp {
                      danach vollständig lokal auf diesem Mac:",
                 );
                 ui.add_space(4.0);
-                ui.label("• Spracherkennung: Parakeet TDT 0.6b v3 (~0,5 GB)");
+                ui.label("• Spracherkennung: Nemotron 3.5 ASR Streaming 0.6b (~0,5 GB)");
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Lizenz:").small().weak());
                     ui.hyperlink_to(
-                        "CC-BY-4.0 (NVIDIA)",
-                        "https://creativecommons.org/licenses/by/4.0/",
+                        "OpenMDW-1.1 (NVIDIA)",
+                        "https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b",
                     );
                 });
                 ui.label("• Cleanup-LLM: gemma4:e2b (~5 GB, lädt im Hintergrund)");
@@ -827,9 +827,12 @@ impl SettingsApp {
                     .button("Lizenzen akzeptieren und Modelle laden")
                     .clicked()
                 {
-                    self.update_config(|c| c.model_download_consent = true);
+                    self.update_config(|c| {
+                        c.model_download_consent = true;
+                        c.stt_license_consent = true;
+                    });
                     // consent-pending → missing, dann Downloads anstoßen.
-                    for id in [ModelId::Parakeet, ModelId::Gemma] {
+                    for id in [ModelId::Stt, ModelId::Gemma] {
                         if self.models_state.get(id) == ModelState::ConsentPending {
                             self.models_state.set(id, ModelState::Missing);
                         }
@@ -838,7 +841,7 @@ impl SettingsApp {
                 }
             }
             SetupStage::Downloading => {
-                let state = self.models_state.get(ModelId::Parakeet);
+                let state = self.models_state.get(ModelId::Stt);
                 ui.label(
                     "Die Spracherkennung wird eingerichtet — danach ist talker \
                      sofort nutzbar (Modus Roh).",
@@ -867,7 +870,7 @@ impl SettingsApp {
                 if ui.button("Erneut versuchen").clicked() {
                     models::start_download(
                         &self.models_state,
-                        ModelId::Parakeet,
+                        ModelId::Stt,
                         &self.models_root,
                         true,
                     );
@@ -961,14 +964,14 @@ impl eframe::App for SettingsApp {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(4.0);
-                // Setup-Gate (Ticket-0029): bis Parakeet ready ist, ersetzt das
+                // Setup-Gate (Ticket-0029): bis das STT-Modell ready ist, ersetzt das
                 // Erst-Start-Setup die Tabs — Consent, Fortschritt, Fehler.
                 let consent = self
                     .config
                     .read()
-                    .map(|c| c.model_download_consent)
+                    .map(|c| c.models_consent())
                     .unwrap_or(false);
-                let stage = setup_stage(consent, &self.models_state.get(ModelId::Parakeet));
+                let stage = setup_stage(consent, &self.models_state.get(ModelId::Stt));
                 if stage != SetupStage::Done {
                     ui.heading("talker — Einrichtung");
                     self.permissions_section(ui);
@@ -1002,27 +1005,27 @@ impl eframe::App for SettingsApp {
 }
 
 /// Setup-Phase des Erst-Start-Fensters (Ticket-0029). Reine Logik, egui-frei:
-/// Consent-Gate vor allem anderen, dann blockiert Parakeet bis `ready`.
+/// Consent-Gate vor allem anderen, dann blockiert das STT-Modell bis `ready`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetupStage {
     /// Lizenzen noch nicht akzeptiert — kein Download.
     Consent,
-    /// Parakeet lädt/prüft; App-Nutzung bleibt gesperrt.
+    /// STT-Modell lädt/prüft; App-Nutzung bleibt gesperrt.
     Downloading,
-    /// Parakeet-Download gescheitert — Fehler zeigen + Retry.
+    /// STT-Download gescheitert — Fehler zeigen + Retry.
     Failed(String),
-    /// Parakeet ready — Setup vorbei, normale Einstellungen.
+    /// STT-Modell ready — Setup vorbei, normale Einstellungen.
     Done,
 }
 
-pub(crate) fn setup_stage(consent: bool, parakeet: &ModelState) -> SetupStage {
-    if *parakeet == ModelState::Ready {
+pub(crate) fn setup_stage(consent: bool, stt: &ModelState) -> SetupStage {
+    if *stt == ModelState::Ready {
         return SetupStage::Done;
     }
     if !consent {
         return SetupStage::Consent;
     }
-    match parakeet {
+    match stt {
         ModelState::Corrupt => {
             SetupStage::Failed("Checksum-Prüfung fehlgeschlagen — die Datei war beschädigt.".into())
         }
@@ -1091,7 +1094,7 @@ mod tests {
     }
 
     /// Consent-Gate (Ticket-0029, DoD): vor Accept nie Downloading — egal
-    /// welcher Modell-Zustand; nach Accept blockiert Parakeet bis ready.
+    /// welcher Modell-Zustand; nach Accept blockiert das STT-Modell bis ready.
     #[test]
     fn setup_stage_gates_consent_before_any_download() {
         for state in [

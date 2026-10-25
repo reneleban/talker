@@ -1,6 +1,6 @@
 # Modell-Downloader — Anforderungen (EARS)
 
-Feature-Bereich: Erst-Start-Download von STT-Modell (Parakeet, blockierend)
+Feature-Bereich: Erst-Start-Download von STT-Modell (Nemotron, blockierend)
 und Cleanup-LLM (gemma4:e2b, Hintergrund) inkl. Lizenz-Consent,
 SHA-256-Verifikation und Resume abgebrochener Downloads.
 
@@ -9,7 +9,7 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
 ## Lizenz-Consent
 
 - **REQ-MODEL-001**: WÄHREND das Consent-Flag `model_download_consent` nicht
-  gesetzt ist, soll das System für Parakeet und gemma den Zustand
+  gesetzt ist, soll das System für das STT-Modell und gemma den Zustand
   `ConsentPending` halten und keinen Download starten
   (`src/models.rs:initial_state`, `run_download`; Ticket-0028 AK 3/6).
 - **REQ-MODEL-002**: FALLS `run_download` ohne gesetztes Consent-Flag
@@ -17,12 +17,12 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
   zurücksetzen und den Download mit einem Fehler verweigern
   (`src/models.rs:run_download`; Ticket-0028 AK 6).
 - **REQ-MODEL-003**: WENN der Nutzer im Erst-Start-Fenster „Lizenzen
-  akzeptieren und Modelle laden" bestätigt, soll das System das
-  Consent-Flag in der Config persistieren und anschließend die Downloads
-  für Parakeet und gemma anstoßen (`src/ui.rs:setup_view`
+  akzeptieren und Modelle laden" bestätigt, soll das System beide
+  Consent-Flags (`model_download_consent`, `stt_license_consent`) in der Config persistieren und anschließend die Downloads
+  für das STT-Modell und gemma anstoßen (`src/ui.rs:setup_view`
   `SetupStage::Consent`; Ticket-0029 AK 1).
 - **REQ-MODEL-004**: Das System soll im Consent-Schritt beide Lizenzen
-  (CC-BY-4.0 für Parakeet/NVIDIA, Google Gemma Terms of Use inkl.
+  (OpenMDW-1.1 für Nemotron/NVIDIA, Google Gemma Terms of Use inkl.
   Prohibited-Use-Policy) mit Verweis-Link anzeigen, bevor ein Download
   startet (`src/ui.rs:setup_view` `SetupStage::Consent`; Ticket-0029 AK 1,
   `docs/licensing.md`).
@@ -34,7 +34,7 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
   keine Datei vorhanden → `Missing`, alle Dateien vorhanden mit korrektem
   Hash → `Ready`, sonst → `Corrupt` (`src/models.rs:check_files`,
   `check`; Ticket-0028 AK 1).
-- **REQ-MODEL-006**: WÄHREND Parakeet nicht im Zustand `Ready` ist, soll
+- **REQ-MODEL-006**: WÄHREND das STT-Modell nicht im Zustand `Ready` ist, soll
   das System Push-to-talk blockieren und den Zustandstext aus
   `setup_hint()` anzeigen (`src/models.rs:setup_hint`,
   `src/pipeline.rs:press`; Ticket-0028 AK 3, Ticket-0029 AK 3).
@@ -46,7 +46,7 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
   System die Nicht-Roh-Cleanup-Modi ohne Neustart über den geteilten
   `ModelsState` freischalten (`src/models.rs:llm_modes_available`;
   Ticket-0028 AK 4).
-- **REQ-MODEL-009**: Das System soll Parakeet-Downloads blockierend im
+- **REQ-MODEL-009**: Das System soll den STT-Download blockierend im
   Vordergrund und den gemma-Download als Hintergrund-Task ausführen, ohne
   dass ein laufender gemma-Download Push-to-talk blockiert
   (`src/models.rs:spawn_background_download`, `run_download`;
@@ -57,7 +57,7 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
   Einstellungen als Fortschrittsbalken anzeigen (`src/models.rs:percent`,
   `src/ui.rs:SettingsApp::setup_view` — `SetupStage::Downloading`,
   `src/ui.rs:SettingsApp::settings_section`; Ticket-0029 AK 1/4).
-- **REQ-MODEL-011**: WÄHREND das Setup nicht abgeschlossen ist (Parakeet
+- **REQ-MODEL-011**: WÄHREND das Setup nicht abgeschlossen ist (STT-Modell
   nicht `Ready`), soll das System das Tray-Icon im durchgestrichenen
   Setup-Zustand anzeigen (`src/tray.rs:set_setup`,
   `MicStyle::Setup`; Ticket-0029 AK 2).
@@ -99,7 +99,7 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
 
 ## Setup-Gate & Live-Aktivierung
 
-- **REQ-MODEL-019**: WÄHREND Parakeet nicht im Zustand `Ready` ist, soll
+- **REQ-MODEL-019**: WÄHREND das STT-Modell nicht im Zustand `Ready` ist, soll
   das System das Erst-Start-Setup anstelle der normalen
   Einstellungs-Tabs anzeigen (`src/ui.rs:setup_stage`, `src/ui.rs:SettingsApp::ui`;
   Ticket-0029 AK 1).
@@ -109,3 +109,17 @@ Muster/ID-Konvention: siehe [`README.md`](README.md). Begriffe: `CONTEXT.md`.
   Aktions-Button („Neu laden" bei `Missing`, „Reparieren" bei `Corrupt`
   oder `Error`) anzeigen (`src/models.rs:ModelState::status_line`,
   `src/ui.rs:SettingsApp::settings_section`; Ticket-0029 AK 4).
+
+## Modellwechsel Parakeet → Nemotron (ADR-0008)
+
+- **REQ-MODEL-021**: FALLS die Config `model_download_consent` gesetzt hat,
+  aber `stt_license_consent` fehlt oder `false` ist, DANN soll das System den
+  Lizenz-Consent als nicht erteilt behandeln, das STT-Modell im Zustand
+  `ConsentPending` halten und den Lizenz-Schritt erneut anzeigen
+  (`src/config.rs:Config::models_consent`, `src/main.rs:main`,
+  `src/ui.rs:SettingsApp::ui`; ADR-0008).
+- **REQ-MODEL-022**: WENN eine Config ein `stt_model_dir` enthält, das auf das
+  frühere Parakeet-Verzeichnis zeigt (egal unter welchem Elternpfad), DANN soll
+  das System es beim Laden auf das Nemotron-Standardverzeichnis setzen;
+  eigene, andere Verzeichnisse bleiben unverändert
+  (`src/config.rs:Config::parse`; ADR-0008, `docs/stability.md`).

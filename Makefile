@@ -40,7 +40,7 @@ stress: ## Cleanup-Stress-Testreihe (EVAL-0001) gegen das echte Modell
 stt-eval: ## STT-Qualitäts-Testreihe (EVAL-0002); Fixtures: scripts/gen_stt_fixtures.sh
 	cargo run --release --example stt_eval
 
-pipeline-ab: ## Pipeline-Vergleich A/B/C (EVAL-0003): Parakeet vs +Gemma vs Gemma-Audio
+pipeline-ab: ## Pipeline-Vergleich A/B/C (EVAL-0003): Nemotron vs +Gemma vs Gemma-Audio
 	cargo run --release --example pipeline_ab
 
 run: ## App aus dem Quellbaum starten

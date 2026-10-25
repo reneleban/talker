@@ -34,7 +34,7 @@ Alles lokal — auch dein Prompt-Rohmaterial geht an keine Cloud.
 
 - **Push-to-talk systemweit**: globale Taste (Default Fn/🌐) halten und
   sprechen — funktioniert in jeder App, die Texteingabe annimmt.
-- **Lokale Spracherkennung** (de/en): Parakeet TDT 0.6b v3 via sherpa-onnx.
+- **Lokale Spracherkennung** (de/en): NVIDIA Nemotron 3.5 ASR Streaming 0.6b via sherpa-onnx.
 - **Cleanup-Modi** (gemma4:e2b, eingebettetes llama.cpp — kein Server, kein
   Daemon): `Roh` (Transkript unverändert), `Geschäftlich` (formal, entfernt
   unsichere Floskeln), `Natürlich` (nur Füllwörter/Interpunktion, dein Ton
@@ -74,7 +74,7 @@ make install  # baut talker.app und installiert nach ~/Applications
 2. **Modelle laden** nach `~/Library/Application Support/talker/models/`
    (talker bundlet keine Modelle; sie stehen unter eigenen Lizenz-Terms —
    siehe [`docs/licensing.md`](docs/licensing.md)):
-   - `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/` — [Download](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2) (entpacken)
+   - `sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11/` — [Download](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2) (entpacken; talker lädt es beim Erst-Start auch selbst)
    - `gemma-4-E2B-it-Q8_0.gguf` — von `ggml-org/gemma-4-E2B-it-GGUF` (Hugging Face)
 3. **Signatur-Zertifikat anlegen (einmalig):** `make cert` — sonst verfallen
    die Permissions bei jedem Update (siehe Known Issue unten).
