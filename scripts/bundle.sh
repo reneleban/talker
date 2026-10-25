@@ -29,15 +29,6 @@ echo "→ Bundle zusammensetzen …"
 cp target/release/talker "$APP/Contents/MacOS/talker"
 cp resources/Info.plist "$APP/Contents/Info.plist"
 
-# sherpa-rs (download-binaries) linkt dynamisch gegen diese Dylibs; sie liegen
-# unter target/release neben dem Binary. Ins Bundle einbetten + RPATH setzen,
-# sonst startet die .app nicht (dyld: Library not loaded @rpath/...).
-echo "→ Dylibs einbetten …"
-mkdir -p "$APP/Contents/Frameworks"
-cp target/release/libonnxruntime.1.17.1.dylib "$APP/Contents/Frameworks/"
-cp target/release/libsherpa-onnx-c-api.dylib "$APP/Contents/Frameworks/"
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/talker"
-
 # Stabile Signatur-Identität bevorzugen: bei Ad-hoc invalidiert jeder Rebuild
 # die TCC-Permissions (Accessibility/Mikrofon müssten neu erteilt werden).
 if security find-identity -p codesigning -v | grep -q '"talker-dev"'; then
@@ -49,7 +40,6 @@ else
   sleep 5
 fi
 echo "→ Signatur ($SIGN_ID) …"
-codesign --force -s "$SIGN_ID" "$APP/Contents/Frameworks/"*.dylib
 codesign --force -s "$SIGN_ID" "$APP"
 
 echo "✓ Fertig: $APP"
