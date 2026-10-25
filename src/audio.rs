@@ -13,7 +13,7 @@ use rubato::{Fft, FixedSync, Resampler};
 
 use crate::error::{Result, TalkerError};
 
-/// Zielformat für STT (Parakeet/Whisper): 16 kHz mono.
+/// Zielformat für STT (Nemotron/Whisper): 16 kHz mono.
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 /// Utterances darunter gelten als versehentlicher Tastendruck und werden verworfen.
 pub const MIN_UTTERANCE_MS: u64 = 300;

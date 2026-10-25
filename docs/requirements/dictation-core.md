@@ -46,23 +46,27 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
 - **REQ-DICT-009**: Das System soll 16 kHz mono PCM einer Utterance über ein
   austauschbares `Transcriber`-Interface on-device in einen Raw Transcript
   (unbearbeiteten Text) umwandeln, ohne Netzwerkzugriff.
-  (`src/stt.rs:Transcriber`, `ParakeetTranscriber`, ADR-0001, Ticket-0004 AK1/AK4)
+  (`src/stt.rs:Transcriber`, `NemotronTranscriber`, ADR-0001, Ticket-0004 AK1/AK4)
 - **REQ-DICT-010**: FALLS eine Utterance einen leeren PCM-Puffer liefert oder
   die Spracherkennung einen leeren Transcript zurückgibt, DANN soll das System
   die Utterance als „nichts erkannt" verwerfen, ohne etwas einzufügen.
-  (`src/stt.rs:ParakeetTranscriber::transcribe`, `src/pipeline.rs:process_utterance`
+  (`src/stt.rs:NemotronTranscriber::transcribe`, `src/pipeline.rs:process_utterance`
   → `Processed::Empty` → `Outcome::Rejected("Nichts erkannt")`)
 - **REQ-DICT-011**: FALLS beim Laden des STT-Modells Modell-Dateien fehlen
   oder beschädigt sind, DANN soll das System einen klaren Fehler mit
   Ablagepfad-Hinweis liefern statt abzustürzen, und weiterhin auf ein zuvor
   geladenes Modell zurückfallen, falls eines aktiv war.
-  (`src/stt.rs:ParakeetTranscriber::new`, `src/pipeline.rs:DictationWorker::handle`
+  (`src/stt.rs:NemotronTranscriber::new`, `src/pipeline.rs:DictationWorker::handle`
   „alter Transcriber bleibt bei Fehler aktiv", Ticket-0004 AK3)
 - **REQ-DICT-012**: FALLS die Spracherkennung selbst mit einem Fehler
   abbricht, DANN soll das System die Utterance als „Spracherkennung
   fehlgeschlagen" sichtbar verwerfen statt sie stillschweigend zu verlieren.
   (`src/pipeline.rs:process_utterance` → `Processed::SttFailed` →
   `Outcome::Rejected`)
+- **REQ-DICT-021**: Das System soll dem Streaming-Modell das Audio einer
+  Utterance mit 0,4 s Vorlauf- und 1,2 s Nachlauf-Stille übergeben, damit
+  weder Satzanfang noch die letzten Wörter fehlen
+  (`src/stt.rs:pad_with_silence`; ADR-0008).
 
 ## Injection
 

@@ -30,7 +30,7 @@ pub enum Outcome {
     Rejected(&'static str),
 }
 
-/// Lädt die STT-Engine aus einem Modell-Verzeichnis. Zwei Adapter: Parakeet
+/// Lädt die STT-Engine aus einem Modell-Verzeichnis. Zwei Adapter: Nemotron
 /// in `main.rs`, Fakes in den Tests.
 pub type TranscriberLoader<T> = Box<dyn FnMut(&Path) -> crate::error::Result<T>>;
 /// Lädt das Cleanup-LLM; das zweite Element meldet den Fehlschlag
@@ -308,7 +308,7 @@ impl PttSession {
     /// erfassen (Kontext-Awareness, Ticket-0026 — bleibt stabil, auch wenn
     /// die App während der Utterance wechselt), Mikrofon starten.
     pub fn press(&mut self, cfg: &Config, models: &ModelsState) -> PressOutcome {
-        if let Some(hint) = models.get(ModelId::Parakeet).setup_hint() {
+        if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
             return PressOutcome::Blocked(hint);
         }
         let frontmost = injection::frontmost_bundle_id();

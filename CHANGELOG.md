@@ -10,6 +10,18 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Changed
 
+- **Breaking:** Spracherkennung wechselt von Parakeet TDT 0.6b v3 auf NVIDIA
+  Nemotron 3.5 ASR Streaming 0.6b (ADR-0008) — ein Modell für alle Modi, Grundlage
+  für Live-Diktat. Erst-Start-Download des neuen Modells (ca. 475 MB), danach läuft
+  alles lokal. Migration: beim ersten Start nach dem Update erscheint der
+  Lizenz-Dialog erneut (neue Lizenz: OpenMDW-1.1, neues Config-Feld
+  `stt_license_consent`, Default `false`); ein `stt_model_dir`, das auf das alte
+  Parakeet-Verzeichnis zeigt, wird automatisch auf das neue Verzeichnis
+  umgestellt. Das alte Modell bleibt auf der Platte (`sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`)
+  und kann gelöscht werden. Preis des Wechsels laut `make stt-eval` (24 TTS-Fixtures):
+  die Wartezeit nach dem Loslassen steigt von ca. 0,35 s auf ca. 0,7–1,0 s,
+  die Wortfehlerrate von 15,0 % auf 17,3 %. Dafür liefert das Modell
+  Interpunktion und Groß-/Kleinschreibung selbst.
 - Spracherkennung läuft jetzt über den offiziellen Crate `sherpa-onnx` 2.0.0
   statt über das archivierte `sherpa-rs`. Modell (Parakeet TDT 0.6b v3), Trait
   `Transcriber` und Config bleiben unverändert; einzelne Sätze werden durch die

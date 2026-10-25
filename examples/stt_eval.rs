@@ -1,11 +1,11 @@
-//! STT-Qualitäts-Testreihe für Parakeet.
+//! STT-Qualitäts-Testreihe für Nemotron.
 //! Liest tests/fixtures/stt/*.wav + *.ref.txt, misst WER, Problembegriff-
 //! Treffer und Latenz. Ausgabe: Markdown. Aufruf: make stt-eval
 
 use std::path::Path;
 use std::time::Instant;
 
-use talker::stt::{ParakeetTranscriber, Transcriber};
+use talker::stt::{NemotronTranscriber, Transcriber};
 
 /// Begriffe, deren Erkennung uns besonders interessiert (de/en-Mix-Schmerz),
 /// aus tests/fixtures/stt/terms.txt — dieselbe Liste, die später das
@@ -70,8 +70,8 @@ fn main() {
     cases.sort();
     assert!(!cases.is_empty(), "keine WAV-Fixtures gefunden");
 
-    let mut stt = ParakeetTranscriber::new(&ParakeetTranscriber::default_model_dir())
-        .expect("Parakeet-Modell fehlt");
+    let mut stt = NemotronTranscriber::new(&NemotronTranscriber::default_model_dir())
+        .expect("Nemotron-Modell fehlt");
 
     println!("| Fall | Audio | Latenz | WER | Hypothese |");
     println!("|---|---|---|---|---|");

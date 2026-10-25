@@ -25,7 +25,7 @@ pub enum OverlayPosition {
 pub struct Config {
     /// PTT-Taste (macOS-Keycode eines Modifiers, Default Fn/🌐 = 63).
     pub hotkey_keycode: i64,
-    /// Verzeichnis des Parakeet-Modells (encoder/decoder/joiner/tokens).
+    /// Verzeichnis des Nemotron-Modells (encoder/decoder/joiner/tokens).
     pub stt_model_dir: PathBuf,
     /// Aktives Cleanup-Stil-Profil (ersetzt das frühere `cleanup_enabled`).
     pub cleanup_mode: CleanupMode,
@@ -54,9 +54,14 @@ pub struct Config {
     pub context_aware_enabled: bool,
     /// Regeln (bundle-id → Modus); erste passende gewinnt, sonst `cleanup_mode`.
     pub context_rules: Vec<(String, CleanupMode)>,
-    /// Modell-Downloader (Ticket-0028): Nutzer hat den Modell-Lizenzen
-    /// (NVIDIA/Parakeet + Gemma Terms) zugestimmt — ohne dies kein Download.
+    /// Modell-Downloader (Ticket-0028): Nutzer hat den Gemma-Terms (und früher
+    /// der Parakeet-Lizenz) zugestimmt. Zusammen mit `stt_license_consent` Voraussetzung
+    /// für jeden Download, siehe `models_consent()`.
     pub model_download_consent: bool,
+    /// Nutzer hat der Lizenz des STT-Modells (NVIDIA Nemotron, OpenMDW-1.1)
+    /// zugestimmt. Eigenes Feld, damit Bestandsnutzer nach dem Modellwechsel
+    /// erneut gefragt werden.
+    pub stt_license_consent: bool,
 }
 
 /// Default-Farben der Wellen: Weiß, Cyan, Blau, Violett (kühle Siri-Palette).
@@ -99,7 +104,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey_keycode: crate::hotkey::DEFAULT_PTT_KEYCODE,
-            stt_model_dir: crate::stt::ParakeetTranscriber::default_model_dir(),
+            stt_model_dir: crate::stt::NemotronTranscriber::default_model_dir(),
             cleanup_mode: CleanupMode::default(),
             mic_device: None,
             overlay_position: OverlayPosition::Bottom,
@@ -114,11 +119,21 @@ impl Default for Config {
             context_aware_enabled: false,
             context_rules: Vec::new(),
             model_download_consent: false,
+            stt_license_consent: false,
         }
     }
 }
 
+/// Verzeichnisname des früheren STT-Modells (Parakeet): nicht mit dem
+/// Nemotron-Loader kompatibel, wird beim Laden auf den Default umgebogen.
+const LEGACY_PARAKEET_DIR_NAME: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+
 impl Config {
+    /// Beide Lizenz-Zustimmungen liegen vor — erst dann darf ein Modell geladen werden.
+    pub fn models_consent(&self) -> bool {
+        self.model_download_consent && self.stt_license_consent
+    }
+
     pub fn default_path() -> PathBuf {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -167,7 +182,8 @@ impl Config {
     /// falscher Typ in einem bekannten Feld → Fehler, unbekannte Felder werden
     /// toleriert. Migriert vorab das Legacy-Feld `cleanup_enabled` (bool, bis
     /// Ticket-0010): false → Roh, true → Geschäftlich — ein explizit gesetztes
-    /// `cleanup_mode` gewinnt.
+    /// `cleanup_mode` gewinnt. Ein `stt_model_dir`, das auf das frühere
+    /// Parakeet-Verzeichnis zeigt, wird auf den Nemotron-Default gesetzt.
     fn parse(text: &str) -> std::result::Result<Self, toml::de::Error> {
         use serde::de::Error as _;
         let mut value: toml::Value = toml::from_str(text)?;
@@ -192,7 +208,15 @@ impl Config {
                 }
             }
         }
-        value.try_into()
+        let mut cfg: Self = value.try_into()?;
+        if cfg
+            .stt_model_dir
+            .file_name()
+            .is_some_and(|name| name == LEGACY_PARAKEET_DIR_NAME)
+        {
+            cfg.stt_model_dir = Self::default().stt_model_dir;
+        }
+        Ok(cfg)
     }
 
     fn serialize(&self) -> std::result::Result<String, toml::ser::Error> {
@@ -344,6 +368,77 @@ mod tests {
     #[test]
     fn context_rules_with_unknown_mode_are_a_parse_error() {
         assert!(Config::parse("context_rules = [[\"com.foo\", \"episch\"]]").is_err());
+    }
+
+    #[test]
+    fn stt_license_consent_defaults_false_and_roundtrips() {
+        // Alte Configs ohne das Feld → kein Consent für die STT-Lizenz.
+        assert!(
+            !Config::parse("cleanup_mode = \"raw\"")
+                .unwrap()
+                .stt_license_consent
+        );
+        assert!(!Config::default().stt_license_consent);
+        let cfg = Config {
+            stt_license_consent: true,
+            ..Config::default()
+        };
+        assert!(
+            Config::parse(&cfg.serialize().unwrap())
+                .unwrap()
+                .stt_license_consent
+        );
+        assert!(Config::parse("stt_license_consent = \"ja\"").is_err());
+    }
+
+    /// Bestandsnutzer haben nur den alten Lizenzen (Parakeet + Gemma)
+    /// zugestimmt: ohne neue STT-Zustimmung gilt der Consent nicht.
+    #[test]
+    fn models_consent_needs_both_flags() {
+        for (download, stt, expected) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let cfg = Config {
+                model_download_consent: download,
+                stt_license_consent: stt,
+                ..Config::default()
+            };
+            assert_eq!(cfg.models_consent(), expected, "{download}/{stt}");
+        }
+        let legacy = Config::parse("model_download_consent = true").unwrap();
+        assert!(!legacy.models_consent());
+    }
+
+    /// Das alte Parakeet-Verzeichnis passt nicht zum Nemotron-Loader: es wird
+    /// beim Laden auf den neuen Default umgebogen (egal wo es liegt).
+    #[test]
+    fn legacy_parakeet_model_dir_migrates_to_the_default() {
+        let default_dir = Config::default().stt_model_dir;
+        for legacy in [
+            "/Users/x/Library/Application Support/talker/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+            "/Volumes/extern/modelle/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/",
+        ] {
+            let cfg = Config::parse(&format!("stt_model_dir = \"{legacy}\"")).unwrap();
+            assert_eq!(cfg.stt_model_dir, default_dir, "{legacy}");
+        }
+    }
+
+    #[test]
+    fn custom_and_current_model_dirs_are_kept() {
+        for dir in [
+            "/tmp/eigenes/modell",
+            "/tmp/parakeet-test",
+            "/tmp/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8-alt",
+        ] {
+            let cfg = Config::parse(&format!("stt_model_dir = \"{dir}\"")).unwrap();
+            assert_eq!(cfg.stt_model_dir, PathBuf::from(dir));
+        }
+        let current = Config::default().stt_model_dir;
+        let text = Config::default().serialize().unwrap();
+        assert_eq!(Config::parse(&text).unwrap().stt_model_dir, current);
     }
 
     #[test]
