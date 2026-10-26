@@ -20,6 +20,62 @@ pub enum OverlayPosition {
     Bottom,
 }
 
+/// Stufe 1 des Live-Diktats (ADR-0009): wann der Text ins Zielfeld kommt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InsertMode {
+    /// Gesamter Text nach dem Loslassen (bisheriges Verhalten).
+    #[default]
+    #[serde(rename = "end")]
+    AtEnd,
+    /// Ein Satz je Sprechpause.
+    #[serde(rename = "sentence")]
+    PerSentence,
+    /// Stabile Wortgruppen während des Sprechens.
+    #[serde(rename = "phrase")]
+    PerPhrase,
+}
+
+impl InsertMode {
+    pub const ALL: [InsertMode; 3] = [
+        InsertMode::AtEnd,
+        InsertMode::PerSentence,
+        InsertMode::PerPhrase,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InsertMode::AtEnd => "Am Ende",
+            InsertMode::PerSentence => "Satzweise",
+            InsertMode::PerPhrase => "Wortgruppenweise",
+        }
+    }
+
+    /// Stufe 2: erlaubte Cleanup-Modi (aufsteigend nach Eingriffstiefe).
+    pub fn allowed_modes(self) -> &'static [CleanupMode] {
+        match self {
+            InsertMode::AtEnd => &CleanupMode::ALL,
+            InsertMode::PerSentence => {
+                &[CleanupMode::Raw, CleanupMode::Business, CleanupMode::Casual]
+            }
+            InsertMode::PerPhrase => &[CleanupMode::Raw],
+        }
+    }
+
+    pub fn allows(self, mode: CleanupMode) -> bool {
+        self.allowed_modes().contains(&mode)
+    }
+
+    /// Nicht erlaubter Modus → der höchste erlaubte.
+    pub fn resolve(self, mode: CleanupMode) -> CleanupMode {
+        if self.allows(mode) {
+            mode
+        } else {
+            *self.allowed_modes().last().unwrap_or(&CleanupMode::Raw)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -62,6 +118,10 @@ pub struct Config {
     /// zugestimmt. Eigenes Feld, damit Bestandsnutzer nach dem Modellwechsel
     /// erneut gefragt werden.
     pub stt_license_consent: bool,
+    /// Live-Diktat Stufe 1: wann der Text eingefügt wird (ADR-0009).
+    pub insert_mode: InsertMode,
+    /// Sprechpause in ms, nach der *Satzweise* einfügt. Nur per TOML einstellbar.
+    pub endpoint_silence_ms: u32,
 }
 
 /// Default-Farben der Wellen: Weiß, Cyan, Blau, Violett (kühle Siri-Palette).
@@ -120,6 +180,8 @@ impl Default for Config {
             context_rules: Vec::new(),
             model_download_consent: false,
             stt_license_consent: false,
+            insert_mode: InsertMode::default(),
+            endpoint_silence_ms: 700,
         }
     }
 }
@@ -389,6 +451,84 @@ mod tests {
                 .stt_license_consent
         );
         assert!(Config::parse("stt_license_consent = \"ja\"").is_err());
+    }
+
+    /// REQ-STREAM-001/002: drei Einfüge-Verhalten, Default Am Ende; alte
+    /// Configs ohne Feld bleiben gültig, falscher Wert/Typ ist ein Parse-Fehler.
+    #[test]
+    fn insert_mode_defaults_to_at_end_and_roundtrips() {
+        assert_eq!(InsertMode::ALL.len(), 3);
+        assert_eq!(Config::default().insert_mode, InsertMode::AtEnd);
+        assert_eq!(
+            Config::parse("cleanup_mode = \"raw\"").unwrap().insert_mode,
+            InsertMode::AtEnd
+        );
+        for mode in InsertMode::ALL {
+            let cfg = Config {
+                insert_mode: mode,
+                ..Config::default()
+            };
+            assert_eq!(
+                Config::parse(&cfg.serialize().unwrap())
+                    .unwrap()
+                    .insert_mode,
+                mode
+            );
+        }
+        assert!(Config::parse("insert_mode = \"sofort\"").is_err());
+        assert!(Config::parse("insert_mode = 3").is_err());
+    }
+
+    /// REQ-STREAM-008: fehlende Pausenlänge → Default; übrige Werte werden gelesen.
+    #[test]
+    fn endpoint_silence_defaults_and_roundtrips() {
+        assert_eq!(Config::default().endpoint_silence_ms, 700);
+        assert_eq!(
+            Config::parse("insert_mode = \"sentence\"")
+                .unwrap()
+                .endpoint_silence_ms,
+            700
+        );
+        assert_eq!(
+            Config::parse("endpoint_silence_ms = 1200")
+                .unwrap()
+                .endpoint_silence_ms,
+            1200
+        );
+        assert!(Config::parse("endpoint_silence_ms = \"lang\"").is_err());
+    }
+
+    /// REQ-STREAM-009: Erlaubnismatrix je Einfüge-Verhalten.
+    #[test]
+    fn insert_mode_allows_exactly_the_agreed_cleanup_modes() {
+        use CleanupMode::*;
+        assert_eq!(
+            InsertMode::AtEnd.allowed_modes(),
+            &[Raw, Business, Casual, LlmOptimized]
+        );
+        assert_eq!(
+            InsertMode::PerSentence.allowed_modes(),
+            &[Raw, Business, Casual]
+        );
+        assert_eq!(InsertMode::PerPhrase.allowed_modes(), &[Raw]);
+        assert!(InsertMode::AtEnd.allows(LlmOptimized));
+        assert!(!InsertMode::PerSentence.allows(LlmOptimized));
+        assert!(!InsertMode::PerPhrase.allows(Business));
+    }
+
+    /// REQ-STREAM-010/015: nicht erlaubter Modus → nächster erlaubter
+    /// (der höchste erlaubte); erlaubte Modi bleiben unverändert.
+    #[test]
+    fn insert_mode_resolves_disallowed_cleanup_modes_to_the_nearest_allowed() {
+        use CleanupMode::*;
+        for mode in CleanupMode::ALL {
+            assert_eq!(InsertMode::AtEnd.resolve(mode), mode);
+        }
+        assert_eq!(InsertMode::PerSentence.resolve(LlmOptimized), Casual);
+        assert_eq!(InsertMode::PerSentence.resolve(Business), Business);
+        assert_eq!(InsertMode::PerPhrase.resolve(LlmOptimized), Raw);
+        assert_eq!(InsertMode::PerPhrase.resolve(Casual), Raw);
+        assert_eq!(InsertMode::PerPhrase.resolve(Raw), Raw);
     }
 
     /// Bestandsnutzer haben nur den alten Lizenzen (Parakeet + Gemma)
