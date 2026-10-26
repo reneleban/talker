@@ -20,6 +20,9 @@ pub enum OverlayPosition {
     Bottom,
 }
 
+/// Default der Sprechpause für *Satzweise*.
+pub const DEFAULT_ENDPOINT_SILENCE_MS: u32 = 700;
+
 /// Stufe 1 des Live-Diktats (ADR-0009): wann der Text ins Zielfeld kommt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -181,7 +184,7 @@ impl Default for Config {
             model_download_consent: false,
             stt_license_consent: false,
             insert_mode: InsertMode::default(),
-            endpoint_silence_ms: 700,
+            endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,
         }
     }
 }

@@ -7,7 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use sherpa_onnx::{
-    OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig,
+    OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
+    OnlineTransducerModelConfig,
 };
 
 use crate::error::{Result, TalkerError};
@@ -19,6 +20,8 @@ pub trait Transcriber {
 
 pub struct NemotronTranscriber {
     inner: OnlineRecognizer,
+    /// Laufende Utterance im Live-Betrieb (`begin` … `finish`).
+    live: Option<OnlineStream>,
 }
 
 /// Stille vor dem Audio: das Streaming-Modell verschluckt sonst den Satzanfang.
@@ -29,6 +32,10 @@ const TAIL_SILENCE_SAMPLES: usize = 19_200; // 1,2 s bei 16 kHz
 /// Chunk des Pakets: 560 ms bei 16 kHz — der Nachlauf muss ihn füllen.
 const CHUNK_SAMPLES: usize = 8_960;
 const _: () = assert!(TAIL_SILENCE_SAMPLES >= CHUNK_SAMPLES);
+/// Zwangs-Endpoint für sehr lange Segmente ohne Pause.
+const MAX_SEGMENT_SECONDS: f32 = 60.0;
+
+use crate::config::DEFAULT_ENDPOINT_SILENCE_MS;
 
 /// Mehr Threads verkürzen die Wartezeit nach dem Loslassen deutlich (Messung auf
 /// einem 14-Kern-Mac: 4 → 1,09 s, 8 → 0,73 s); darüber bremsen Effizienz-Kerne.
@@ -54,6 +61,12 @@ const MODEL_FILES: [&str; 4] = [
 impl NemotronTranscriber {
     /// Lädt das Nemotron-Modell aus `model_dir`. Fehlende Dateien → klarer Fehler.
     pub fn new(model_dir: &Path) -> Result<Self> {
+        Self::with_endpoint_silence(model_dir, DEFAULT_ENDPOINT_SILENCE_MS)
+    }
+
+    /// Wie `new`; `endpoint_silence_ms` ist die Sprechpause, die im Live-Betrieb
+    /// ein Segment beendet.
+    pub fn with_endpoint_silence(model_dir: &Path, endpoint_silence_ms: u32) -> Result<Self> {
         for file in MODEL_FILES {
             let path = model_dir.join(file);
             if !path.is_file() {
@@ -78,11 +91,15 @@ impl NemotronTranscriber {
                 ..Default::default()
             },
             decoding_method: Some("greedy_search".into()),
+            enable_endpoint: true,
+            rule1_min_trailing_silence: endpoint_silence_ms as f32 / 1000.0,
+            rule2_min_trailing_silence: endpoint_silence_ms as f32 / 1000.0,
+            rule3_min_utterance_length: MAX_SEGMENT_SECONDS,
             ..Default::default()
         };
         let inner = OnlineRecognizer::create(&config)
             .ok_or_else(|| TalkerError::Stt("Modell laden fehlgeschlagen".into()))?;
-        Ok(Self { inner })
+        Ok(Self { inner, live: None })
     }
 
     /// Default-Ablageort: ~/Library/Application Support/talker/models/<modellname>
@@ -118,6 +135,135 @@ impl Transcriber for NemotronTranscriber {
             .map(|r| r.text)
             .unwrap_or_default();
         Ok(text.trim().to_string())
+    }
+}
+
+/// Zwischenstand nach einem `feed`: Text des offenen Segments; `endpoint` ist
+/// wahr, wenn eine Sprechpause das Segment beendet hat (Text ist dann final,
+/// der Recognizer bereits für das nächste Segment zurückgesetzt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUpdate {
+    pub text: String,
+    pub endpoint: bool,
+}
+
+/// Live-Diktat: Audio in Chunks einspeisen (ADR-0009). Eine Utterance läuft von
+/// `begin` bis `finish`.
+pub trait StreamingTranscriber {
+    fn begin(&mut self);
+    fn feed(&mut self, pcm_16k_mono: &[f32]) -> Result<StreamUpdate>;
+    /// Beendet die Utterance und liefert den Text des noch offenen Segments.
+    fn finish(&mut self) -> Result<String>;
+}
+
+/// Wortgruppenweise: bestimmt aus Zwischenständen die stabilen Wörter. Stabil
+/// = in zwei aufeinanderfolgenden Ständen an gleicher Stelle gleich und nicht
+/// das letzte Wort. Bereits ausgegebene Wörter werden nie zurückgenommen.
+#[derive(Debug, Default)]
+pub struct PhraseCommitter {
+    emitted: usize,
+    previous: Vec<String>,
+}
+
+fn words(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_string).collect()
+}
+
+impl PhraseCommitter {
+    fn take(&mut self, current: &[String], upto: usize) -> Option<String> {
+        let upto = upto.min(current.len());
+        if upto <= self.emitted {
+            return None;
+        }
+        let out = current[self.emitted..upto].join(" ");
+        self.emitted = upto;
+        Some(out)
+    }
+
+    /// Neuer Zwischenstand → neu stabile Wörter.
+    pub fn update(&mut self, partial: &str) -> Option<String> {
+        let current = words(partial);
+        let common = self
+            .previous
+            .iter()
+            .zip(&current)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let stable = common.min(current.len().saturating_sub(1));
+        let out = self.take(&current, stable);
+        self.previous = current;
+        out
+    }
+
+    /// Segment-Ende: restliche Wörter ausgeben, neues Segment beginnen.
+    pub fn flush(&mut self, text: &str) -> Option<String> {
+        let current = words(text);
+        let out = self.take(&current, current.len());
+        *self = Self::default();
+        out
+    }
+}
+
+impl NemotronTranscriber {
+    fn drain(&mut self, stream: &OnlineStream) -> String {
+        while self.inner.is_ready(stream) {
+            self.inner.decode(stream);
+        }
+        self.inner
+            .get_result(stream)
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default()
+    }
+}
+
+impl StreamingTranscriber for NemotronTranscriber {
+    fn begin(&mut self) {
+        let stream = self.inner.create_stream();
+        stream.set_option("language", "auto");
+        stream.accept_waveform(
+            crate::audio::TARGET_SAMPLE_RATE as i32,
+            &[0.0; LEAD_SILENCE_SAMPLES],
+        );
+        self.live = Some(stream);
+    }
+
+    fn feed(&mut self, pcm_16k_mono: &[f32]) -> Result<StreamUpdate> {
+        let stream = self
+            .live
+            .take()
+            .ok_or_else(|| TalkerError::Stt("feed ohne begin".into()))?;
+        if !pcm_16k_mono.is_empty() {
+            stream.accept_waveform(crate::audio::TARGET_SAMPLE_RATE as i32, pcm_16k_mono);
+        }
+        let text = self.drain(&stream);
+        // Eine Pause ohne erkannten Text ist kein Segment-Ende (nur zurücksetzen).
+        let ended = self.inner.is_endpoint(&stream);
+        if ended {
+            self.inner.reset(&stream);
+            // Wie beim Start braucht das Modell Vorlauf, sonst fehlt der Satzanfang.
+            stream.accept_waveform(
+                crate::audio::TARGET_SAMPLE_RATE as i32,
+                &[0.0; LEAD_SILENCE_SAMPLES],
+            );
+        }
+        self.live = Some(stream);
+        Ok(StreamUpdate {
+            endpoint: ended && !text.is_empty(),
+            text,
+        })
+    }
+
+    fn finish(&mut self) -> Result<String> {
+        let stream = self
+            .live
+            .take()
+            .ok_or_else(|| TalkerError::Stt("finish ohne begin".into()))?;
+        stream.accept_waveform(
+            crate::audio::TARGET_SAMPLE_RATE as i32,
+            &[0.0; TAIL_SILENCE_SAMPLES],
+        );
+        stream.input_finished();
+        Ok(self.drain(&stream))
     }
 }
 
@@ -181,6 +327,59 @@ mod tests {
     fn empty_pcm_gives_empty_transcript() {
         let mut t: Box<dyn Transcriber> = Box::new(FakeTranscriber { reply: "x" });
         assert_eq!(t.transcribe(&[]).unwrap(), "");
+    }
+
+    /// REQ-STREAM-005: nur Wörter, die in zwei aufeinanderfolgenden Zwischenständen
+    /// übereinstimmen — und nie das letzte (evtl. noch unfertige) Wort.
+    #[test]
+    fn phrase_committer_emits_only_words_stable_across_two_partials() {
+        let mut c = PhraseCommitter::default();
+        assert_eq!(c.update("Das ist"), None);
+        assert_eq!(c.update("Das ist ein"), Some("Das ist".into()));
+        assert_eq!(c.update("Das ist ein Test"), Some("ein".into()));
+        // Nichts Neues → nichts doppelt.
+        assert_eq!(c.update("Das ist ein Test"), None);
+    }
+
+    #[test]
+    fn phrase_committer_never_emits_the_last_word_early() {
+        let mut c = PhraseCommitter::default();
+        assert_eq!(c.update("Hallo"), None);
+        assert_eq!(c.update("Hallo"), None);
+    }
+
+    #[test]
+    fn phrase_committer_keeps_emitted_words_when_the_recognizer_revises_them() {
+        let mut c = PhraseCommitter::default();
+        c.update("Wir sind da");
+        assert_eq!(c.update("Wir sind da dann"), Some("Wir sind da".into()));
+        // Frühere Wörter ändern sich: bereits Eingefügtes wird nicht erneut gesendet.
+        assert_eq!(c.update("Wie sind da dann los"), None);
+        assert_eq!(
+            c.update("Wie sind da dann los jetzt"),
+            Some("dann los".into())
+        );
+    }
+
+    /// REQ-STREAM-006: am Ende (Endpoint/Loslassen) kommt der Rest — genau einmal.
+    #[test]
+    fn phrase_committer_flush_returns_the_rest_and_resets() {
+        let mut c = PhraseCommitter::default();
+        c.update("Das ist");
+        c.update("Das ist ein");
+        assert_eq!(c.flush("Das ist ein Test"), Some("ein Test".into()));
+        // Neues Segment beginnt bei null.
+        assert_eq!(c.update("Neu"), None);
+        assert_eq!(c.flush("Neu"), Some("Neu".into()));
+    }
+
+    #[test]
+    fn phrase_committer_handles_empty_and_whitespace_input() {
+        let mut c = PhraseCommitter::default();
+        assert_eq!(c.update(""), None);
+        assert_eq!(c.update("   "), None);
+        assert_eq!(c.flush(""), None);
+        assert_eq!(c.flush("  "), None);
     }
 
     #[test]
