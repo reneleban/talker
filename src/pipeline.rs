@@ -313,7 +313,7 @@ impl PttSession {
         }
         let frontmost = injection::frontmost_bundle_id();
         let mode = resolve_mode(cfg, frontmost.as_deref());
-        match audio::start(cfg.mic_device.as_deref()) {
+        match audio::start(cfg.mic_device.as_deref(), None) {
             Ok(rec) => {
                 let level = rec.level();
                 self.frontmost = frontmost;
