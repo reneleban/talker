@@ -507,6 +507,8 @@ pub enum PressOutcome {
 
 /// Rohe Audio-Blöcke einer Live-Aufnahme samt Format und Ziel-App.
 pub struct LiveFeed {
+    /// Zeitpunkt des Tastendrucks (vor dem Mikrofon-Start) — für die Latenz-Logs.
+    pub pressed_at: Instant,
     pub frontmost: Option<String>,
     pub blocks: std::sync::mpsc::Receiver<Vec<f32>>,
     pub format: (u16, u32),
@@ -540,6 +542,7 @@ impl PttSession {
     /// erfassen (Kontext-Awareness, Ticket-0026 — bleibt stabil, auch wenn
     /// die App während der Utterance wechselt), Mikrofon starten.
     pub fn press(&mut self, cfg: &Config, models: &ModelsState) -> PressOutcome {
+        let pressed_at = Instant::now();
         if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
             return PressOutcome::Blocked(hint);
         }
@@ -550,7 +553,12 @@ impl PttSession {
         match audio::start(cfg.mic_device.as_deref(), live.then_some(tx)) {
             Ok(rec) => {
                 let level = rec.level();
+                eprintln!(
+                    "talker: Mikrofon-Start dauerte {} ms",
+                    pressed_at.elapsed().as_millis()
+                );
                 let feed = live.then(|| LiveFeed {
+                    pressed_at,
                     frontmost: frontmost.clone(),
                     blocks: rx,
                     format: rec.format(),

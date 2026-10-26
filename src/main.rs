@@ -125,9 +125,21 @@ fn spawn_stt_worker(
                     // Der Indicator zeigt erst nach dem Loslassen Ergebnis oder
                     // Fehler: den ersten Hinweis merken, am Ende melden.
                     let mut first_hint = None;
+                    let (pressed_at, (channels, rate)) = (feed.pressed_at, feed.format);
+                    let (mut raw_samples, mut first_block) = (0usize, true);
+                    let blocks = feed.blocks.into_iter().inspect(|b| {
+                        if first_block {
+                            first_block = false;
+                            eprintln!(
+                                "talker: erster Audio-Block {} ms nach Tastendruck",
+                                pressed_at.elapsed().as_millis()
+                            );
+                        }
+                        raw_samples += b.len();
+                    });
                     pipeline::run_live(
                         &mut worker,
-                        feed.blocks,
+                        blocks,
                         feed.format,
                         feed.frontmost.as_deref(),
                         &cfg,
@@ -135,6 +147,11 @@ fn spawn_stt_worker(
                             let hint = deliver(outcome);
                             first_hint = first_hint.or(hint);
                         },
+                    );
+                    eprintln!(
+                        "talker: Live-Ende: {} ms Audio aufgenommen, {} ms seit Tastendruck",
+                        raw_samples * 1000 / (usize::from(channels) * rate as usize),
+                        pressed_at.elapsed().as_millis()
                     );
                     first_hint
                 }
