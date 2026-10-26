@@ -6,7 +6,7 @@
 //! Indicator/Injection (Ticket-0034).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
@@ -371,16 +371,10 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
         }
         return;
     }
-    let started = Instant::now();
     for block in blocks {
         match assembler.push(&block) {
             Ok(chunks) => {
                 for chunk in chunks {
-                    eprintln!(
-                        "talker: Live-Chunk ({} Samples) nach {} ms",
-                        chunk.len(),
-                        started.elapsed().as_millis()
-                    );
                     worker.live_chunk(&chunk).into_iter().for_each(&mut *emit);
                 }
             }
@@ -484,18 +478,76 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
 /// `Arc<Mutex<PttSession>>`, weil `hotkey::install` `Send`-Closures verlangt.
 #[derive(Default)]
 pub struct PttSession {
-    recording: Option<audio::Recording>,
+    slot: Option<Arc<Mutex<MicSlot<audio::Recording>>>>,
     frontmost: Option<String>,
     /// Die laufende Aufnahme speist das Live-Diktat (Block-Kanal).
     live: bool,
+}
+
+/// Zustand des (im Hintergrund startenden) Mikrofons zwischen Press und Release.
+enum MicSlot<R> {
+    Starting,
+    Ready(R),
+    /// Taste vor dem Start losgelassen — eine spät fertige Aufnahme wird verworfen.
+    Cancelled,
+    Failed,
+}
+
+/// Was `release` im Slot vorfindet.
+enum Taken<R> {
+    Ready(R),
+    /// Mikrofon war noch nicht gestartet: Aufnahme abgebrochen.
+    StartAborted,
+    /// Nichts (mehr) da: Start fehlgeschlagen oder schon abgeholt.
+    Gone,
+}
+
+/// Der Start-Thread meldet sein Ergebnis. Der Callback läuft unter dem
+/// Slot-Lock — ein gleichzeitiges `release` wartet, bis er durch ist.
+fn complete_start<R>(
+    slot: &Mutex<MicSlot<R>>,
+    started: Result<R, TalkerError>,
+    on_ready: impl FnOnce(Result<&R, TalkerError>),
+) {
+    let Ok(mut guard) = slot.lock() else { return };
+    if matches!(*guard, MicSlot::Cancelled) {
+        return;
+    }
+    match started {
+        Ok(rec) => {
+            on_ready(Ok(&rec));
+            *guard = MicSlot::Ready(rec);
+        }
+        Err(e) => {
+            *guard = MicSlot::Failed;
+            on_ready(Err(e));
+        }
+    }
+}
+
+fn take_on_release<R>(slot: &Mutex<MicSlot<R>>) -> Taken<R> {
+    let Ok(mut guard) = slot.lock() else {
+        return Taken::Gone;
+    };
+    match std::mem::replace(&mut *guard, MicSlot::Cancelled) {
+        MicSlot::Ready(rec) => Taken::Ready(rec),
+        MicSlot::Starting => Taken::StartAborted,
+        MicSlot::Cancelled | MicSlot::Failed => Taken::Gone,
+    }
 }
 
 /// Ergebnis von [`PttSession::press`].
 pub enum PressOutcome {
     /// PTT gesperrt (Setup-Gate, AK 3) — Grund als sichtbarer Hinweis.
     Blocked(String),
-    /// Aufnahme gestartet, mit dem für diese Utterance aufgelösten Modus.
-    Started {
+    /// Mikrofon startet im Hintergrund; das Ergebnis kommt als [`MicReady`].
+    Starting,
+}
+
+/// Ergebnis des Mikrofon-Starts, gemeldet vom Start-Thread.
+pub enum MicReady {
+    /// Aufnahme läuft, mit dem für diese Utterance aufgelösten Modus.
+    Recording {
         level: audio::LevelHandle,
         mode: CleanupMode,
         /// Gesetzt bei Live-Diktat: Strom für den STT-Worker (`run_live`).
@@ -507,8 +559,6 @@ pub enum PressOutcome {
 
 /// Rohe Audio-Blöcke einer Live-Aufnahme samt Format und Ziel-App.
 pub struct LiveFeed {
-    /// Zeitpunkt des Tastendrucks (vor dem Mikrofon-Start) — für die Latenz-Logs.
-    pub pressed_at: Instant,
     pub frontmost: Option<String>,
     pub blocks: std::sync::mpsc::Receiver<Vec<f32>>,
     pub format: (u16, u32),
@@ -519,6 +569,8 @@ pub struct LiveFeed {
 pub enum ReleaseOutcome {
     /// Keine laufende Aufnahme (Press war gesperrt oder scheiterte).
     NoRecording,
+    /// Taste vor dem Mikrofon-Start losgelassen — Aufnahme abgebrochen.
+    StartAborted,
     /// Live-Aufnahme beendet — der STT-Worker schließt die Utterance selbst ab.
     LiveEnded,
     /// Utterance zu kurz — gilt als versehentlicher Tastendruck, verworfen.
@@ -540,54 +592,65 @@ impl PttSession {
 
     /// PTT gedrückt: Setup-Gate prüfen, Frontmost-App VOR Aufnahmestart
     /// erfassen (Kontext-Awareness, Ticket-0026 — bleibt stabil, auch wenn
-    /// die App während der Utterance wechselt), Mikrofon starten.
-    pub fn press(&mut self, cfg: &Config, models: &ModelsState) -> PressOutcome {
+    /// die App während der Utterance wechselt), Mikrofon im Hintergrund
+    /// starten. Der Tastendruck-Callback blockiert nie auf CoreAudio;
+    /// `on_ready` meldet den Start (oder seinen Fehler) vom Start-Thread aus.
+    pub fn press(
+        &mut self,
+        cfg: &Config,
+        models: &ModelsState,
+        on_ready: impl FnOnce(MicReady) + Send + 'static,
+    ) -> PressOutcome {
         let pressed_at = Instant::now();
         if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
             return PressOutcome::Blocked(hint);
         }
         let frontmost = injection::frontmost_bundle_id();
         let live = cfg.insert_mode != InsertMode::AtEnd;
-        let mode = resolve_mode(cfg, frontmost.as_deref());
-        let (tx, rx) = std::sync::mpsc::channel();
-        match audio::start(cfg.mic_device.as_deref(), live.then_some(tx)) {
-            Ok(rec) => {
-                let level = rec.level();
-                eprintln!(
-                    "talker: Mikrofon-Start dauerte {} ms",
-                    pressed_at.elapsed().as_millis()
-                );
-                let feed = live.then(|| LiveFeed {
-                    pressed_at,
-                    frontmost: frontmost.clone(),
-                    blocks: rx,
-                    format: rec.format(),
-                });
-                self.frontmost = frontmost;
-                self.live = live;
-                self.recording = Some(rec);
-                // Im Live-Betrieb zeigt der Indicator den tatsächlich wirkenden Modus.
-                let mode = if live {
-                    cfg.insert_mode.resolve(mode)
-                } else {
-                    mode
-                };
-                PressOutcome::Started {
-                    level,
-                    mode,
-                    live: feed,
-                }
-            }
-            Err(e) => PressOutcome::Failed(e),
+        let mut mode = resolve_mode(cfg, frontmost.as_deref());
+        if live {
+            // Im Live-Betrieb zeigt der Indicator den tatsächlich wirkenden Modus.
+            mode = cfg.insert_mode.resolve(mode);
         }
+        let device = cfg.mic_device.clone();
+        let slot = Arc::new(Mutex::new(MicSlot::Starting));
+        self.slot = Some(Arc::clone(&slot));
+        self.frontmost = frontmost.clone();
+        self.live = live;
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let started = audio::start(device.as_deref(), live.then_some(tx));
+            eprintln!(
+                "talker: Mikrofon-Start dauerte {} ms",
+                pressed_at.elapsed().as_millis()
+            );
+            complete_start(&slot, started, |result| match result {
+                Ok(rec) => on_ready(MicReady::Recording {
+                    level: rec.level(),
+                    mode,
+                    live: live.then(|| LiveFeed {
+                        frontmost,
+                        blocks: rx,
+                        format: rec.format(),
+                    }),
+                }),
+                Err(e) => on_ready(MicReady::Failed(e)),
+            });
+        });
+        PressOutcome::Starting
     }
 
     /// PTT losgelassen: Aufnahme stoppen, Mindestlänge prüfen (versehentlicher
     /// Tastendruck), sonst PCM + Frontmost zum Senden an den STT-Worker freigeben.
     pub fn release(&mut self) -> ReleaseOutcome {
         let frontmost = self.frontmost.take();
-        let Some(rec) = self.recording.take() else {
+        let Some(slot) = self.slot.take() else {
             return ReleaseOutcome::NoRecording;
+        };
+        let rec = match take_on_release(&slot) {
+            Taken::Ready(rec) => rec,
+            Taken::StartAborted => return ReleaseOutcome::StartAborted,
+            Taken::Gone => return ReleaseOutcome::NoRecording,
         };
         if std::mem::take(&mut self.live) {
             rec.finish_live();
@@ -820,12 +883,63 @@ mod tests {
     // Ticket-0038). Getestet wird deshalb nur, was ohne Hardware entscheidbar
     // ist: das Setup-Gate selbst und der Leerlauf-Fall von `release()`.
 
+    // ---- asynchroner Mikrofon-Start (MicSlot) ----
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn mic_started_before_release_hands_the_recording_over() {
+        let slot = Mutex::new(MicSlot::<u32>::Starting);
+        let mut seen = None;
+        complete_start(&slot, Ok(7), |r| {
+            seen = Some(r.copied().map_err(|e| e.to_string()))
+        });
+        assert_eq!(seen, Some(Ok(7)));
+        assert!(matches!(take_on_release(&slot), Taken::Ready(7)));
+        // Ein zweites Loslassen findet nichts mehr.
+        assert!(matches!(take_on_release(&slot), Taken::Gone));
+    }
+
+    /// Grenzfall: Taste vor dem Mikrofon-Start losgelassen → abgebrochen, die
+    /// spät fertige Aufnahme wird sofort verworfen, nichts wird gemeldet.
+    #[test]
+    fn release_before_mic_start_aborts_and_drops_the_late_recording() {
+        let slot = Mutex::new(MicSlot::<DropFlag>::Starting);
+        assert!(matches!(take_on_release(&slot), Taken::StartAborted));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut called = false;
+        complete_start(&slot, Ok(DropFlag(Arc::clone(&dropped))), |_| called = true);
+        assert!(!called, "abgebrochener Start darf nichts melden");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Fehlerpfad: der Fehler wird gemeldet; das Loslassen danach ist still.
+    #[test]
+    fn mic_start_failure_is_reported_and_release_stays_silent() {
+        let slot = Mutex::new(MicSlot::<u32>::Starting);
+        let mut error = None;
+        complete_start(
+            &slot,
+            Err(TalkerError::Audio("kein Mikrofon".into())),
+            |r| {
+                error = r.err().map(|e| e.to_string());
+            },
+        );
+        assert!(error.is_some_and(|e| e.contains("kein Mikrofon")));
+        assert!(matches!(take_on_release(&slot), Taken::Gone));
+    }
+
     #[test]
     fn press_blocked_by_setup_gate_never_touches_audio() {
         let models = ModelsState::new(ModelState::Missing, ModelState::Missing);
         let mut session = PttSession::new();
 
-        let outcome = session.press(&Config::default(), &models);
+        let outcome = session.press(&Config::default(), &models, |_| {});
 
         assert!(matches!(outcome, PressOutcome::Blocked(_)));
     }

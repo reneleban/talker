@@ -125,21 +125,9 @@ fn spawn_stt_worker(
                     // Der Indicator zeigt erst nach dem Loslassen Ergebnis oder
                     // Fehler: den ersten Hinweis merken, am Ende melden.
                     let mut first_hint = None;
-                    let (pressed_at, (channels, rate)) = (feed.pressed_at, feed.format);
-                    let (mut raw_samples, mut first_block) = (0usize, true);
-                    let blocks = feed.blocks.into_iter().inspect(|b| {
-                        if first_block {
-                            first_block = false;
-                            eprintln!(
-                                "talker: erster Audio-Block {} ms nach Tastendruck",
-                                pressed_at.elapsed().as_millis()
-                            );
-                        }
-                        raw_samples += b.len();
-                    });
                     pipeline::run_live(
                         &mut worker,
-                        blocks,
+                        feed.blocks,
                         feed.format,
                         feed.frontmost.as_deref(),
                         &cfg,
@@ -147,11 +135,6 @@ fn spawn_stt_worker(
                             let hint = deliver(outcome);
                             first_hint = first_hint.or(hint);
                         },
-                    );
-                    eprintln!(
-                        "talker: Live-Ende: {} ms Audio aufgenommen, {} ms seit Tastendruck",
-                        raw_samples * 1000 / (usize::from(channels) * rate as usize),
-                        pressed_at.elapsed().as_millis()
                     );
                     first_hint
                 }
@@ -311,40 +294,50 @@ fn main() -> ExitCode {
                         Arc::clone(&config),
                         move || {
                             let cfg = mic_config.read().map(|c| c.clone()).unwrap_or_default();
+                            // Balken sofort zeigen; der Start-Thread schaltet auf
+                            // Wellen um, sobald das Mikrofon wirklich läuft.
+                            if let Ok(mut ind) = ind_press.lock() {
+                                ind.starting(Instant::now());
+                            }
+                            ctx_press.request_repaint();
+                            let (ind_ready, ctx_ready, stt_ready) =
+                                (Arc::clone(&ind_press), ctx_press.clone(), stt_press.clone());
+                            let on_ready = move |ready: pipeline::MicReady| {
+                                match ready {
+                                    pipeline::MicReady::Recording { level, mode, live } => {
+                                        if let Some(feed) = live
+                                            && stt_ready.send(SttJob::Live(feed)).is_err()
+                                        {
+                                            eprintln!("talker: STT-Worker nicht verfügbar.");
+                                        }
+                                        // Der Indicator besitzt den Aufnahme-Status
+                                        // (inkl. aufgelöstem Modus); das Tray leitet
+                                        // sein Icon daraus ab (Ticket-0035).
+                                        if let Ok(mut ind) = ind_ready.lock() {
+                                            ind.start_recording(Instant::now(), level, mode);
+                                        }
+                                    }
+                                    pipeline::MicReady::Failed(e) => {
+                                        eprintln!("talker: {e}");
+                                        if let Ok(mut ind) = ind_ready.lock() {
+                                            ind.fail(Instant::now(), "Mikrofon nicht verfügbar");
+                                        }
+                                    }
+                                }
+                                ctx_ready.request_repaint();
+                            };
                             let outcome = session_press
                                 .lock()
-                                .map(|mut s| s.press(&cfg, &models_press))
-                                .unwrap_or(pipeline::PressOutcome::Failed(
-                                    talker::error::TalkerError::Audio(
-                                        "Session-Lock poisoned".into(),
-                                    ),
+                                .map(|mut s| s.press(&cfg, &models_press, on_ready))
+                                .unwrap_or(pipeline::PressOutcome::Blocked(
+                                    "Interner Fehler (Session)".into(),
                                 ));
-                            match outcome {
-                                pipeline::PressOutcome::Blocked(hint) => {
-                                    eprintln!("talker: PTT gesperrt — {hint}");
-                                    if let Ok(mut ind) = ind_press.lock() {
-                                        ind.fail(Instant::now(), hint);
-                                    }
-                                    ctx_press.request_repaint();
+                            if let pipeline::PressOutcome::Blocked(hint) = outcome {
+                                eprintln!("talker: PTT gesperrt — {hint}");
+                                if let Ok(mut ind) = ind_press.lock() {
+                                    ind.fail(Instant::now(), hint);
                                 }
-                                pipeline::PressOutcome::Started { level, mode, live } => {
-                                    if let Some(feed) = live
-                                        && stt_press.send(SttJob::Live(feed)).is_err()
-                                    {
-                                        eprintln!("talker: STT-Worker nicht verfügbar.");
-                                    }
-                                    // Der Indicator besitzt den Aufnahme-Status
-                                    // (inkl. aufgelöstem Modus); das Tray leitet
-                                    // sein Icon daraus ab (Ticket-0035).
-                                    if let Ok(mut ind) = ind_press.lock() {
-                                        ind.start_recording(Instant::now(), level, mode);
-                                    }
-                                    ctx_press.request_repaint();
-                                }
-                                pipeline::PressOutcome::Failed(e) => {
-                                    eprintln!("talker: {e}");
-                                    tray::with_instance(|t| t.set_permission_warning());
-                                }
+                                ctx_press.request_repaint();
                             }
                         },
                         move || {
@@ -360,6 +353,10 @@ fn main() -> ExitCode {
                             };
                             match outcome {
                                 pipeline::ReleaseOutcome::NoRecording => {}
+                                pipeline::ReleaseOutcome::StartAborted => {
+                                    eprintln!("talker: Taste vor dem Mikrofon-Start losgelassen.");
+                                    update(&|ind| ind.cancel());
+                                }
                                 pipeline::ReleaseOutcome::LiveEnded => {
                                     update(&|ind| ind.transcribing(Instant::now()));
                                 }

@@ -56,6 +56,8 @@ pub struct Overlay {
     sparkle: Retained<CALayer>,
     chip: Retained<CALayer>,
     chip_text: Retained<CATextLayer>,
+    /// Laufender Balken im Chip (nur beim Mikrofon-Start sichtbar).
+    bar: Retained<CALayer>,
     shown: Cell<bool>,
     /// Zuletzt angewendete (Position, Breite) — für Live-Updates aus der Vorschau.
     placed: Cell<Option<(OverlayPosition, u8)>>,
@@ -159,6 +161,11 @@ impl Overlay {
             chip_text.setContentsScale(2.0);
             chip.addSublayer(&chip_text);
         }
+        let bar = CALayer::new();
+        bar.setBackgroundColor(Some(&cg_color(0.35, 0.85, 1.0, 0.95)));
+        bar.setCornerRadius(1.5);
+        bar.setHidden(true);
+        chip.addSublayer(&bar);
 
         let overlay = Self {
             window,
@@ -167,6 +174,7 @@ impl Overlay {
             sparkle,
             chip,
             chip_text,
+            bar,
             shown: Cell::new(false),
             placed: Cell::new(None),
             style: std::cell::RefCell::new(None),
@@ -260,6 +268,15 @@ impl Overlay {
                     0.35 + 0.4 * (0.5 + 0.5 * (t * 1.6).sin()) * (0.7 + 0.3 * (t * 4.3).cos());
                 self.render_waves(synth, t, style.trail_len);
             }
+            Phase::Starting => {
+                self.show_chip("Mikrofon startet", (0.86, 0.86, 0.88));
+                let (x, w) = bar_span(self.started.elapsed().as_secs_f32(), self.bar_track());
+                self.bar.setFrame(CGRect::new(
+                    CGPoint::new(BAR_INSET + x, 3.0),
+                    CGSize::new(w, 3.0),
+                ));
+                self.bar.setHidden(false);
+            }
             Phase::Loading => {
                 let dots = ".".repeat(1 + (self.started.elapsed().as_millis() / 400 % 3) as usize);
                 self.show_chip(
@@ -309,7 +326,13 @@ impl Overlay {
         }
     }
 
+    /// Länge der Balken-Spur im Chip.
+    fn bar_track(&self) -> f64 {
+        (240.0_f64.min(self.width.get() - 20.0) - 2.0 * BAR_INSET).max(0.0)
+    }
+
     fn show_chip(&self, text: &str, (r, g, b): (f64, f64, f64)) {
+        self.bar.setHidden(true);
         for trail in &self.trails {
             for layer in trail {
                 layer.setHidden(true);
@@ -373,6 +396,24 @@ impl Overlay {
 }
 
 /// Offene Wellen-Linie als CGPath (Fenster-Koordinaten, y-Mitte = halbe Höhe).
+/// Dauer eines Balken-Durchlaufs beim Mikrofon-Start (Sekunden).
+const BAR_PERIOD: f32 = 1.2;
+/// Abstand der Balken-Spur zum Chip-Rand.
+const BAR_INSET: f64 = 18.0;
+
+/// Position (x, Breite) des laufenden Balkens in einer Spur der Länge `track`:
+/// ein Abschnitt (40 % der Spur) schiebt sich von links nach rechts durch.
+fn bar_span(t: f32, track: f64) -> (f64, f64) {
+    if track <= 0.0 || !t.is_finite() {
+        return (0.0, 0.0);
+    }
+    let segment = track * 0.4;
+    let progress = f64::from((t / BAR_PERIOD).fract().max(0.0));
+    let head = progress * (track + segment);
+    let x = (head - segment).max(0.0);
+    (x, (head.min(track) - x).max(0.0))
+}
+
 fn line_path(level: f32, t: f32, layer: usize, width: f64) -> CFRetained<CGMutablePath> {
     let samples = wave_samples(level, t, layer, WAVE_POINTS);
     let path = CGMutablePath::new();
@@ -426,6 +467,38 @@ fn wave_color(colors: &[[u8; 3]], i: usize) -> [u8; 3] {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_OVERLAY_COLORS;
+
+    /// Mikrofon-Start-Balken: ein Abschnitt läuft von links nach rechts und
+    /// bleibt immer innerhalb der Spur.
+    #[test]
+    fn bar_span_sweeps_left_to_right_inside_the_track() {
+        let track = 200.0;
+        let mut last_end = -1.0;
+        for step in 0..100 {
+            let t = step as f32 / 100.0 * BAR_PERIOD;
+            let (x, w) = bar_span(t, track);
+            assert!(
+                x >= 0.0 && w >= 0.0 && x + w <= track + 1e-9,
+                "t={t}: {x}+{w}"
+            );
+            assert!(x + w >= last_end - 1e-9, "Balken läuft rückwärts bei t={t}");
+            last_end = x + w;
+        }
+        // Zu Beginn kaum sichtbar, am Ende der Periode am rechten Rand.
+        assert!(bar_span(0.0, track).1 < 1.0);
+        let (x, w) = bar_span(BAR_PERIOD * 0.999, track);
+        assert!(x + w > track * 0.95);
+        // Der Lauf wiederholt sich nach einer Periode.
+        let (a, b) = (bar_span(0.3, track), bar_span(0.3 + BAR_PERIOD, track));
+        assert!((a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bar_span_handles_degenerate_tracks() {
+        assert_eq!(bar_span(0.5, 0.0), (0.0, 0.0));
+        let (x, w) = bar_span(f32::MAX, 100.0);
+        assert!(x.is_finite() && w.is_finite() && x + w <= 100.0 + 1e-9);
+    }
 
     #[test]
     fn wave_color_falls_back_per_index_when_config_list_is_short() {

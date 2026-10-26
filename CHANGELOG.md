@@ -10,6 +10,13 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Added
 
+- **Mikrofon-Start-Anzeige:** Beim Drücken der PTT-Taste erscheint sofort ein
+  Balken „Mikrofon startet“; die Wellen zeigt das Overlay erst, wenn das Mikrofon
+  wirklich Audio liefert. Der Start läuft im Hintergrund und blockiert die Taste
+  nicht mehr. Lässt du vor dem Start los, wird die Aufnahme abgebrochen; startet
+  das Mikrofon nach 5 s nicht, erscheint eine Fehlermeldung. Hinweis: Ein
+  fehlgeschlagener Mikrofon-Start zeigt jetzt die Overlay-Meldung „Mikrofon nicht
+  verfügbar“ statt der Tray-Warnung.
 - **Live-Diktat** (ADR-0009): In den Settings wählbares Einfügen — *Am Ende*
   (wie bisher, Default), *Satzweise* (jeder Satz nach einer Sprechpause) oder
   *Wortgruppenweise* (laufend, sobald Wörter feststehen). Der Cleanup-Modus
