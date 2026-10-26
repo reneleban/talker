@@ -31,6 +31,7 @@ aktuelle Soll-Zustand):
 - `onboarding-permissions.md` — Settings, Erst-Start, Permissions, Login-Item
 - `context-awareness.md` — Per-App-Modus-Auflösung
 - `model-downloader.md` — Modell-Download, Lizenz-Consent, Checksum, Resume
+- `streaming-dictation.md` — Live-Diktat: Einfüge-Verhalten, Korrektur-Matrix, Fallback
 
 Bei neuen Features: erst die EARS-Sätze hier ergänzen, dann Tests schreiben,
 dann implementieren (TDD-Reihenfolge aus `CLAUDE.md`).
