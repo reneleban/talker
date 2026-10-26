@@ -219,6 +219,12 @@ impl Recording {
         (self.channels, self.sample_rate)
     }
 
+    /// Beendet eine Live-Aufnahme: der Stream (und damit der Block-Kanal) wird
+    /// geschlossen, die Samples hat der Verbraucher bereits bekommen.
+    pub fn finish_live(self) {
+        drop(self.stream);
+    }
+
     /// Beendet die Aufnahme und liefert die Utterance als 16 kHz mono PCM.
     pub fn stop(self) -> Result<Vec<f32>> {
         drop(self.stream);

@@ -337,6 +337,62 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
     }
 }
 
+/// Fährt eine ganze Live-Utterance: rohe Callback-Blöcke → 560-ms-Chunks →
+/// Worker; jeder Einfüge-Auftrag geht sofort an `emit`. Endet der Block-Strom
+/// (Aufnahme gestoppt), wird der Rest eingespeist und die Sitzung beendet.
+/// Ist Live nicht möglich, wird die Aufnahme stattdessen als ganze Utterance
+/// verarbeitet (Fallback auf Am Ende).
+pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
+    worker: &mut DictationWorker<T, C>,
+    blocks: impl IntoIterator<Item = Vec<f32>>,
+    format: (u16, u32),
+    frontmost: Option<&str>,
+    cfg: &Config,
+    emit: &mut dyn FnMut(Outcome),
+) {
+    let (channels, sample_rate) = format;
+    let mut assembler = match audio::ChunkAssembler::new(channels, sample_rate) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("talker: Live-Audio unbrauchbar: {e}");
+            emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
+            return;
+        }
+    };
+    if worker.live_begin(frontmost, cfg) == LiveStart::Unavailable {
+        let raw: Vec<f32> = blocks.into_iter().flatten().collect();
+        match audio::to_mono_16k(&raw, channels, sample_rate) {
+            Ok(pcm) => emit(worker.handle(&pcm, frontmost, cfg)),
+            Err(e) => {
+                eprintln!("talker: Fallback-Aufnahme unbrauchbar: {e}");
+                emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
+            }
+        }
+        return;
+    }
+    for block in blocks {
+        match assembler.push(&block) {
+            Ok(chunks) => {
+                for chunk in chunks {
+                    worker.live_chunk(&chunk).into_iter().for_each(&mut *emit);
+                }
+            }
+            Err(e) => {
+                eprintln!("talker: Live-Audio fehlgeschlagen: {e}");
+                emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
+            }
+        }
+    }
+    match assembler.flush() {
+        Ok(rest) if !rest.is_empty() => {
+            worker.live_chunk(&rest).into_iter().for_each(&mut *emit);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("talker: Live-Audio-Rest verworfen: {e}"),
+    }
+    worker.live_end().into_iter().for_each(&mut *emit);
+}
+
 /// Vokabular-Korrektur und optionaler Cleanup für einen erkannten Text (ganze
 /// Utterance oder Live-Segment). Liefert Text + „Cleanup fiel auf Rohtext zurück".
 fn postprocess(
@@ -423,6 +479,8 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
 pub struct PttSession {
     recording: Option<audio::Recording>,
     frontmost: Option<String>,
+    /// Die laufende Aufnahme speist das Live-Diktat (Block-Kanal).
+    live: bool,
 }
 
 /// Ergebnis von [`PttSession::press`].
@@ -433,9 +491,18 @@ pub enum PressOutcome {
     Started {
         level: audio::LevelHandle,
         mode: CleanupMode,
+        /// Gesetzt bei Live-Diktat: Strom für den STT-Worker (`run_live`).
+        live: Option<LiveFeed>,
     },
     /// Mikrofon-Start fehlgeschlagen (z.B. fehlende Permission).
     Failed(TalkerError),
+}
+
+/// Rohe Audio-Blöcke einer Live-Aufnahme samt Format und Ziel-App.
+pub struct LiveFeed {
+    pub frontmost: Option<String>,
+    pub blocks: std::sync::mpsc::Receiver<Vec<f32>>,
+    pub format: (u16, u32),
 }
 
 /// Ergebnis von [`PttSession::release`].
@@ -443,6 +510,8 @@ pub enum PressOutcome {
 pub enum ReleaseOutcome {
     /// Keine laufende Aufnahme (Press war gesperrt oder scheiterte).
     NoRecording,
+    /// Live-Aufnahme beendet — der STT-Worker schließt die Utterance selbst ab.
+    LiveEnded,
     /// Utterance zu kurz — gilt als versehentlicher Tastendruck, verworfen.
     TooShort { ms: u64 },
     /// PCM + der bei Press erfasste Frontmost, bereit für den STT-Worker.
@@ -468,13 +537,31 @@ impl PttSession {
             return PressOutcome::Blocked(hint);
         }
         let frontmost = injection::frontmost_bundle_id();
+        let live = cfg.insert_mode != InsertMode::AtEnd;
         let mode = resolve_mode(cfg, frontmost.as_deref());
-        match audio::start(cfg.mic_device.as_deref(), None) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        match audio::start(cfg.mic_device.as_deref(), live.then_some(tx)) {
             Ok(rec) => {
                 let level = rec.level();
+                let feed = live.then(|| LiveFeed {
+                    frontmost: frontmost.clone(),
+                    blocks: rx,
+                    format: rec.format(),
+                });
                 self.frontmost = frontmost;
+                self.live = live;
                 self.recording = Some(rec);
-                PressOutcome::Started { level, mode }
+                // Im Live-Betrieb zeigt der Indicator den tatsächlich wirkenden Modus.
+                let mode = if live {
+                    cfg.insert_mode.resolve(mode)
+                } else {
+                    mode
+                };
+                PressOutcome::Started {
+                    level,
+                    mode,
+                    live: feed,
+                }
             }
             Err(e) => PressOutcome::Failed(e),
         }
@@ -487,6 +574,10 @@ impl PttSession {
         let Some(rec) = self.recording.take() else {
             return ReleaseOutcome::NoRecording;
         };
+        if std::mem::take(&mut self.live) {
+            rec.finish_live();
+            return ReleaseOutcome::LiveEnded;
+        }
         match rec.stop() {
             Ok(pcm) => {
                 let ms = audio::duration_ms(&pcm);
@@ -1048,6 +1139,63 @@ mod tests {
         );
         w.live_begin(None, &cfg);
         let out = w.live_chunk(&[0.0; 160]);
+        assert!(matches!(out.as_slice(), [Outcome::Rejected(_)]));
+    }
+
+    // ---- run_live: Block-Strom → Chunks → Worker (ADR-0009) ----
+
+    fn collect_live(
+        w: &mut DictationWorker<FakeStreaming, ScriptedCleaner>,
+        blocks: Vec<Vec<f32>>,
+        format: (u16, u32),
+        cfg: &Config,
+    ) -> Vec<Outcome> {
+        let mut out = Vec::new();
+        run_live(w, blocks, format, None, cfg, &mut |o| out.push(o));
+        out
+    }
+
+    /// Chunks gehen der Reihe nach an den Worker; der Rest unter 560 ms wird
+    /// ebenfalls eingespeist (hier kommt der Endpoint erst mit dem Rest-Chunk).
+    #[test]
+    fn run_live_feeds_full_chunks_and_the_remainder_then_ends() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || FakeStreaming::new(&[("", false), ("", false), ("Drittes.", true)], "Ende."),
+            &log,
+        );
+        let n = crate::audio::CHUNK_16K_SAMPLES;
+        let blocks = vec![vec![0.0; n + 10], vec![0.0; n + 90]];
+        assert_eq!(
+            texts(collect_live(&mut w, blocks, (1, 16_000), &cfg)),
+            ["Drittes.", " Ende."]
+        );
+    }
+
+    /// Fallback (REQ-STREAM-013): ohne Live-Engine wird die Aufnahme als ganze
+    /// Utterance verarbeitet — nichts geht verloren.
+    #[test]
+    fn run_live_falls_back_to_batch_when_live_is_unavailable() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[], "Batch-Text."), &log);
+        let blocks = vec![vec![0.1; 2_000], vec![0.1; 2_000]];
+        assert_eq!(
+            texts(collect_live(&mut w, blocks, (1, 16_000), &cfg)),
+            ["Batch-Text."]
+        );
+    }
+
+    /// Grenzfälle: kein Audio → kein Einfügen; unbrauchbares Format → sichtbarer Fehler.
+    #[test]
+    fn run_live_handles_no_audio_and_bad_format() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[], ""), &log);
+        assert!(collect_live(&mut w, vec![], (1, 16_000), &cfg).is_empty());
+        let out = collect_live(&mut w, vec![vec![0.0; 100]], (0, 16_000), &cfg);
         assert!(matches!(out.as_slice(), [Outcome::Rejected(_)]));
     }
 

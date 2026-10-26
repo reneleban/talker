@@ -34,6 +34,13 @@ fn try_load_cleaner() -> (Option<cleanup::GemmaCleaner>, bool) {
     }
 }
 
+/// Auftrag an den STT-Worker: eine fertige Utterance (Am Ende) oder ein
+/// Live-Strom (Satzweise/Wortgruppenweise), der bis zum Ende der Aufnahme läuft.
+enum SttJob {
+    Utterance(Vec<f32>, Option<String>),
+    Live(pipeline::LiveFeed),
+}
+
 /// STT + Cleanup + Injection laufen abseits des Main-Threads: der Dictation
 /// Worker (pipeline.rs) besitzt die Modelle und deren Lebenszyklus; dieser
 /// Thread drainiert nur den Channel und mappt `Outcome` auf Indicator/Injection.
@@ -42,7 +49,7 @@ fn spawn_stt_worker(
     indicator: Arc<Mutex<Indicator>>,
     egui_ctx: eframe::egui::Context,
     models_state: Arc<models::ModelsState>,
-) -> mpsc::Sender<(Vec<f32>, Option<String>)> {
+) -> mpsc::Sender<SttJob> {
     // Ergebnis der Pipeline ans Overlay melden (+ Repaint anstoßen).
     let report = move |f: &dyn Fn(&mut Indicator)| {
         if let Ok(mut ind) = indicator.lock() {
@@ -50,7 +57,7 @@ fn spawn_stt_worker(
         }
         egui_ctx.request_repaint();
     };
-    let (tx, rx) = mpsc::channel::<(Vec<f32>, Option<String>)>();
+    let (tx, rx) = mpsc::channel::<SttJob>();
     std::thread::spawn(move || {
         let snapshot = |cfg: &Arc<RwLock<config::Config>>| cfg.read().map(|c| c.clone()).ok();
 
@@ -58,19 +65,24 @@ fn spawn_stt_worker(
         let mut worker = pipeline::DictationWorker::new(
             &cfg,
             models_state,
-            Box::new(|dir: &std::path::Path| stt::NemotronTranscriber::new(dir)),
+            Box::new({
+                let config = Arc::clone(&config);
+                move |dir: &std::path::Path| {
+                    let pause = config
+                        .read()
+                        .map_or(config::DEFAULT_ENDPOINT_SILENCE_MS, |c| {
+                            c.endpoint_silence_ms
+                        });
+                    stt::NemotronTranscriber::with_endpoint_silence(dir, pause)
+                }
+            }),
             Box::new(try_load_cleaner),
         );
         report(&|ind| ind.ready(Instant::now()));
 
-        for (pcm, frontmost) in rx {
-            let Some(cfg) = snapshot(&config) else {
-                // Poisoned Config-Lock: nicht still verwerfen (CLAUDE.md).
-                eprintln!("talker: Config-Lock poisoned — Utterance verworfen.");
-                report(&|ind| ind.fail(Instant::now(), "Interner Fehler (Config)"));
-                continue;
-            };
-            match worker.handle(&pcm, frontmost.as_deref(), &cfg) {
+        // Fügt ein Ergebnis ein; Rückgabe: Hinweis für den Indicator, `None` = alles gut.
+        let deliver = |outcome: pipeline::Outcome| -> Option<&'static str> {
+            match outcome {
                 pipeline::Outcome::Inject {
                     text,
                     cleanup_fell_back,
@@ -79,21 +91,50 @@ fn spawn_stt_worker(
                     &injection::CgKeySender,
                     &text,
                 ) {
-                    Ok(()) if cleanup_fell_back => {
-                        // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
-                        report(&|ind| {
-                            ind.fail(Instant::now(), "Cleanup übersprungen — Rohtext eingefügt")
-                        });
-                    }
-                    Ok(()) => report(&|ind| ind.finish_ok(Instant::now())),
+                    // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
+                    Ok(()) if cleanup_fell_back => Some("Cleanup übersprungen — Rohtext eingefügt"),
+                    Ok(()) => None,
                     Err(e) => {
                         eprintln!("talker: Injection fehlgeschlagen: {e}");
-                        report(&|ind| ind.fail(Instant::now(), "Einfügen fehlgeschlagen"));
+                        Some("Einfügen fehlgeschlagen")
                     }
                 },
-                pipeline::Outcome::Rejected(hint) => {
-                    report(&|ind| ind.fail(Instant::now(), hint));
+                pipeline::Outcome::Rejected(hint) => Some(hint),
+            }
+        };
+
+        for job in rx {
+            let Some(cfg) = snapshot(&config) else {
+                // Poisoned Config-Lock: nicht still verwerfen (CLAUDE.md).
+                eprintln!("talker: Config-Lock poisoned — Utterance verworfen.");
+                report(&|ind| ind.fail(Instant::now(), "Interner Fehler (Config)"));
+                continue;
+            };
+            let hint = match job {
+                SttJob::Utterance(pcm, frontmost) => {
+                    deliver(worker.handle(&pcm, frontmost.as_deref(), &cfg))
                 }
+                SttJob::Live(feed) => {
+                    // Der Indicator zeigt erst nach dem Loslassen Ergebnis oder
+                    // Fehler: den ersten Hinweis merken, am Ende melden.
+                    let mut first_hint = None;
+                    pipeline::run_live(
+                        &mut worker,
+                        feed.blocks,
+                        feed.format,
+                        feed.frontmost.as_deref(),
+                        &cfg,
+                        &mut |outcome| {
+                            let hint = deliver(outcome);
+                            first_hint = first_hint.or(hint);
+                        },
+                    );
+                    first_hint
+                }
+            };
+            match hint {
+                Some(hint) => report(&|ind| ind.fail(Instant::now(), hint)),
+                None => report(&|ind| ind.finish_ok(Instant::now())),
             }
         }
     });
@@ -233,6 +274,7 @@ fn main() -> ExitCode {
                     let ctx_press = egui_ctx.clone();
                     let ctx_release = egui_ctx.clone();
                     let stt_tx = stt_tx.clone();
+                    let stt_press = stt_tx.clone();
                     let models_press = Arc::clone(&models_state);
                     // Eine PttSession pro (erfolgreich) installiertem Tap — ersetzt
                     // die früheren thread_local!-Zellen (Ticket-0038). Ein Retry
@@ -261,7 +303,12 @@ fn main() -> ExitCode {
                                     }
                                     ctx_press.request_repaint();
                                 }
-                                pipeline::PressOutcome::Started { level, mode } => {
+                                pipeline::PressOutcome::Started { level, mode, live } => {
+                                    if let Some(feed) = live
+                                        && stt_press.send(SttJob::Live(feed)).is_err()
+                                    {
+                                        eprintln!("talker: STT-Worker nicht verfügbar.");
+                                    }
                                     // Der Indicator besitzt den Aufnahme-Status
                                     // (inkl. aufgelöstem Modus); das Tray leitet
                                     // sein Icon daraus ab (Ticket-0035).
@@ -289,6 +336,9 @@ fn main() -> ExitCode {
                             };
                             match outcome {
                                 pipeline::ReleaseOutcome::NoRecording => {}
+                                pipeline::ReleaseOutcome::LiveEnded => {
+                                    update(&|ind| ind.transcribing(Instant::now()));
+                                }
                                 pipeline::ReleaseOutcome::TooShort { ms } => {
                                     eprintln!("talker: Utterance zu kurz ({ms} ms) — verworfen.");
                                     update(&|ind| ind.cancel());
@@ -298,7 +348,7 @@ fn main() -> ExitCode {
                                         "talker: Utterance aufgenommen: {ms} ms, {} Samples @16 kHz.",
                                         pcm.len()
                                     );
-                                    if stt_tx.send((pcm, frontmost)).is_err() {
+                                    if stt_tx.send(SttJob::Utterance(pcm, frontmost)).is_err() {
                                         eprintln!(
                                             "talker: STT-Worker nicht verfügbar — Utterance verworfen."
                                         );
