@@ -123,6 +123,7 @@ pub fn input_device_names() -> Vec<String> {
 /// `blocks`: optional zusätzlicher Verbraucher (Live-Diktat) — bekommt jeden
 /// Callback-Block roh; ohne ihn bleibt der Callback wie bisher.
 pub fn start(device_name: Option<&str>, blocks: Option<RawBlocks>) -> Result<Recording> {
+    let t0 = std::time::Instant::now();
     let host = cpal::default_host();
     let device = device_name
         .and_then(|wanted| {
@@ -140,6 +141,10 @@ pub fn start(device_name: Option<&str>, blocks: Option<RawBlocks>) -> Result<Rec
     let supported = device
         .default_input_config()
         .map_err(|e| TalkerError::Audio(format!("Eingabeformat nicht lesbar: {e}")))?;
+    eprintln!(
+        "talker: Mikrofon: Gerät + Format nach {} ms",
+        t0.elapsed().as_millis()
+    );
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let channels = config.channels;
@@ -195,9 +200,17 @@ pub fn start(device_name: Option<&str>, blocks: Option<RawBlocks>) -> Result<Rec
     }
     .map_err(|e| TalkerError::Audio(format!("Aufnahme-Stream fehlgeschlagen: {e}")))?;
 
+    eprintln!(
+        "talker: Mikrofon: Stream gebaut nach {} ms",
+        t0.elapsed().as_millis()
+    );
     stream
         .play()
         .map_err(|e| TalkerError::Audio(format!("Aufnahme-Start fehlgeschlagen: {e}")))?;
+    eprintln!(
+        "talker: Mikrofon: play() fertig nach {} ms",
+        t0.elapsed().as_millis()
+    );
 
     Ok(Recording {
         stream,
