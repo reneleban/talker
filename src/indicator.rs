@@ -9,6 +9,8 @@ use crate::cleanup::CleanupMode;
 /// Wie lange done/error sichtbar bleiben, bevor das Overlay verschwindet.
 const DONE_SHOW: Duration = Duration::from_millis(700);
 const ERROR_SHOW: Duration = Duration::from_millis(2500);
+/// Antwortet das Mikrofon so lange nicht, wird der Start als Fehler gemeldet.
+const STARTING_TIMEOUT: Duration = Duration::from_secs(5);
 /// Glättung des Pegels pro UI-Frame (Anteil des neuen Werts).
 const LEVEL_ATTACK: f32 = 0.35;
 const LEVEL_DECAY: f32 = 0.12;
@@ -22,6 +24,8 @@ pub enum Phase {
     Ready,
     /// Live-Vorschau aus den Einstellungen (synthetischer Pegel, kein Mikro).
     Preview,
+    /// Mikrofon startet (Balken statt Wellen); endet mit `start_recording`.
+    Starting,
     /// Aufnahme läuft; trägt den für diese Utterance AUFGELÖSTEN Cleanup-Modus
     /// (Kontext-Awareness, Ticket-0026) — der Indicator ist der einzige
     /// Besitzer des Aufnahme-Status, das Tray leitet sein Icon daraus ab.
@@ -76,6 +80,13 @@ impl Indicator {
         }
     }
 
+    /// PTT gedrückt, das Mikrofon läuft noch nicht.
+    pub fn starting(&mut self, now: Instant) {
+        self.phase = Phase::Starting;
+        self.phase_since = now;
+        self.level = None;
+    }
+
     pub fn start_recording(&mut self, now: Instant, level: LevelHandle, mode: CleanupMode) {
         self.phase = Phase::Recording { mode };
         self.phase_since = now;
@@ -105,8 +116,15 @@ impl Indicator {
         self.level = None;
     }
 
-    /// Zeitgesteuerte Übergänge (done/error blenden automatisch aus).
+    /// Zeitgesteuerte Übergänge (done/error blenden automatisch aus; ein
+    /// hängender Mikrofon-Start wird zum Fehler).
     pub fn tick(&mut self, now: Instant) {
+        if self.phase == Phase::Starting {
+            if now.duration_since(self.phase_since) >= STARTING_TIMEOUT {
+                self.fail(now, "Mikrofon antwortet nicht");
+            }
+            return;
+        }
         let timeout = match self.phase {
             Phase::Done | Phase::Ready => DONE_SHOW,
             Phase::Error(_) => ERROR_SHOW,
@@ -285,6 +303,45 @@ mod tests {
         assert_eq!(*ind.phase(), Phase::Preview);
         ind.set_preview(false, t0);
         assert!(!ind.visible());
+    }
+
+    /// Mikrofon-Start (ADR-0009-Nachtrag): Balken, bis die Aufnahme wirklich läuft.
+    #[test]
+    fn starting_shows_a_bar_until_the_recording_runs() {
+        let mut ind = Indicator::default();
+        let t0 = now();
+        ind.starting(t0);
+        assert_eq!(*ind.phase(), Phase::Starting);
+        assert!(ind.visible());
+        ind.start_recording(t0, LevelHandle::default(), CleanupMode::Raw);
+        assert_eq!(
+            *ind.phase(),
+            Phase::Recording {
+                mode: CleanupMode::Raw
+            }
+        );
+    }
+
+    #[test]
+    fn starting_can_be_cancelled_and_is_not_overridden_by_preview() {
+        let mut ind = Indicator::default();
+        ind.starting(now());
+        ind.set_preview(true, now());
+        assert_eq!(*ind.phase(), Phase::Starting);
+        ind.cancel();
+        assert!(!ind.visible());
+    }
+
+    /// Kein stiller Hänger: antwortet das Mikrofon nicht, erscheint ein Fehler.
+    #[test]
+    fn starting_times_out_into_a_visible_error() {
+        let mut ind = Indicator::default();
+        let t0 = now();
+        ind.starting(t0);
+        ind.tick(t0 + STARTING_TIMEOUT - Duration::from_millis(1));
+        assert_eq!(*ind.phase(), Phase::Starting);
+        ind.tick(t0 + STARTING_TIMEOUT);
+        assert!(matches!(ind.phase(), Phase::Error(_)));
     }
 
     #[test]
