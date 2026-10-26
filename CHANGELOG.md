@@ -8,6 +8,18 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ## [Unreleased]
 
+### Added
+
+- **Live-Diktat** (ADR-0009): In den Settings wählbares Einfügen — *Am Ende*
+  (wie bisher, Default), *Satzweise* (jeder Satz nach einer Sprechpause) oder
+  *Wortgruppenweise* (laufend, sobald Wörter feststehen). Der Cleanup-Modus
+  richtet sich danach: bei *Satzweise* sind Roh, Geschäftlich und Natürlich
+  erlaubt, bei *Wortgruppenweise* nur Roh; LLM-optimiert gibt es nur bei *Am Ende*.
+  Neue Config-Felder `insert_mode` (`"end"`, `"sentence"`, `"phrase"`) und
+  `endpoint_silence_ms` (Sprechpause für *Satzweise*, Default 700, wirkt nach
+  Neustart); bestehende Configs bleiben unverändert gültig. Bereits eingefügter
+  Text wird nicht zurückgenommen.
+
 ### Changed
 
 - **Breaking:** Spracherkennung wechselt von Parakeet TDT 0.6b v3 auf NVIDIA

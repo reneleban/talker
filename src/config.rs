@@ -199,6 +199,18 @@ impl Config {
         self.model_download_consent && self.stt_license_consent
     }
 
+    /// Einfüge-Verhalten wählen; ein dort nicht erlaubter Cleanup-Modus rückt
+    /// in die erlaubte Menge (ADR-0009).
+    pub fn set_insert_mode(&mut self, mode: InsertMode) {
+        self.insert_mode = mode;
+        self.cleanup_mode = mode.resolve(self.cleanup_mode);
+    }
+
+    /// Cleanup-Modus wählen, begrenzt durch das Einfüge-Verhalten.
+    pub fn set_cleanup_mode(&mut self, mode: CleanupMode) {
+        self.cleanup_mode = self.insert_mode.resolve(mode);
+    }
+
     pub fn default_path() -> PathBuf {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -532,6 +544,41 @@ mod tests {
         assert_eq!(InsertMode::PerPhrase.resolve(LlmOptimized), Raw);
         assert_eq!(InsertMode::PerPhrase.resolve(Casual), Raw);
         assert_eq!(InsertMode::PerPhrase.resolve(Raw), Raw);
+    }
+
+    /// REQ-STREAM-015: Wechsel des Einfüge-Verhaltens zieht Stufe 2 nach.
+    #[test]
+    fn set_insert_mode_moves_the_cleanup_mode_into_the_allowed_set() {
+        let mut cfg = Config {
+            cleanup_mode: CleanupMode::LlmOptimized,
+            ..Config::default()
+        };
+        cfg.set_insert_mode(InsertMode::PerSentence);
+        assert_eq!(cfg.insert_mode, InsertMode::PerSentence);
+        assert_eq!(cfg.cleanup_mode, CleanupMode::Casual);
+        cfg.set_insert_mode(InsertMode::PerPhrase);
+        assert_eq!(cfg.cleanup_mode, CleanupMode::Raw);
+        // Zurück auf Am Ende: der Modus bleibt, wie er ist (kein Hochspringen).
+        cfg.set_insert_mode(InsertMode::AtEnd);
+        assert_eq!(cfg.cleanup_mode, CleanupMode::Raw);
+        // Erlaubter Modus bleibt unangetastet.
+        cfg.cleanup_mode = CleanupMode::Business;
+        cfg.set_insert_mode(InsertMode::PerSentence);
+        assert_eq!(cfg.cleanup_mode, CleanupMode::Business);
+    }
+
+    /// Tray-Schnellwechsel auf einen nicht erlaubten Modus landet im erlaubten Set.
+    #[test]
+    fn set_cleanup_mode_respects_the_insert_mode() {
+        let mut cfg = Config {
+            insert_mode: InsertMode::PerPhrase,
+            ..Config::default()
+        };
+        cfg.set_cleanup_mode(CleanupMode::Business);
+        assert_eq!(cfg.cleanup_mode, CleanupMode::Raw);
+        cfg.insert_mode = InsertMode::AtEnd;
+        cfg.set_cleanup_mode(CleanupMode::LlmOptimized);
+        assert_eq!(cfg.cleanup_mode, CleanupMode::LlmOptimized);
     }
 
     /// Bestandsnutzer haben nur den alten Lizenzen (Parakeet + Gemma)

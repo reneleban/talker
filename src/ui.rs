@@ -304,6 +304,45 @@ impl SettingsApp {
             Self::hairline(ui);
             Self::row(
                 ui,
+                "Einfügen",
+                "Wann der Text im Zielfeld erscheint: Am Ende = nach dem Loslassen · Satzweise = jeder Satz nach einer Sprechpause · Wortgruppenweise = laufend, sobald Wörter feststehen. Bereits eingefügter Text wird nicht zurückgenommen.",
+                |ui| {
+                    egui::ComboBox::from_id_salt("insert_mode")
+                        .selected_text(snapshot.insert_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in crate::config::InsertMode::ALL {
+                                if ui
+                                    .add(egui::Button::selectable(
+                                        snapshot.insert_mode == mode,
+                                        mode.label(),
+                                    ))
+                                    .clicked()
+                                {
+                                    self.update_config(|c| c.set_insert_mode(mode));
+                                }
+                            }
+                        });
+                },
+            );
+            if snapshot.insert_mode != crate::config::InsertMode::AtEnd
+                && self
+                    .models_state
+                    .get(crate::models::ModelId::Stt)
+                    .setup_hint()
+                    .is_some()
+            {
+                ui.label(
+                    RichText::new(
+                        "Live-Einfügen startet, sobald das Spracherkennungs-Modell bereit \
+                         ist — bis dahin gilt „Am Ende“.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+            Self::hairline(ui);
+            Self::row(
+                ui,
                 "Cleanup-Modus (gemma4:e2b)",
                 "Stil der Bereinigung: Roh = wortwörtlich ohne LLM · Geschäftlich = formal, ohne Füllsel · Natürlich = nur Korrekturen, dein Ton bleibt · LLM-optimiert = macht aus Diktat einen strukturierten Prompt für z.B. Claude Code.",
                 |ui| {
@@ -314,7 +353,8 @@ impl SettingsApp {
                         .selected_text(snapshot.cleanup_mode.label())
                         .show_ui(ui, |ui| {
                             for mode in crate::cleanup::CleanupMode::ALL {
-                                let enabled = !mode.uses_llm() || llm_ok;
+                                let enabled = (!mode.uses_llm() || llm_ok)
+                                    && snapshot.insert_mode.allows(mode);
                                 if ui
                                     .add_enabled(
                                         enabled,
@@ -325,12 +365,22 @@ impl SettingsApp {
                                     )
                                     .clicked()
                                 {
-                                    self.update_config(|c| c.cleanup_mode = mode);
+                                    self.update_config(|c| c.set_cleanup_mode(mode));
                                 }
                             }
                         });
                 },
             );
+            if snapshot.insert_mode != crate::config::InsertMode::AtEnd {
+                ui.label(
+                    RichText::new(
+                        "Ausgegraute Modi gehen beim gewählten Einfügen nicht: \
+                         LLM-optimiert nur bei „Am Ende“, bei „Wortgruppenweise“ nur Roh.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
             if !self.models_state.llm_modes_available() {
                 ui.label(
                     RichText::new(
@@ -923,7 +973,7 @@ impl eframe::App for SettingsApp {
             if let Some(mode) =
                 crate::tray::with_instance_map(|t| t.mode_for_id(&event.id)).flatten()
             {
-                self.update_config(|c| c.cleanup_mode = mode);
+                self.update_config(|c| c.set_cleanup_mode(mode));
                 continue;
             }
             if event.id == self.settings_id {
