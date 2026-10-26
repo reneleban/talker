@@ -4,6 +4,7 @@
 //! Funktionen. Kein Platten-I/O, kein Upload.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -17,6 +18,11 @@ use crate::error::{Result, TalkerError};
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 /// Utterances darunter gelten als versehentlicher Tastendruck und werden verworfen.
 pub const MIN_UTTERANCE_MS: u64 = 300;
+
+/// Länge eines Live-Chunks in ms — entspricht dem Chunk des Nemotron-Pakets.
+const CHUNK_MS: u32 = 560;
+/// Samples pro Live-Chunk bei 16 kHz mono.
+pub const CHUNK_16K_SAMPLES: usize = (TARGET_SAMPLE_RATE * CHUNK_MS / 1000) as usize;
 
 /// Live-Pegel der laufenden Aufnahme (RMS des letzten Callback-Frames,
 /// als f32-Bits in einem Atomic — lockfrei lesbar aus dem UI-Thread).
@@ -41,6 +47,53 @@ pub fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+/// Formt rohe Callback-Blöcke (interleaved, Gerätetakt) zu 560-ms-Chunks in
+/// 16 kHz mono — läuft beim Verbraucher, nicht im Audio-Callback (ADR-0009).
+pub struct ChunkAssembler {
+    channels: u16,
+    sample_rate: u32,
+    /// Rohsamples (interleaved), die noch keinen vollen Chunk ergeben.
+    pending: Vec<f32>,
+}
+
+impl ChunkAssembler {
+    pub fn new(channels: u16, sample_rate: u32) -> Result<Self> {
+        if channels == 0 {
+            return Err(TalkerError::Audio("0 Kanäle gemeldet".into()));
+        }
+        Ok(Self {
+            channels,
+            sample_rate,
+            pending: Vec::new(),
+        })
+    }
+
+    /// Rohsamples pro vollem Chunk (Frames × Kanäle).
+    fn chunk_len(&self) -> usize {
+        (self.sample_rate * CHUNK_MS / 1000) as usize * usize::from(self.channels)
+    }
+
+    /// Hängt einen Block an und liefert alle dadurch vollständigen Chunks.
+    pub fn push(&mut self, block: &[f32]) -> Result<Vec<Vec<f32>>> {
+        self.pending.extend_from_slice(block);
+        let len = self.chunk_len();
+        let mut chunks = Vec::new();
+        while len > 0 && self.pending.len() >= len {
+            let raw: Vec<f32> = self.pending.drain(..len).collect();
+            chunks.push(to_mono_16k(&raw, self.channels, self.sample_rate)?);
+        }
+        Ok(chunks)
+    }
+
+    /// Restliche Samples (kürzer als ein Chunk) als 16 kHz mono; leert den Puffer.
+    pub fn flush(&mut self) -> Result<Vec<f32>> {
+        let whole = self.pending.len() / usize::from(self.channels) * usize::from(self.channels);
+        let raw: Vec<f32> = self.pending.drain(..whole).collect();
+        self.pending.clear();
+        to_mono_16k(&raw, self.channels, self.sample_rate)
+    }
+}
+
 /// Laufende Aufnahme. `stop()` beendet sie und liefert 16 kHz mono PCM.
 pub struct Recording {
     stream: Stream,
@@ -49,6 +102,9 @@ pub struct Recording {
     sample_rate: u32,
     level: LevelHandle,
 }
+
+/// Rohe Callback-Blöcke für das Live-Diktat: Sender plus Format.
+pub type RawBlocks = Sender<Vec<f32>>;
 
 /// Namen aller Eingabegeräte (für die Mikrofon-Auswahl in den Settings).
 pub fn input_device_names() -> Vec<String> {
@@ -64,7 +120,9 @@ pub fn input_device_names() -> Vec<String> {
 
 /// Startet die Mikrofon-Aufnahme. `device_name`: Gerät per Name aus der Config,
 /// nicht (mehr) vorhanden → Fallback auf das System-Default-Mikrofon.
-pub fn start(device_name: Option<&str>) -> Result<Recording> {
+/// `blocks`: optional zusätzlicher Verbraucher (Live-Diktat) — bekommt jeden
+/// Callback-Block roh; ohne ihn bleibt der Callback wie bisher.
+pub fn start(device_name: Option<&str>, blocks: Option<RawBlocks>) -> Result<Recording> {
     let host = cpal::default_host();
     let device = device_name
         .and_then(|wanted| {
@@ -102,6 +160,9 @@ pub fn start(device_name: Option<&str>) -> Result<Recording> {
                     if let Ok(mut b) = buf.lock() {
                         b.extend_from_slice(data);
                     }
+                    if let Some(tx) = &blocks {
+                        let _ = tx.send(data.to_vec());
+                    }
                 },
                 err_fn,
                 None,
@@ -117,6 +178,9 @@ pub fn start(device_name: Option<&str>) -> Result<Recording> {
                         let start = b.len();
                         b.extend(data.iter().map(|&s| f32::from(s) / 32768.0));
                         level.set(rms(&b[start..]));
+                        if let Some(tx) = &blocks {
+                            let _ = tx.send(b[start..].to_vec());
+                        }
                     }
                 },
                 err_fn,
@@ -148,6 +212,11 @@ impl Recording {
     /// Handle auf den Live-Pegel (fürs Aufnahme-Overlay).
     pub fn level(&self) -> LevelHandle {
         self.level.clone()
+    }
+
+    /// Kanalzahl und Abtastrate des Geräts — Eingabe für [`ChunkAssembler::new`].
+    pub fn format(&self) -> (u16, u32) {
+        (self.channels, self.sample_rate)
     }
 
     /// Beendet die Aufnahme und liefert die Utterance als 16 kHz mono PCM.
@@ -223,6 +292,55 @@ mod tests {
         (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
             .collect()
+    }
+
+    /// Live-Diktat (ADR-0009): Rohsamples → 560-ms-Chunks in 16 kHz mono.
+    #[test]
+    fn assembler_emits_a_chunk_per_560ms_and_keeps_the_rest() {
+        let mut a = ChunkAssembler::new(1, 16_000).unwrap();
+        assert!(a.push(&[0.1; 5_000]).unwrap().is_empty());
+        let chunks = a.push(&[0.1; 5_000]).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), CHUNK_16K_SAMPLES);
+        // Rest (10_000 - 8_960) kommt beim Flush.
+        assert_eq!(a.flush().unwrap().len(), 10_000 - CHUNK_16K_SAMPLES);
+        assert!(a.flush().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assembler_splits_large_input_into_several_chunks() {
+        let mut a = ChunkAssembler::new(1, 16_000).unwrap();
+        let chunks = a.push(&vec![0.0; CHUNK_16K_SAMPLES * 3 + 10]).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(a.flush().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn assembler_downmixes_and_resamples_to_chunk_size() {
+        // 48 kHz stereo: 560 ms = 26_880 Frames = 53_760 Samples → ~8_960 Samples @16 kHz.
+        let mut a = ChunkAssembler::new(2, 48_000).unwrap();
+        let chunks = a.push(&vec![0.2; 53_760]).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!((chunks[0].len() as i64 - CHUNK_16K_SAMPLES as i64).abs() < 16);
+    }
+
+    #[test]
+    fn assembler_edge_cases_empty_input_and_zero_channels() {
+        assert!(ChunkAssembler::new(0, 16_000).is_err());
+        let mut a = ChunkAssembler::new(1, 16_000).unwrap();
+        assert!(a.push(&[]).unwrap().is_empty());
+        assert!(a.flush().unwrap().is_empty());
+    }
+
+    /// Ein halber Stereo-Frame am Blockende geht nicht verloren, sondern wartet.
+    #[test]
+    fn assembler_keeps_incomplete_frames_for_the_next_push() {
+        let mut a = ChunkAssembler::new(2, 16_000).unwrap();
+        let first = a.push(&vec![0.5; CHUNK_16K_SAMPLES * 2 - 1]).unwrap();
+        assert!(first.is_empty());
+        let second = a.push(&[0.5]).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].len(), CHUNK_16K_SAMPLES);
     }
 
     #[test]
