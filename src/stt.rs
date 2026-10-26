@@ -283,6 +283,57 @@ impl Transcriber for FakeTranscriber {
     }
 }
 
+/// Skriptierter Streaming-Fake: `feed` liefert die vorbereiteten Updates der Reihe nach.
+#[cfg(test)]
+pub(crate) struct FakeStreaming {
+    pub(crate) updates: std::collections::VecDeque<StreamUpdate>,
+    pub(crate) rest: &'static str,
+    pub(crate) fail_feed: bool,
+}
+
+#[cfg(test)]
+impl FakeStreaming {
+    pub(crate) fn new(updates: &[(&str, bool)], rest: &'static str) -> Self {
+        Self {
+            updates: updates
+                .iter()
+                .map(|(text, endpoint)| StreamUpdate {
+                    text: (*text).to_string(),
+                    endpoint: *endpoint,
+                })
+                .collect(),
+            rest,
+            fail_feed: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Transcriber for FakeStreaming {
+    fn transcribe(&mut self, _pcm: &[f32]) -> Result<String> {
+        Ok(self.rest.to_string())
+    }
+}
+
+#[cfg(test)]
+impl StreamingTranscriber for FakeStreaming {
+    fn begin(&mut self) {}
+
+    fn feed(&mut self, _pcm: &[f32]) -> Result<StreamUpdate> {
+        if self.fail_feed {
+            return Err(TalkerError::Stt("feed kaputt".into()));
+        }
+        Ok(self.updates.pop_front().unwrap_or(StreamUpdate {
+            text: String::new(),
+            endpoint: false,
+        }))
+    }
+
+    fn finish(&mut self) -> Result<String> {
+        Ok(self.rest.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

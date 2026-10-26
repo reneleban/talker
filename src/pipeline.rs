@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
-use crate::config::Config;
+use crate::config::{Config, InsertMode};
 use crate::error::TalkerError;
 use crate::injection;
 use crate::models::{ModelId, ModelsState};
-use crate::stt::Transcriber;
+use crate::stt::{PhraseCommitter, StreamingTranscriber, Transcriber};
 use crate::{audio, vocab_match};
 
 /// Ergebnis von [`DictationWorker::handle`] für eine Utterance.
@@ -45,6 +45,7 @@ pub struct DictationWorker<T: Transcriber, C: LlmCleaner> {
     cleaner: Option<C>,
     cleaner_failed: bool,
     llm_was_available: bool,
+    live: Option<LiveSession>,
     models: Arc<ModelsState>,
     load_transcriber: TranscriberLoader<T>,
     load_cleaner: CleanerLoader<C>,
@@ -66,6 +67,7 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
             cleaner: None,
             cleaner_failed: false,
             llm_was_available: models.llm_modes_available(),
+            live: None,
             models,
             load_transcriber,
             load_cleaner,
@@ -87,16 +89,20 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
         worker
     }
 
-    /// Verarbeitet eine Utterance unter der übergebenen Config-Momentaufnahme.
-    /// Bricht nie hart ab: jeder Fehlerpfad wird zu einem `Outcome`.
-    pub fn handle(&mut self, pcm: &[f32], frontmost: Option<&str>, cfg: &Config) -> Outcome {
-        // Live-Aktivierung (Ticket-0029): wird gemma nachträglich ready,
-        // den Fehler-Cache löschen — der nächste LLM-Bedarf lädt dann.
+    /// Live-Aktivierung (Ticket-0029): wird gemma nachträglich ready,
+    /// den Fehler-Cache löschen — der nächste LLM-Bedarf lädt dann.
+    fn refresh_llm_availability(&mut self) {
         let llm_available = self.models.llm_modes_available();
         if llm_available && !self.llm_was_available {
             self.cleaner_failed = false;
         }
         self.llm_was_available = llm_available;
+    }
+
+    /// Verarbeitet eine Utterance unter der übergebenen Config-Momentaufnahme.
+    /// Bricht nie hart ab: jeder Fehlerpfad wird zu einem `Outcome`.
+    pub fn handle(&mut self, pcm: &[f32], frontmost: Option<&str>, cfg: &Config) -> Outcome {
+        self.refresh_llm_availability();
 
         // Kontext-Awareness (Ticket-0026): Modus für DIESE Utterance auflösen.
         let resolved = resolve_mode(cfg, frontmost);
@@ -177,6 +183,24 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
     }
 }
 
+/// Ergebnis von [`DictationWorker::live_begin`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum LiveStart {
+    Started,
+    /// Kein Live möglich (Einfüge-Verhalten Am Ende oder kein STT-Modell) —
+    /// der Aufrufer fällt auf den Batch-Pfad zurück.
+    Unavailable,
+}
+
+/// Zustand einer laufenden Live-Utterance (ADR-0009).
+struct LiveSession {
+    insert_mode: InsertMode,
+    /// Config-Momentaufnahme mit dem für diese Utterance aufgelösten Modus.
+    cfg: Config,
+    committer: PhraseCommitter,
+    emitted_any: bool,
+}
+
 /// Ergebnis einer verarbeiteten Utterance (worker-intern; nach außen: [`Outcome`]).
 #[derive(Debug)]
 enum Processed {
@@ -190,6 +214,160 @@ enum Processed {
     Empty,
     /// Spracherkennung fehlgeschlagen.
     SttFailed(TalkerError),
+}
+
+/// Live-Diktat: braucht eine Engine, die auch streamt.
+impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C> {
+    /// Startet eine Live-Utterance. Der Cleanup-Modus wird mit der Erlaubnismatrix
+    /// des Einfüge-Verhaltens aufgelöst (REQ-STREAM-010).
+    pub fn live_begin(&mut self, frontmost: Option<&str>, cfg: &Config) -> LiveStart {
+        self.live = None;
+        if cfg.insert_mode == InsertMode::AtEnd {
+            return LiveStart::Unavailable;
+        }
+        self.refresh_llm_availability();
+        let resolved = cfg.insert_mode.resolve(resolve_mode(cfg, frontmost));
+        if cfg.stt_model_dir != self.stt_dir || self.transcriber.is_none() {
+            match (self.load_transcriber)(&cfg.stt_model_dir) {
+                Ok(t) => {
+                    self.transcriber = Some(t);
+                    self.stt_dir = cfg.stt_model_dir.clone();
+                }
+                Err(e) => eprintln!("talker: STT-Neuladen fehlgeschlagen — {e}"),
+            }
+        }
+        let Some(transcriber) = self.transcriber.as_mut() else {
+            return LiveStart::Unavailable;
+        };
+        transcriber.begin();
+        if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
+            (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+        }
+        self.live = Some(LiveSession {
+            insert_mode: cfg.insert_mode,
+            cfg: Config {
+                cleanup_mode: resolved,
+                ..cfg.clone()
+            },
+            committer: PhraseCommitter::default(),
+            emitted_any: false,
+        });
+        LiveStart::Started
+    }
+
+    /// Ein Chunk (16 kHz mono) → null oder mehr Einfüge-Aufträge.
+    pub fn live_chunk(&mut self, pcm: &[f32]) -> Vec<Outcome> {
+        let (Some(live), Some(transcriber)) = (self.live.as_mut(), self.transcriber.as_mut())
+        else {
+            return Vec::new();
+        };
+        let update = match transcriber.feed(pcm) {
+            Ok(update) => update,
+            Err(e) => {
+                eprintln!("talker: Live-STT fehlgeschlagen: {e}");
+                return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
+            }
+        };
+        let raw = match live.insert_mode {
+            InsertMode::PerSentence => update.endpoint.then_some(update.text),
+            InsertMode::PerPhrase if update.endpoint => live.committer.flush(&update.text),
+            InsertMode::PerPhrase => live.committer.update(&update.text),
+            InsertMode::AtEnd => None,
+        };
+        raw.and_then(|raw| self.live_segment(&raw))
+            .into_iter()
+            .collect()
+    }
+
+    /// PTT losgelassen: der noch offene Rest, danach ist die Sitzung zu.
+    pub fn live_end(&mut self) -> Vec<Outcome> {
+        let (Some(live), Some(transcriber)) = (self.live.as_mut(), self.transcriber.as_mut())
+        else {
+            return Vec::new();
+        };
+        let rest = match transcriber.finish() {
+            Ok(rest) => rest,
+            Err(e) => {
+                eprintln!("talker: Live-STT fehlgeschlagen: {e}");
+                self.live = None;
+                return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
+            }
+        };
+        let raw = match live.insert_mode {
+            InsertMode::PerSentence => Some(rest),
+            InsertMode::PerPhrase => live.committer.flush(&rest),
+            InsertMode::AtEnd => None,
+        };
+        let out = raw.and_then(|raw| self.live_segment(&raw));
+        self.live = None;
+        out.into_iter().collect()
+    }
+
+    /// Ein erkanntes Segment → Vokabular-Korrektur + Cleanup → Einfüge-Auftrag.
+    /// Leere Segmente erzeugen keinen; ab dem zweiten steht ein Leerzeichen davor.
+    fn live_segment(&mut self, raw: &str) -> Option<Outcome> {
+        let live = self.live.as_mut()?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let cleaner = live
+            .cfg
+            .cleanup_mode
+            .uses_llm()
+            .then_some(self.cleaner.as_mut())
+            .flatten()
+            .map(|c| {
+                c.set_mode(live.cfg.cleanup_mode);
+                c.set_vocab(&live.cfg.vocabulary);
+                c as &mut dyn LlmCleaner
+            });
+        let (text, cleanup_fell_back) =
+            postprocess(raw.to_string(), &live.cfg, cleaner, self.cleaner_failed);
+        let text = if live.emitted_any {
+            format!(" {text}")
+        } else {
+            text
+        };
+        live.emitted_any = true;
+        Some(Outcome::Inject {
+            text,
+            cleanup_fell_back,
+        })
+    }
+}
+
+/// Vokabular-Korrektur und optionaler Cleanup für einen erkannten Text (ganze
+/// Utterance oder Live-Segment). Liefert Text + „Cleanup fiel auf Rohtext zurück".
+fn postprocess(
+    raw: String,
+    cfg: &Config,
+    cleaner: Option<&mut dyn LlmCleaner>,
+    cleaner_failed: bool,
+) -> (String, bool) {
+    // Deterministische Vokabular-Korrektur (Kölner Phonetik) — vor dem
+    // Cleanup, wirkt damit auch im Roh-Modus; per Config abschaltbar.
+    let raw = if cfg.phonetic_matching {
+        vocab_match::apply(&raw, &cfg.vocabulary)
+    } else {
+        raw
+    };
+    match cleaner {
+        Some(c) => {
+            let t2 = Instant::now();
+            let (cleaned, fell_back) = cleanup::clean_with_fallback(c, &raw);
+            eprintln!(
+                "talker: Cleaned Transcript (Cleanup {} ms): {cleaned}",
+                t2.elapsed().as_millis()
+            );
+            (cleaned, fell_back)
+        }
+        // Cleanup gewollt, aber Modell nicht ladbar → ebenfalls sichtbar machen.
+        None => {
+            let degraded = cfg.cleanup_mode.uses_llm() && cleaner_failed;
+            (raw, degraded)
+        }
+    }
 }
 
 /// Verarbeitet eine Utterance: STT → optionale phonetische Vokabular-Korrektur
@@ -213,29 +391,7 @@ fn process_utterance(
         "talker: Raw Transcript ({audio_ms} ms Audio, STT {} ms): {raw}",
         t1.elapsed().as_millis()
     );
-    // Deterministische Vokabular-Korrektur (Kölner Phonetik) — vor dem
-    // Cleanup, wirkt damit auch im Roh-Modus; per Config abschaltbar.
-    let raw = if cfg.phonetic_matching {
-        vocab_match::apply(&raw, &cfg.vocabulary)
-    } else {
-        raw
-    };
-    let (text, cleanup_fell_back) = match cleaner {
-        Some(c) => {
-            let t2 = Instant::now();
-            let (cleaned, fell_back) = cleanup::clean_with_fallback(c, &raw);
-            eprintln!(
-                "talker: Cleaned Transcript (Cleanup {} ms): {cleaned}",
-                t2.elapsed().as_millis()
-            );
-            (cleaned, fell_back)
-        }
-        // Cleanup gewollt, aber Modell nicht ladbar → ebenfalls sichtbar machen.
-        None => {
-            let degraded = cfg.cleanup_mode.uses_llm() && cleaner_failed;
-            (raw, degraded)
-        }
-    };
+    let (text, cleanup_fell_back) = postprocess(raw, cfg, cleaner, cleaner_failed);
     Processed::Text {
         text,
         cleanup_fell_back,
@@ -706,6 +862,193 @@ mod tests {
             } => (text, cleanup_fell_back),
             other => panic!("erwartet Inject, bekam {other:?}"),
         }
+    }
+
+    // ---- Live-Diktat (ADR-0009, REQ-STREAM-004..011) ----
+
+    use crate::config::InsertMode;
+    use crate::stt::FakeStreaming;
+
+    fn live_cfg(insert_mode: InsertMode, cleanup_mode: CleanupMode) -> Config {
+        Config {
+            insert_mode,
+            cleanup_mode,
+            ..Config::default()
+        }
+    }
+
+    fn live_worker(
+        cfg: &Config,
+        stt: impl Fn() -> FakeStreaming + 'static,
+        log: &Rc<RefCell<Vec<String>>>,
+    ) -> DictationWorker<FakeStreaming, ScriptedCleaner> {
+        let loads = Rc::new(RefCell::new(0usize));
+        DictationWorker::new(
+            cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(move |_dir: &Path| Ok(stt())),
+            counted_cleaner_loader(&loads, log),
+        )
+    }
+
+    fn texts(outcomes: Vec<Outcome>) -> Vec<String> {
+        outcomes
+            .into_iter()
+            .map(|o| inject_text(o).0)
+            .collect::<Vec<_>>()
+    }
+
+    /// REQ-STREAM-004/006: Satzweise fügt beim Endpoint ein, der Rest kommt beim
+    /// Loslassen; ab dem zweiten Segment mit Leerzeichen davor.
+    #[test]
+    fn live_sentence_mode_injects_at_endpoint_and_rest_at_end() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || {
+                FakeStreaming::new(
+                    &[("das ist", false), ("Erster Satz.", true), ("noch", false)],
+                    "Zweiter Satz.",
+                )
+            },
+            &log,
+        );
+        assert!(matches!(w.live_begin(None, &cfg), LiveStart::Started));
+        assert!(w.live_chunk(&[0.0; 160]).is_empty());
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["Erster Satz."]);
+        assert!(w.live_chunk(&[0.0; 160]).is_empty());
+        assert_eq!(texts(w.live_end()), [" Zweiter Satz."]);
+    }
+
+    /// REQ-STREAM-011: Geschäftlich/Natürlich korrigieren jedes Segment einzeln.
+    #[test]
+    fn live_sentence_mode_cleans_each_segment() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Business);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[("eins", true)], "zwei"), &log);
+        w.live_begin(None, &cfg);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["[eins]"]);
+        assert_eq!(texts(w.live_end()), [" [zwei]"]);
+    }
+
+    /// REQ-STREAM-010: LLM-optimiert ist bei Satzweise nicht erlaubt → Natürlich;
+    /// auch eine Kontext-Regel wird so aufgelöst.
+    #[test]
+    fn live_sentence_mode_resolves_disallowed_modes() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut cfg = live_cfg(InsertMode::PerSentence, CleanupMode::LlmOptimized);
+        cfg.context_aware_enabled = true;
+        cfg.context_rules = vec![("com.app".into(), CleanupMode::LlmOptimized)];
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[("eins", true)], ""), &log);
+        w.live_begin(Some("com.app"), &cfg);
+        w.live_chunk(&[0.0; 160]);
+        assert!(
+            log.borrow().iter().any(|e| e.starts_with("mode:Natürlich")),
+            "erwartet set_mode(Natürlich): {:?}",
+            log.borrow()
+        );
+        assert!(log.borrow().iter().all(|e| !e.contains("LLM-optimiert")));
+    }
+
+    /// Cleanup-Fehler brechen nie ab: Rohtext des Segments + Fallback-Flag.
+    #[test]
+    fn live_sentence_mode_falls_back_to_raw_when_cleaner_is_unavailable() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Business);
+        let mut w: DictationWorker<FakeStreaming, ScriptedCleaner> = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_dir: &Path| Ok(FakeStreaming::new(&[("eins", true)], ""))),
+            Box::new(|| (None, true)),
+        );
+        w.live_begin(None, &cfg);
+        let out = w.live_chunk(&[0.0; 160]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            inject_text(out.into_iter().next().unwrap()),
+            ("eins".into(), true)
+        );
+    }
+
+    /// REQ-STREAM-005/009: Wortgruppenweise gibt nur stabile Wörter aus, nur Roh.
+    #[test]
+    fn live_phrase_mode_injects_stable_words_without_cleanup() {
+        let cfg = live_cfg(InsertMode::PerPhrase, CleanupMode::Business);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || {
+                FakeStreaming::new(
+                    &[
+                        ("das ist", false),
+                        ("das ist ein", false),
+                        ("das ist ein test", false),
+                    ],
+                    "das ist ein test",
+                )
+            },
+            &log,
+        );
+        w.live_begin(None, &cfg);
+        assert!(w.live_chunk(&[0.0; 160]).is_empty());
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["das ist"]);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), [" ein"]);
+        assert_eq!(texts(w.live_end()), [" test"]);
+        assert!(log.borrow().iter().all(|e| !e.starts_with("clean:")));
+    }
+
+    /// Grenzfälle: leere Segmente und leerer Rest erzeugen keinen Einfüge-Auftrag.
+    #[test]
+    fn live_empty_segments_inject_nothing() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[("  ", true)], "  "), &log);
+        w.live_begin(None, &cfg);
+        assert!(w.live_chunk(&[0.0; 160]).is_empty());
+        assert!(w.live_end().is_empty());
+        // Nach dem Ende ist die Sitzung zu: weitere Chunks/Ends sind harmlos.
+        assert!(w.live_chunk(&[0.0; 160]).is_empty());
+        assert!(w.live_end().is_empty());
+    }
+
+    /// REQ-STREAM-013: Am Ende oder fehlendes Modell → kein Live (Fallback auf Batch).
+    #[test]
+    fn live_is_unavailable_for_at_end_and_without_model() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let at_end = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = live_worker(&at_end, || FakeStreaming::new(&[], ""), &log);
+        assert!(matches!(
+            w.live_begin(None, &at_end),
+            LiveStart::Unavailable
+        ));
+
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w: DictationWorker<FakeStreaming, ScriptedCleaner> = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_dir: &Path| Err(TalkerError::Stt("kein Modell".into()))),
+            Box::new(|| (None, false)),
+        );
+        assert!(matches!(w.live_begin(None, &cfg), LiveStart::Unavailable));
+    }
+
+    /// Fehlerpfad: ein STT-Fehler im Stream wird sichtbar gemeldet, nicht verschluckt.
+    #[test]
+    fn live_feed_error_is_reported() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || {
+                let mut f = FakeStreaming::new(&[], "");
+                f.fail_feed = true;
+                f
+            },
+            &log,
+        );
+        w.live_begin(None, &cfg);
+        let out = w.live_chunk(&[0.0; 160]);
+        assert!(matches!(out.as_slice(), [Outcome::Rejected(_)]));
     }
 
     /// AK2a: gemma wird zwischen zwei Utterances ready → Fehler-Cache-Reset,
