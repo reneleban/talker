@@ -82,7 +82,8 @@ fn spawn_stt_worker(
 
         // Fügt ein Ergebnis ein; Rückgabe: Hinweis für den Indicator, `None` = alles gut.
         let deliver = |outcome: pipeline::Outcome| -> Option<&'static str> {
-            match outcome {
+            let t0 = Instant::now();
+            let result = match outcome {
                 pipeline::Outcome::Inject {
                     text,
                     cleanup_fell_back,
@@ -100,7 +101,13 @@ fn spawn_stt_worker(
                     }
                 },
                 pipeline::Outcome::Rejected(hint) => Some(hint),
-            }
+            };
+            eprintln!(
+                "talker: Einfügen abgeschlossen nach {} ms ({})",
+                t0.elapsed().as_millis(),
+                result.unwrap_or("ok")
+            );
+            result
         };
 
         for job in rx {

@@ -324,6 +324,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
             });
         let (text, cleanup_fell_back) =
             postprocess(raw.to_string(), &live.cfg, cleaner, self.cleaner_failed);
+        eprintln!("talker: Live-Segment: {text}");
         let text = if live.emitted_any {
             format!(" {text}")
         } else {
@@ -370,10 +371,16 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
         }
         return;
     }
+    let started = Instant::now();
     for block in blocks {
         match assembler.push(&block) {
             Ok(chunks) => {
                 for chunk in chunks {
+                    eprintln!(
+                        "talker: Live-Chunk ({} Samples) nach {} ms",
+                        chunk.len(),
+                        started.elapsed().as_millis()
+                    );
                     worker.live_chunk(&chunk).into_iter().for_each(&mut *emit);
                 }
             }
