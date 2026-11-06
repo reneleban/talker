@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo deny check*)",
+      "Bash(make verify)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git merge --no-ff wt/*)",
+      "Bash(git merge --abort)",
+      "Bash(git rev-parse*)",
+      "Bash(git worktree list*)",
+      "Bash(git push -u origin feat/*)",
+      "Bash(git push -u origin fix/*)",
+      "Bash(git push -u origin chore/*)",
+      "Bash(gh pr create --draft *)",
+      "Bash(gh pr view*)",
+      "Bash(sh .claude/skills/spawn-worker/spawn.sh *)"
+    ],
+    "deny": [
+      "Bash(git push * main*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(*--no-verify*)",
+      "Bash(gh pr merge*)",
+      "Bash(gh pr ready*)"
+    ]
+  }
+}

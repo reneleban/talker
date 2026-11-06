@@ -1,64 +1,11 @@
-# talker — Engineering-Regeln (Repo)
+@AGENTS.md
 
-Verbindlich für alle, die in diesem Repo Code schreiben (Menschen wie Agenten/Fable).
-Kontext: Entscheidungen in `docs/adr/`, Begriffe in `CONTEXT.md`.
+# Claude-Code-spezifisch
 
-## Dokumentations-Formate (Override des globalen Defaults)
-- **Architektur**: kein volles arc42. Stattdessen ADRs (`docs/adr/`, MADR-Format,
-  bereits Praxis) + `docs/architecture/overview.md` mit 3 Mermaid-Diagrammen
-  (Bausteinsicht, Laufzeitsicht/Pipeline, Kontextsicht ggü. macOS-APIs). Deckt
-  die Fragen ab, die bei Verständnisproblemen wirklich weiterhelfen, ohne die
-  übrigen arc42-Kapitel (Solo-Projekt, kein Mehrwert). Begründung: ADR-0004.
-- **Requirements**: kein IREB-Fließtext. Stattdessen **EARS**-Syntax
-  (Ubiquitär/Event/State/Optional/Unwanted-Behavior) unter `docs/requirements/`.
-  Kürzer, testbarer, deckt sich mit der AK↔Test-1:1-Regel unten. Begründung: ADR-0004.
-
-## Stabilitäts-Policies (verbindlich)
-- **SemVer, CHANGELOG (Keep a Changelog), Config-Versionierung/Deprecation** —
-  Details in `docs/stability.md`. Kurzfassung: Config-TOML ist ein
-  Kompatibilitäts-Vertrag (neues Feld = `Config` + `Default`, fehlend → Default
-  via `#[serde(default)]`, Legacy-Migration in `Config::parse()`, Deprecation
-  statt stillem Break); jede nutzersichtbare Änderung bekommt einen CHANGELOG-Eintrag
-  im selben PR; Breaking Changes werden explizit markiert.
-
-## Scope & Stack (hart)
-- **Nur macOS, aktuellste Version.** Keine Cross-Platform-Abstraktionen — native macOS-APIs direkt.
-- **Rust.** ML-Engines (STT/LLM) via FFI, gekapselt hinter Traits (`Transcriber`, `LlmCleaner`) — ADR-0001.
-
-## Test-Driven & Testabdeckung
-- **TDD wo möglich** (red-green-refactor): erst der Test, der die AK ausdrückt, dann Code.
-- **Tests-pro-Story ist Definition of Done.** Jede Akzeptanzkriterium hat mind. einen Test — AK ↔ Test 1:1. Ohne Tests ist eine Story nicht fertig.
-- **Grenzfälle sind Pflicht:** leere Eingaben, Min/Max, ein-über/-unter-Grenze, Fehlerpfade. Out-of-Scope-Items als „darf nicht passieren"-Tests wo sinnvoll.
-- **Kritische Logik voll abgedeckt:** Clipboard save/restore, Resampling, TOML load/save, Cleanup-Fallback. Kein starres Prozent-Gate (vermeidet Test-Theater für GUI/FFI-Glue).
-
-## Clean Code
-- **YAGNI strikt:** nur bauen, was die aktuelle AK fordert. Keine Stubs „für später", keine ungenutzten Felder/Methoden, keine TODO-Platzhalter.
-- Bestehende Dateien editieren statt neue anlegen. Minimale, fokussierte Changes — kein Refactor über den Auftrag hinaus.
-- Keine voreiligen Abstraktionen — drei ähnliche Zeilen > ein einmal genutzter Helper.
-- Validieren nur an Systemgrenzen (User-Input, externe APIs/FFI).
-- Keine Docstrings/Kommentare zu unverändertem Code.
-
-## Fehlerbehandlung
-- `Result` + `thiserror`/`anyhow`. **Keine Panics im Hot-Path** (Aufnahme → STT → Cleanup → Injection).
-- Die Pipeline darf an keiner Stufe hart abbrechen: Cleanup-Fehler → Fallback auf Raw Transcript; fehlende Permission → sichtbarer Hinweis statt stillem Fail.
-
-## Toolchain (gepinnt)
-- Rust **1.94.1** (`rust-toolchain.toml`), Komponenten rustfmt + clippy. „Grün" ist damit für alle identisch definiert.
-- Clippy-Lints: `[lints.clippy] all = "warn"` in `Cargo.toml`, `msrv` in `clippy.toml`.
-
-## verify:fast (vor jedem Commit)
-- `cargo build` + `cargo test` + `cargo clippy` müssen grün sein. Lokal nicht grün → nicht committen, nicht pushen.
-- Feature-Stories (UI/Injection) zusätzlich einmal real benutzen (Field-Test), nicht nur type-checken.
-
-## Coverage (Report, kein Gate)
-- Sichtbarkeit via `cargo llvm-cov` (einmalig installieren: `cargo install cargo-llvm-cov`). Berichtet die Zahl, blockiert nichts.
-- Verbindlich bleibt die AK-basierte Abdeckung oben, nicht ein Prozentwert.
-
-## Git
-- **Immer Feature-Branch**, nie direkt auf `main`. Naming: `feat/<ticket>-<kurzname>`, `fix/...`.
-- **Conventional Commits**: `type(scope): beschreibung`.
-- Kein `--no-verify`, keine Hooks überspringen. Merge nach `main` nur nach manuellem Review/OK.
-
-## Stopp-Punkte (an den Menschen übergeben, nicht raten)
-- macOS-Permissions (Accessibility, Mikrofon) kann kein Prozess sich selbst geben — anhalten, erklären, auf OK warten.
-- Nach 2 erfolglosen Versuchen an derselben Stelle: stoppen, Root-Cause + Optionen melden.
+- Agent-Definitionen: `.claude/agents/`. Default-Agent dieses Repos ist `orchestrator`
+  (nur im Haupt-Checkout, `.claude/settings.local.json`); eine Rolle direkt starten: `claude --agent <rolle>`.
+- Gemeinsame Abläufe mehrerer Rollen sind Projekt-Skills in `.claude/skills/`:
+  `verify-fast`, `test-first`, `git-workflow`, `ears-requirement`, `field-test`,
+  `release-checklist`, `spawn-worker` (nur Orchestrator).
+- Rollen kommunizieren über Cross-Session-Messaging (`ListAgents`, `SendMessage`).
+  Der Session-Name einer Rolle ist `<rolle>-<ticket>`, z. B. `rust-developer-0026`.
