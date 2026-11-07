@@ -177,7 +177,10 @@ open --env TALKER_DEBUG_WAV_DIR="$HOME/talker-debug" ~/Applications/talker.app
 **Messreihe.** `make latency-eval` verarbeitet alle STT-Fixtures je Am Ende/Satzweise ×
 Roh/Natürlich ohne Einfügen und gibt eine Markdown-Tabelle mit p50/p95 aus. `N=<zahl>` setzt
 die Läufe je Fall (Default 10, dazu ein verworfener Aufwärmlauf), `LATENCY_OUT=<datei>` schreibt
-die Tabelle zusätzlich in eine Datei. Braucht das Nemotron- und das Gemma-Modell.
+die Tabelle zusätzlich in eine Datei. `N=3` ist der Schnelllauf; `N=10` dauert über 30 Minuten,
+weil Satzweise im Echtzeittakt läuft. Die Spalte „je Audio-s“ setzt `Loslassen→Text` ins
+Verhältnis zur Clip-Länge (die Latenz am Ende wächst mit ihr). Braucht das Nemotron-Modell;
+ohne Gemma laufen nur die Roh-Fälle, die Natürlich-Fälle stehen unter „Übersprungen“.
 
 **Fixtures.** Die zehn FLEURS-Clips (`tests/fixtures/stt/fleurs-de-*`, CC-BY-4.0, siehe
 `tests/fixtures/stt/ATTRIBUTION.md`) erzeugt `scripts/fetch_fleurs_fixtures.sh` neu; das

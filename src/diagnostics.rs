@@ -167,7 +167,7 @@ fn fmt_khz(rate: u32) -> String {
     }
 }
 
-fn cleanup_name(mode: CleanupMode) -> &'static str {
+pub fn cleanup_name(mode: CleanupMode) -> &'static str {
     match mode {
         CleanupMode::Raw => "Roh",
         CleanupMode::Business => "Geschäftlich",

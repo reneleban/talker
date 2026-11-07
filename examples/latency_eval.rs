@@ -2,7 +2,8 @@
 //! Roh/Natürlich, ohne echte Injection, durch dieselbe Pipeline wie die App
 //! (`WavSource` → `audio::start` → `process_job`). Ausgabe: Markdown mit p50/p95.
 //! Aufruf: `make latency-eval` (Variablen `N` = Läufe je Fall, Default 10; `LATENCY_OUT=<datei>`
-//! schreibt die Tabelle zusätzlich in eine Datei). Braucht Nemotron- und Gemma-Modell.
+//! schreibt die Tabelle zusätzlich in eine Datei). Braucht das Nemotron-Modell; ohne Gemma laufen
+//! nur die Roh-Fälle, die Natürlich-Fälle stehen unter „Übersprungen“.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,11 +17,17 @@ use talker::audio::{
 };
 use talker::cleanup::{CleanupMode, GemmaCleaner, LlmCleaner};
 use talker::config::{Config, InsertMode};
-use talker::diagnostics::DictationTrace;
+use talker::diagnostics::{DictationTrace, cleanup_name};
 use talker::error::TalkerError;
 use talker::models::{ModelState, ModelsState};
 use talker::pipeline::{DictationWorker, LiveFeed, SttJob, process_job};
 use talker::stt::{NemotronTranscriber, StreamingTranscriber, Transcriber};
+
+/// Dieselbe Wortnormalisierung wie die Regression „erstes Wort“ (`tests/stt_nemotron.rs`).
+#[path = "../tests/support/first_word.rs"]
+#[allow(dead_code)]
+mod first_word_support;
+use first_word_support::normalize_words;
 
 /// Läufe je Fall, wenn `N` nicht gesetzt ist; zusätzlich ein verworfener Aufwärmlauf.
 const DEFAULT_RUNS: usize = 10;
@@ -46,21 +53,11 @@ fn collect_runs<T>(n: usize, mut run: impl FnMut() -> T) -> Vec<T> {
     (0..n).map(|_| run()).collect()
 }
 
-fn normalize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
-}
-
 /// Wortfehlerrate (Levenshtein über normalisierte Wörter / Referenzlänge).
 /// Leere Referenz: 0 bei leerer Hypothese, sonst 1.
 fn wer(reference: &str, hypothesis: &str) -> f64 {
-    let r = normalize(reference);
-    let h = normalize(hypothesis);
+    let r = normalize_words(reference);
+    let h = normalize_words(hypothesis);
     if r.is_empty() {
         return if h.is_empty() { 0.0 } else { 1.0 };
     }
@@ -134,19 +131,30 @@ fn list_wavs(dir: &Path) -> Result<Vec<PathBuf>, String> {
 #[derive(Debug, Default, Clone)]
 struct RunResult {
     release_to_text: Option<Duration>,
+    /// `Loslassen→Text` je Sekunde aufgenommenes Audio (die Latenz am Ende wächst mit der Clip-Länge).
+    per_audio_second: Option<Duration>,
     stt: Option<Duration>,
     cleanup: Option<Duration>,
     first_segment: Option<Duration>,
     text: String,
 }
 
+/// Latenz bezogen auf eine Sekunde Audio; Audiodauer 0 → `None`.
+fn per_audio_second(latency: Duration, recorded: Duration) -> Option<Duration> {
+    (!recorded.is_zero()).then(|| latency.div_f64(recorded.as_secs_f64()))
+}
+
 impl RunResult {
     fn from_trace(trace: &DictationTrace, text: String) -> Self {
+        let release_to_text = match (trace.text_at, trace.released_at) {
+            (Some(text_at), Some(released)) => Some(text_at.saturating_since(released)),
+            _ => None,
+        };
         Self {
-            release_to_text: match (trace.text_at, trace.released_at) {
-                (Some(text_at), Some(released)) => Some(text_at.saturating_since(released)),
-                _ => None,
-            },
+            release_to_text,
+            per_audio_second: release_to_text
+                .zip(trace.recorded)
+                .and_then(|(latency, recorded)| per_audio_second(latency, recorded)),
             stt: trace.stt,
             cleanup: trace.cleanup,
             first_segment: trace
@@ -161,6 +169,7 @@ impl RunResult {
 #[derive(Default)]
 struct ComboStats {
     release_to_text: Vec<Duration>,
+    per_audio_second: Vec<Duration>,
     stt: Vec<Duration>,
     cleanup: Vec<Duration>,
     first_segment: Vec<Duration>,
@@ -171,6 +180,7 @@ struct ComboStats {
 impl ComboStats {
     fn add_run(&mut self, run: &RunResult) {
         self.release_to_text.extend(run.release_to_text);
+        self.per_audio_second.extend(run.per_audio_second);
         self.stt.extend(run.stt);
         self.cleanup.extend(run.cleanup);
         self.first_segment.extend(run.first_segment);
@@ -202,17 +212,12 @@ fn cell(d: Option<Duration>) -> String {
     d.map_or_else(|| "—".to_string(), |d| format!("{} ms", d.as_millis()))
 }
 
-fn wer_cell(w: Option<f64>) -> String {
-    w.map_or_else(|| "—".to_string(), |w| format!("{:.1} %", w * 100.0))
+fn rate_cell(d: Option<Duration>) -> String {
+    d.map_or_else(|| "—".to_string(), |d| format!("{} ms/s", d.as_millis()))
 }
 
-fn cleanup_label(mode: CleanupMode) -> &'static str {
-    match mode {
-        CleanupMode::Raw => "Roh",
-        CleanupMode::Casual => "Natürlich",
-        CleanupMode::Business => "Geschäftlich",
-        CleanupMode::LlmOptimized => "LLM-optimiert",
-    }
+fn wer_cell(w: Option<f64>) -> String {
+    w.map_or_else(|| "—".to_string(), |w| format!("{:.1} %", w * 100.0))
 }
 
 /// Markdown-Tabelle mit p50/p95 je Fall, Kaltlade-Dauer je Modell, Commit, Datum, Gerät.
@@ -230,17 +235,19 @@ fn render_table(report: &Report) -> String {
         ));
     }
     out.push_str(
-        "\n| Einfügen | Cleanup | Loslassen→Text p50 | p95 | STT p50 | p95 | Cleanup p50 | p95 | →erstes Segment p50 | p95 | WER |\n",
+        "\n| Einfügen | Cleanup | Loslassen→Text p50 | p95 | je Audio-s p50 | p95 | STT p50 | p95 | Cleanup p50 | p95 | →erstes Segment p50 | p95 | WER |\n",
     );
-    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for combo in &report.combos {
         let s = &combo.stats;
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             combo.insert.label(),
-            cleanup_label(combo.cleanup),
+            cleanup_name(combo.cleanup),
             cell(percentile(&s.release_to_text, 0.5)),
             cell(percentile(&s.release_to_text, 0.95)),
+            rate_cell(percentile(&s.per_audio_second, 0.5)),
+            rate_cell(percentile(&s.per_audio_second, 0.95)),
             cell(percentile(&s.stt, 0.5)),
             cell(percentile(&s.stt, 0.95)),
             cell(percentile(&s.cleanup, 0.5)),
@@ -358,6 +365,7 @@ fn measure<T, C>(
     worker: &mut DictationWorker<T, C>,
     fixtures: &[Fixture],
     runs: usize,
+    cleanups: &[CleanupMode],
     progress: &mut dyn FnMut(&str),
 ) -> (Vec<Combo>, Vec<(String, String)>)
 where
@@ -367,13 +375,11 @@ where
     let mut combos: Vec<Combo> = [InsertMode::AtEnd, InsertMode::PerSentence]
         .into_iter()
         .flat_map(|insert| {
-            [CleanupMode::Raw, CleanupMode::Casual]
-                .into_iter()
-                .map(move |cleanup| Combo {
-                    insert,
-                    cleanup,
-                    stats: ComboStats::default(),
-                })
+            cleanups.iter().map(move |&cleanup| Combo {
+                insert,
+                cleanup,
+                stats: ComboStats::default(),
+            })
         })
         .collect();
     let mut skipped = Vec::new();
@@ -383,7 +389,7 @@ where
                 "{} · {} · {}",
                 fixture.name,
                 combo.insert.label(),
-                cleanup_label(combo.cleanup)
+                cleanup_name(combo.cleanup)
             ));
             let mut failure = None;
             let results = collect_runs(runs, || {
@@ -438,28 +444,57 @@ struct EvalConfig {
     out: Option<PathBuf>,
 }
 
-/// Beide geladenen Modelle samt Kaltlade-Dauer.
+/// Die geladenen Modelle samt Kaltlade-Dauer; Gemma ist optional (ohne Gemma nur Roh-Fälle).
 struct Models {
     stt: NemotronTranscriber,
-    cleaner: GemmaCleaner,
+    cleaner: Option<GemmaCleaner>,
     cold_loads: Vec<(&'static str, Duration)>,
+    /// Grund, warum die Natürlich-Fälle fehlen (Gemma nicht ladbar).
+    cleaner_note: Option<(String, String)>,
 }
 
-/// Lädt beide Modelle (Kaltlade-Dauer gemessen); fehlt eins → Fehler mit Pfad-Hinweis, kein Panic.
+/// Lädt Gemma; fehlt es, gibt es statt eines Abbruchs `None` und einen Hinweis für „Übersprungen“.
+fn load_cleaner(path: &Path) -> (Option<GemmaCleaner>, Option<(String, String)>) {
+    match GemmaCleaner::new(path) {
+        Ok(cleaner) => (Some(cleaner), None),
+        Err(e) => (
+            None,
+            Some((
+                cleanup_name(CleanupMode::Casual).to_string(),
+                format!(
+                    "Gemma nicht verfügbar ({e}; erwartet: {}) — Natürlich-Fälle übersprungen",
+                    path.display()
+                ),
+            )),
+        ),
+    }
+}
+
+/// Die Cleanup-Modi der Messreihe: Roh immer, Natürlich nur mit Gemma.
+fn cleanup_modes(has_cleaner: bool) -> Vec<CleanupMode> {
+    let mut modes = vec![CleanupMode::Raw];
+    if has_cleaner {
+        modes.push(CleanupMode::Casual);
+    }
+    modes
+}
+
+/// Lädt die Modelle (Kaltlade-Dauer gemessen); Nemotron ist Pflicht → Fehler mit Pfad-Hinweis,
+/// kein Panic. Gemma fehlt → nur die Roh-Fälle laufen.
 fn load_models(cfg: &EvalConfig) -> Result<Models, String> {
     let t0 = std::time::Instant::now();
     let stt = NemotronTranscriber::new(&cfg.nemotron_dir).map_err(|e| e.to_string())?;
-    let stt_load = t0.elapsed();
+    let mut cold_loads = vec![("Nemotron (STT)", t0.elapsed())];
     let t1 = std::time::Instant::now();
-    let cleaner = GemmaCleaner::new(&cfg.gemma_path).map_err(|e| e.to_string())?;
-    let cleaner_load = t1.elapsed();
+    let (cleaner, cleaner_note) = load_cleaner(&cfg.gemma_path);
+    if cleaner.is_some() {
+        cold_loads.push(("Gemma (Cleanup)", t1.elapsed()));
+    }
     Ok(Models {
         stt,
         cleaner,
-        cold_loads: vec![
-            ("Nemotron (STT)", stt_load),
-            ("Gemma (Cleanup)", cleaner_load),
-        ],
+        cold_loads,
+        cleaner_note,
     })
 }
 
@@ -468,8 +503,10 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
         stt,
         cleaner,
         cold_loads,
+        cleaner_note,
     } = load_models(cfg)?;
-    let mut skipped = Vec::new();
+    let has_cleaner = cleaner.is_some();
+    let mut skipped: Vec<(String, String)> = cleaner_note.into_iter().collect();
     let mut fixtures = Vec::new();
     for wav in list_wavs(&cfg.fixtures_dir)? {
         match load_fixture(&wav) {
@@ -489,14 +526,25 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
     }
     // Natürlich braucht den Cleaner schon beim Erzeugen des Workers (Vorladen).
     let preload = Config {
-        cleanup_mode: CleanupMode::Casual,
+        cleanup_mode: if has_cleaner {
+            CleanupMode::Casual
+        } else {
+            CleanupMode::Raw
+        },
         ..Config::default()
     };
     let mut stt_slot = Some(stt);
-    let mut cleaner_slot = Some(cleaner);
+    let mut cleaner_slot = cleaner;
     let mut worker = DictationWorker::new(
         &preload,
-        Arc::new(ModelsState::new(ModelState::Ready, ModelState::Ready)),
+        Arc::new(ModelsState::new(
+            ModelState::Ready,
+            if has_cleaner {
+                ModelState::Ready
+            } else {
+                ModelState::Missing
+            },
+        )),
         Box::new(move |_| {
             stt_slot
                 .take()
@@ -505,7 +553,13 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
         Box::new(move || (cleaner_slot.take(), false)),
     );
     let mut progress = |label: &str| eprintln!("… {label}");
-    let (combos, run_skipped) = measure(&mut worker, &fixtures, cfg.runs, &mut progress);
+    let (combos, run_skipped) = measure(
+        &mut worker,
+        &fixtures,
+        cfg.runs,
+        &cleanup_modes(has_cleaner),
+        &mut progress,
+    );
     skipped.extend(run_skipped);
     let report = Report {
         combos,
@@ -596,6 +650,48 @@ mod tests {
         assert!((wer("a b c d", "a x c d") - 0.25).abs() < 1e-9);
     }
 
+    /// PERF-3: Latenz relativ zur Audiodauer; Dauer 0 → kein Wert (keine Division durch 0).
+    #[test]
+    fn latency_per_audio_second_scales_with_the_clip_length() {
+        assert_eq!(
+            per_audio_second(ms(780), Duration::from_secs(3)),
+            Some(ms(260))
+        );
+        assert_eq!(per_audio_second(ms(780), ms(12_000)), Some(ms(65)));
+        assert_eq!(
+            per_audio_second(Duration::ZERO, Duration::from_secs(3)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(per_audio_second(ms(780), Duration::ZERO), None);
+    }
+
+    /// PERF-1: fehlt Gemma, laufen nur die Roh-Fälle; der Grund steht unter „Übersprungen“.
+    #[test]
+    fn missing_gemma_leaves_only_the_raw_cases_with_a_note() {
+        let (cleaner, note) = load_cleaner(Path::new("/nicht/vorhanden/gemma.gguf"));
+        assert!(cleaner.is_none());
+        let (name, reason) = note.unwrap();
+        assert_eq!(name, "Natürlich");
+        assert!(reason.contains("/nicht/vorhanden/gemma.gguf"), "{reason}");
+        assert_eq!(cleanup_modes(false), [CleanupMode::Raw]);
+        assert_eq!(cleanup_modes(true), [CleanupMode::Raw, CleanupMode::Casual]);
+
+        let fx = TempFixtures::new("ohne-gemma");
+        fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        let mut worker = fake_worker();
+        let (combos, skipped) = measure(
+            &mut worker,
+            &[fixture],
+            1,
+            &cleanup_modes(false),
+            &mut |_| {},
+        );
+        assert_eq!(combos.len(), 2);
+        assert!(combos.iter().all(|c| c.cleanup == CleanupMode::Raw));
+        assert!(skipped.is_empty());
+    }
+
     #[test]
     fn runs_come_from_n_with_a_default() {
         assert_eq!(parse_runs(None), Ok(10));
@@ -613,6 +709,7 @@ mod tests {
             release_to_text: Some(ms(780)),
             stt: Some(ms(520)),
             cleanup: Some(ms(240)),
+            per_audio_second: Some(ms(260)),
             first_segment: Some(ms(1_400)),
             text: String::new(),
         });
@@ -647,7 +744,7 @@ mod tests {
     fn table_contains_all_columns_and_header_facts() {
         let table = render_table(&sample_report());
         for needle in [
-            "Loslassen→Text p50 | p95",
+            "Loslassen→Text p50 | p95 | je Audio-s p50 | p95",
             "STT p50 | p95",
             "Cleanup p50 | p95",
             "→erstes Segment p50 | p95",
@@ -658,8 +755,8 @@ mod tests {
             "2026-11-07",
             "Apple M3 (8 Kerne)",
             "Läufe je Fall: 10",
-            "| Satzweise | Natürlich | 780 ms | 780 ms | 520 ms | 520 ms | 240 ms | 240 ms | 1400 ms | 1400 ms | 12.5 % |",
-            "| Am Ende | Roh | — | — | — | — | — | — | — | — | — |",
+            "| Satzweise | Natürlich | 780 ms | 780 ms | 260 ms/s | 260 ms/s | 520 ms | 520 ms | 240 ms | 240 ms | 1400 ms | 1400 ms | 12.5 % |",
+            "| Am Ende | Roh | — | — | — | — | — | — | — | — | — | — | — |",
             "kaputt: übersprungen: WAV ist leer",
         ] {
             assert!(table.contains(needle), "Tabelle ohne: {needle}\n{table}");
@@ -824,6 +921,7 @@ mod tests {
         let batch = run_once(&mut worker, &fixture, InsertMode::AtEnd, CleanupMode::Raw).unwrap();
         assert_eq!(batch.text, "hallo welt");
         assert!(batch.release_to_text.is_some() && batch.stt.is_some());
+        assert!(batch.per_audio_second.is_some());
         assert_eq!(batch.cleanup, None, "Roh hat keinen Cleanup");
         assert_eq!(batch.first_segment, None, "Am Ende hat kein Segment");
 
@@ -866,7 +964,13 @@ mod tests {
         let mut progress = |_: &str| {
             calls.fetch_add(1, Ordering::Relaxed);
         };
-        let (combos, skipped) = measure(&mut worker, &[good, vanished], 1, &mut progress);
+        let (combos, skipped) = measure(
+            &mut worker,
+            &[good, vanished],
+            1,
+            &cleanup_modes(true),
+            &mut progress,
+        );
         assert_eq!(combos.len(), 4);
         assert_eq!(
             skipped.len(),
