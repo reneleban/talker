@@ -135,10 +135,9 @@ fn relaunch() {
 }
 
 fn main() -> ExitCode {
-    talker::logging::init(&talker::logging::default_log_dir());
+    talker::logging::init(talker::logging::default_log_dir().as_deref());
     let loaded = config::Config::load();
     talker::logging::apply_config_level(loaded.log_level);
-    talker::logging::warn_if_env_invalid();
     let config = Arc::new(RwLock::new(loaded));
 
     // Modell-Setup (Ticket-0028/0029): Zustand per Präsenz-Check (der volle
