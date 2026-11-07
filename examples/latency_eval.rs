@@ -552,7 +552,11 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
                 .take()
                 .ok_or_else(|| TalkerError::Stt("Nemotron nur einmal geladen".into()))
         }),
-        cleaner_loader(cleaner, move || load_cleaner(&gemma_path).ok()),
+        cleaner_loader(cleaner, move || {
+            load_cleaner(&gemma_path)
+                .map_err(|e| eprintln!("latency-eval: {e}"))
+                .ok()
+        }),
     );
     let mut progress = |label: &str| eprintln!("… {label}");
     let (combos, run_skipped) = measure(
