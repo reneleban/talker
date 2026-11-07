@@ -984,7 +984,8 @@ mod tests {
         assert!(cleaned.cleanup.is_some());
     }
 
-    /// AK-22 (PERF-5), REQ-DIAG-034 AK-2: Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh den Cleaner-Handle verworfen hat.
+    /// AK-22 (PERF-5), REQ-DIAG-034 AK-2: Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh
+    /// das Cleaner-Handle verworfen hat.
     #[test]
     fn casual_cases_get_cleanup_after_raw_dropped_the_cleaner() {
         let fx = TempFixtures::new("natuerlich");
@@ -1073,20 +1074,30 @@ mod tests {
         (combos, census, fx)
     }
 
-    /// REQ-DIAG-034 AK-1/AK-2/AK-3: Gemma einmal beim Start, nie zwei Instanzen, jeder Natürlich-Fall mit Cleanup.
+    /// REQ-DIAG-034 AK-1/AK-2/AK-3 inkl. Grenzfälle (N=1, eine Fixture): nie zwei Instanzen zugleich,
+    /// jeder Natürlich-Fall mit Cleanup; `constructed` ist nur Nebenbedingung.
     #[test]
-    fn cleaner_is_constructed_once_and_never_duplicated_across_fixtures_and_modes() {
-        let (combos, census, _fx) = measure_with_one_cleaner(2, 2);
-        assert_eq!(census.constructed.get(), 1, "kein Nachladen nach dem Start");
-        assert_eq!(census.max_alive.get(), 1, "nie zwei Instanzen zugleich");
-        for combo in combos.iter().filter(|c| c.cleanup == CleanupMode::Casual) {
-            assert_eq!(combo.stats.cleanup.len(), 2 * 2, "{}", combo.insert.label());
+    fn cleaner_is_never_duplicated_across_fixtures_runs_and_modes() {
+        for (fixtures, runs) in [(2, 2), (2, 1), (1, 2)] {
+            let (combos, census, _fx) = measure_with_one_cleaner(fixtures, runs);
+            let ctx = format!("{fixtures} Fixtures × {runs} Läufe");
+            assert_eq!(census.max_alive.get(), 1, "nie zwei Instanzen: {ctx}");
+            assert_eq!(census.constructed.get(), 1, "kein Nachladen: {ctx}");
+            assert_eq!(combos.len(), 4, "{ctx}");
+            for combo in combos.iter().filter(|c| c.cleanup == CleanupMode::Casual) {
+                assert_eq!(
+                    combo.stats.cleanup.len(),
+                    fixtures * runs,
+                    "{ctx}: {}",
+                    combo.insert.label()
+                );
+            }
+            assert_eq!(
+                census.last_mode.get(),
+                Some(CleanupMode::Casual),
+                "set_mode kommt am geteilten Cleaner an: {ctx}"
+            );
         }
-        assert_eq!(
-            census.last_mode.get(),
-            Some(CleanupMode::Casual),
-            "set_mode kommt am geteilten Cleaner an"
-        );
     }
 
     /// REQ-DIAG-034 AK-3: Die Instanz überlebt die Roh-Fälle (kein Drop mitten in der Reihe) und wird
@@ -1118,26 +1129,6 @@ mod tests {
             "Instanz wird mit dem Worker freigegeben"
         );
         assert_eq!(census.constructed.get(), 1);
-    }
-
-    /// REQ-DIAG-034 Grenzfall N=1 (Absicherung nach T1, kein Rot-Grün-Zyklus).
-    #[test]
-    fn single_run_per_case_still_constructs_the_cleaner_once() {
-        let (combos, census, _fx) = measure_with_one_cleaner(2, 1);
-        assert_eq!(census.constructed.get(), 1);
-        assert_eq!(census.max_alive.get(), 1);
-        for combo in combos.iter().filter(|c| c.cleanup == CleanupMode::Casual) {
-            assert_eq!(combo.stats.cleanup.len(), 2, "{}", combo.insert.label());
-        }
-    }
-
-    /// REQ-DIAG-034 Grenzfall eine Fixture (Absicherung nach T1, kein Rot-Grün-Zyklus).
-    #[test]
-    fn single_fixture_needs_no_load_after_the_start() {
-        let (combos, census, _fx) = measure_with_one_cleaner(1, 2);
-        assert_eq!(census.constructed.get(), 1);
-        assert_eq!(census.max_alive.get(), 1);
-        assert_eq!(combos.len(), 4);
     }
 
     /// REQ-DIAG-034 Grenzfall nur Roh (Absicherung nach T1, kein Rot-Grün-Zyklus).
