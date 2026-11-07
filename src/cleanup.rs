@@ -73,11 +73,11 @@ pub fn clean_with_fallback(cleaner: &mut dyn LlmCleaner, raw: &str) -> (String, 
     match cleaner.clean(raw) {
         Ok(cleaned) if !cleaned.is_empty() => (cleaned, false),
         Ok(_) => {
-            eprintln!("talker: Cleanup lieferte leeren Text — nutze Raw Transcript.");
+            log::warn!("Cleanup lieferte leeren Text — nutze Raw Transcript.");
             (raw.to_string(), true)
         }
         Err(e) => {
-            eprintln!("talker: Cleanup fehlgeschlagen ({e}) — nutze Raw Transcript.");
+            log::warn!("Cleanup fehlgeschlagen ({e}) — nutze Raw Transcript.");
             (raw.to_string(), true)
         }
     }

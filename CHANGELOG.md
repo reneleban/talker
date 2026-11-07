@@ -10,6 +10,24 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Added
 
+- **Logdatei mit Rotation und einstellbarem Detailgrad:** talker schreibt nach
+  `~/Library/Logs/talker/talker.log` (Start aus Terminal, Finder oder als Login-Item);
+  ab 1 MB wird rotiert, höchstens 4 ältere Dateien bleiben (zusammen ≤ 5 MB). In den
+  Settings wählst du unter „Protokoll“ Fehler/Warnungen/Info/Debug (wirkt sofort) und
+  öffnest die Datei mit „Log im Finder zeigen“. Neues Config-Feld `log_level`
+  (`"error"`, `"warn"`, `"info"`, `"debug"`, Default `"info"`); bestehende Configs
+  bleiben unverändert gültig. Die Umgebungsvariable `TALKER_LOG` übersteuert den
+  Grad für den Prozess.
+- **Messzeile je Diktat:** Nach jedem Diktat (auch verworfen oder fehlgeschlagen) steht
+  genau eine Zeile im Log mit Taste→Mikro bereit, →erster Block, →erstes Signal,
+  gehalten, aufgenommen, Loslassen→Text (STT, Cleanup), →eingefügt, Gerät, Modus,
+  Kaltstart und Ergebnis. Kein Transcript-Text im Log.
+- **Debug-Mitschnitt:** Mit `TALKER_DEBUG_WAV_DIR` schreibt talker je Diktat
+  `<nr>-mic.wav` und `<nr>-model.wav` (opt-in; ohne die Variable kein Audio auf der
+  Platte). Beim Bundle: `open --env TALKER_DEBUG_WAV_DIR=… talker.app`.
+- **`make latency-eval`:** Latenz-Messreihe über alle STT-Fixtures (p50/p95, WER,
+  Kaltlade-Dauer); dazu zehn FLEURS-Testclips (CC-BY-4.0) und eine Regression
+  „erstes Wort“, die den bekannten Verlust der ersten Wörter reproduziert.
 - **Mikrofon-Start-Anzeige:** Beim Drücken der PTT-Taste erscheint sofort ein
   Balken „Mikrofon startet“; die Wellen zeigt das Overlay erst, wenn das Mikrofon
   wirklich Audio liefert. Der Start läuft im Hintergrund und blockiert die Taste
@@ -29,6 +47,9 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Changed
 
+- Logs gehen in eine Datei statt auf stderr (beim Start aus dem Terminal erscheinen
+  sie weiter dort, wenn die Datei nicht angelegt werden kann). Der Wortlaut der
+  Logzeilen ist kein stabiler Vertrag.
 - **Breaking:** Spracherkennung wechselt von Parakeet TDT 0.6b v3 auf NVIDIA
   Nemotron 3.5 ASR Streaming 0.6b (ADR-0008) — ein Modell für alle Modi, Grundlage
   für Live-Diktat. Erst-Start-Download des neuen Modells (ca. 475 MB), danach läuft

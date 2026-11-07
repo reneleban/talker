@@ -134,7 +134,51 @@ bleiben. Alternative von Hand: Schlüsselbundverwaltung → Zertifikatsassistent
 ## Konfiguration
 
 `~/Library/Application Support/talker/config.toml` — wird von den Einstellungen
-geschrieben (PTT-Taste, Mikrofon, Cleanup an/aus, STT-Modellpfad).
+geschrieben (PTT-Taste, Mikrofon, Cleanup an/aus, STT-Modellpfad, Protokoll-Detailgrad).
+
+## Diagnose: Logdatei, Messzeile, Mitschnitt
+
+**Logdatei.** talker schreibt alle Meldungen nach `~/Library/Logs/talker/talker.log` —
+egal ob Start aus dem Terminal, dem Finder oder als Login-Item. Wird die Datei größer
+als 1 MB, rotiert talker: `talker.1.log` … `talker.4.log`, die älteste Datei wird
+gelöscht (zusammen höchstens 5 MB, nie nach Alter). Lässt sich das Verzeichnis nicht
+anlegen, läuft talker ohne Datei weiter und schreibt nach stderr. In den Settings öffnet
+„Log im Finder zeigen" die Datei im Finder.
+
+**Detailgrad.** `log_level` in der `config.toml` (`error`, `warn`, `info`, `debug`; Default
+`info`), in den Settings unter „Protokoll" umschaltbar — ohne Neustart. Die Umgebungsvariable
+`TALKER_LOG=<grad>` übersteuert den Wert für den Prozess; die Settings zeigen dann „durch
+TALKER_LOG übersteuert". Ein ungültiger Wert wird mit einer Warnung ignoriert. Auf `info`
+steht pro Diktat genau eine Zeile (die Messzeile), nichts pro Block oder Segment; auf `debug`
+kommen Details dazu. Transcript-Text steht nie im Log.
+
+**Messzeile.** Nach jedem Diktat, auch bei verworfenen oder fehlgeschlagenen:
+
+```
+Diktat #17: Taste→Mikro bereit 120 ms · →erster Block 380 ms · →erstes Signal 640 ms · gehalten 4,2 s · aufgenommen 3,6 s · Loslassen→Text 780 ms (STT 520 ms · Cleanup 240 ms) · →eingefügt 35 ms · Gerät: AirPods (48 kHz, 1 Kanal) · Einfügen: Am Ende · Modus: Natürlich · Kaltstart: nein · Ergebnis: eingefügt
+```
+
+Nicht erreichte Messpunkte stehen als `—`. Satzweise/Wortgruppenweise ergänzen
+`→erstes Segment` und `Segmente`; wurde ein Modell geladen, steht `Modell-Laden …` dabei.
+
+**Debug-Mitschnitt.** Nur mit gesetzter Umgebungsvariable `TALKER_DEBUG_WAV_DIR` schreibt talker
+je Diktat `<nr>-mic.wav` (rohe Mikrofon-Blöcke im Geräteformat) und `<nr>-model.wav` (exakt der
+Modell-Eingang, 16 kHz mono) in dieses Verzeichnis (32-bit Float; `<nr>` = Nummer der Messzeile).
+Das Verzeichnis wird angelegt, Dateien werden nie gelöscht. Ohne die Variable schreibt talker
+kein Audio auf die Platte. Beim Bundle über `open` starten:
+
+```sh
+open --env TALKER_DEBUG_WAV_DIR="$HOME/talker-debug" ~/Applications/talker.app
+```
+
+**Messreihe.** `make latency-eval` verarbeitet alle STT-Fixtures je Am Ende/Satzweise ×
+Roh/Natürlich ohne Einfügen und gibt eine Markdown-Tabelle mit p50/p95 aus. `N=<zahl>` setzt
+die Läufe je Fall (Default 10, dazu ein verworfener Aufwärmlauf), `LATENCY_OUT=<datei>` schreibt
+die Tabelle zusätzlich in eine Datei. Braucht das Nemotron- und das Gemma-Modell.
+
+**Fixtures.** Die zehn FLEURS-Clips (`tests/fixtures/stt/fleurs-de-*`, CC-BY-4.0, siehe
+`tests/fixtures/stt/ATTRIBUTION.md`) erzeugt `scripts/fetch_fleurs_fixtures.sh` neu; das
+Skript lädt sie einmalig aus Hugging Face (Netz nötig).
 
 ## Lizenz & Sicherheit
 

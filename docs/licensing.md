@@ -46,3 +46,12 @@ Hinweis: Bis zum Modellwechsel (ADR-0008) nutzte talker Parakeet TDT 0.6b v3
 selbst herunterladen, muss der Download-Flow die jeweiligen Terms anzeigen
 und die Zustimmung des Nutzers einholen, bevor geladen wird (insbesondere
 Gemma Terms of Use).
+
+## Testdaten: FLEURS-Fixtures, NICHT MIT
+
+`tests/fixtures/stt/fleurs-de-*.{wav,ref.txt}` (zehn deutsche Clips) stammen aus dem Datensatz
+FLEURS (Google, Conneau et al.) und stehen unter **CC-BY-4.0**, nicht unter der MIT-Lizenz
+dieses Repos. Urheber, Quelle, Lizenzlink und Änderungen: `tests/fixtures/stt/ATTRIBUTION.md`.
+Die Clips werden nur in Tests und in `make latency-eval` verwendet und sind nicht Teil des
+App-Binarys oder des Bundles. Der Download passiert nur im Skript
+`scripts/fetch_fleurs_fixtures.sh`; die App enthält dafür keinen HTTP-Client-Pfad.

@@ -11,6 +11,7 @@ use core_graphics::event::{
     CGEventType, CallbackResult, EventField,
 };
 
+use crate::audio::HostInstant;
 use crate::config::Config;
 use crate::error::{Result, TalkerError};
 
@@ -40,11 +41,12 @@ fn modifier_flag(keycode: i64) -> CGEventFlags {
 
 /// Installiert den Event-Tap auf dem aktuellen (Main-)RunLoop.
 /// Die PTT-Taste wird pro Event aus `config` gelesen.
-/// Gibt den Tap zurück — der Aufrufer muss ihn am Leben halten.
+/// Die Callbacks bekommen den Zeitpunkt des Tap-Callback-Eintritts auf der gemeinsamen
+/// Uhr (ADR-0012). Gibt den Tap zurück — der Aufrufer muss ihn am Leben halten.
 pub fn install(
     config: Arc<RwLock<Config>>,
-    on_press: impl Fn() + Send + 'static,
-    on_release: impl Fn() + Send + 'static,
+    on_press: impl Fn(HostInstant) + Send + 'static,
+    on_release: impl Fn(HostInstant) + Send + 'static,
 ) -> Result<CGEventTap<'static>> {
     let held = Cell::new(false);
     let tap = CGEventTap::new(
@@ -53,6 +55,7 @@ pub fn install(
         CGEventTapOptions::ListenOnly,
         vec![CGEventType::FlagsChanged],
         move |_proxy, _event_type, event| {
+            let at = HostInstant::now();
             let keycode = config
                 .read()
                 .map(|c| c.hotkey_keycode)
@@ -61,10 +64,10 @@ pub fn install(
                 let pressed = event.get_flags().contains(modifier_flag(keycode));
                 if pressed && !held.get() {
                     held.set(true);
-                    on_press();
+                    on_press(at);
                 } else if !pressed && held.get() {
                     held.set(false);
-                    on_release();
+                    on_release(at);
                 }
             }
             CallbackResult::Keep

@@ -5,6 +5,7 @@
 //! (Crate `sherpa-onnx`), on-device.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use sherpa_onnx::{
     OnlineModelConfig, OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
@@ -18,10 +19,31 @@ pub trait Transcriber {
     fn transcribe(&mut self, pcm_16k_mono: &[f32]) -> Result<String>;
 }
 
+/// Geteilter Puffer für den Debug-Mitschnitt (ADR-0012): sammelt exakt das, was das Modell
+/// bekommt (inkl. Vor-/Nachlauf-Stille und der Stille nach jedem Reset). `Clone` teilt den Puffer.
+#[derive(Clone, Default)]
+pub struct ModelTap(Arc<Mutex<Vec<f32>>>);
+
+impl ModelTap {
+    /// Holt den bisherigen Inhalt und leert den Puffer.
+    pub fn take(&self) -> Vec<f32> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub(crate) fn push(&self, pcm: &[f32]) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(pcm);
+    }
+}
+
 pub struct NemotronTranscriber {
     inner: OnlineRecognizer,
     /// Laufende Utterance im Live-Betrieb (`begin` … `finish`).
     live: Option<OnlineStream>,
+    /// Nur für den Debug-Mitschnitt gesetzt.
+    tap: Option<ModelTap>,
 }
 
 /// Stille vor dem Audio: das Streaming-Modell verschluckt sonst den Satzanfang.
@@ -99,7 +121,25 @@ impl NemotronTranscriber {
         };
         let inner = OnlineRecognizer::create(&config)
             .ok_or_else(|| TalkerError::Stt("Modell laden fehlgeschlagen".into()))?;
-        Ok(Self { inner, live: None })
+        Ok(Self {
+            inner,
+            live: None,
+            tap: None,
+        })
+    }
+
+    /// Schreibt alles, was das Modell bekommt, zusätzlich in `tap` (Debug-Mitschnitt).
+    pub fn with_model_tap(mut self, tap: ModelTap) -> Self {
+        self.tap = Some(tap);
+        self
+    }
+
+    /// Einziger Ort für `accept_waveform`: speist das Modell und den Tap.
+    fn accept(&self, stream: &OnlineStream, pcm: &[f32]) {
+        stream.accept_waveform(crate::audio::TARGET_SAMPLE_RATE as i32, pcm);
+        if let Some(tap) = &self.tap {
+            tap.push(pcm);
+        }
     }
 
     /// Default-Ablageort: ~/Library/Application Support/talker/models/<modellname>
@@ -121,10 +161,7 @@ impl Transcriber for NemotronTranscriber {
         let stream = self.inner.create_stream();
         // Sprache automatisch erkennen (de/en-Mix im Alltag).
         stream.set_option("language", "auto");
-        stream.accept_waveform(
-            crate::audio::TARGET_SAMPLE_RATE as i32,
-            &pad_with_silence(pcm_16k_mono),
-        );
+        self.accept(&stream, &pad_with_silence(pcm_16k_mono));
         stream.input_finished();
         while self.inner.is_ready(&stream) {
             self.inner.decode(&stream);
@@ -220,10 +257,7 @@ impl StreamingTranscriber for NemotronTranscriber {
     fn begin(&mut self) {
         let stream = self.inner.create_stream();
         stream.set_option("language", "auto");
-        stream.accept_waveform(
-            crate::audio::TARGET_SAMPLE_RATE as i32,
-            &[0.0; LEAD_SILENCE_SAMPLES],
-        );
+        self.accept(&stream, &[0.0; LEAD_SILENCE_SAMPLES]);
         self.live = Some(stream);
     }
 
@@ -233,7 +267,7 @@ impl StreamingTranscriber for NemotronTranscriber {
             .take()
             .ok_or_else(|| TalkerError::Stt("feed ohne begin".into()))?;
         if !pcm_16k_mono.is_empty() {
-            stream.accept_waveform(crate::audio::TARGET_SAMPLE_RATE as i32, pcm_16k_mono);
+            self.accept(&stream, pcm_16k_mono);
         }
         let text = self.drain(&stream);
         // Eine Pause ohne erkannten Text ist kein Segment-Ende (nur zurücksetzen).
@@ -241,10 +275,7 @@ impl StreamingTranscriber for NemotronTranscriber {
         if ended {
             self.inner.reset(&stream);
             // Wie beim Start braucht das Modell Vorlauf, sonst fehlt der Satzanfang.
-            stream.accept_waveform(
-                crate::audio::TARGET_SAMPLE_RATE as i32,
-                &[0.0; LEAD_SILENCE_SAMPLES],
-            );
+            self.accept(&stream, &[0.0; LEAD_SILENCE_SAMPLES]);
         }
         self.live = Some(stream);
         Ok(StreamUpdate {
@@ -258,10 +289,7 @@ impl StreamingTranscriber for NemotronTranscriber {
             .live
             .take()
             .ok_or_else(|| TalkerError::Stt("finish ohne begin".into()))?;
-        stream.accept_waveform(
-            crate::audio::TARGET_SAMPLE_RATE as i32,
-            &[0.0; TAIL_SILENCE_SAMPLES],
-        );
+        self.accept(&stream, &[0.0; TAIL_SILENCE_SAMPLES]);
         stream.input_finished();
         Ok(self.drain(&stream))
     }
@@ -337,6 +365,18 @@ impl StreamingTranscriber for FakeStreaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-DIAG-019: `take` leert, `Clone` teilt den Puffer.
+    #[test]
+    fn model_tap_take_drains_and_clones_share_the_buffer() {
+        let tap = ModelTap::default();
+        assert!(tap.take().is_empty());
+        let shared = tap.clone();
+        shared.push(&[0.5, -0.5]);
+        tap.push(&[1.0]);
+        assert_eq!(tap.take(), [0.5, -0.5, 1.0]);
+        assert!(shared.take().is_empty());
+    }
 
     #[test]
     fn padding_surrounds_the_audio_with_silence() {
