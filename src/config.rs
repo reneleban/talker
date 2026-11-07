@@ -273,8 +273,8 @@ impl Config {
             return Self::default();
         };
         Self::parse(&text).unwrap_or_else(|e| {
-            eprintln!(
-                "talker: config.toml unlesbar ({e}) — nutze Defaults. Pfad: {}",
+            log::warn!(
+                "config.toml unlesbar ({e}) — nutze Defaults. Pfad: {}",
                 path.display()
             );
             Self::default()

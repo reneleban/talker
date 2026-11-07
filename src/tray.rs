@@ -135,7 +135,7 @@ impl Tray {
                     .icon
                     .set_icon(Some(mic_icon(MicStyle::Recording, Some(resolved_mode))))
                 {
-                    eprintln!("talker: Tray-Icon (aufnehmend) nicht setzbar: {e}");
+                    log::warn!("Tray-Icon (aufnehmend) nicht setzbar: {e}");
                 }
                 self.icon.set_icon_as_template(false); // bewusst rot, soll auffallen
             }
@@ -150,14 +150,14 @@ impl Tray {
             (MicStyle::Idle, Some(self.mode.get()))
         };
         if let Err(e) = self.icon.set_icon(Some(mic_icon(style, badge))) {
-            eprintln!("talker: Tray-Icon (idle) nicht setzbar: {e}");
+            log::warn!("Tray-Icon (idle) nicht setzbar: {e}");
         }
         self.icon.set_icon_as_template(true);
     }
 
     pub fn set_permission_warning(&self) {
         if let Err(e) = self.icon.set_icon(Some(mic_icon(MicStyle::Warning, None))) {
-            eprintln!("talker: Tray-Icon (Warnung) nicht setzbar: {e}");
+            log::warn!("Tray-Icon (Warnung) nicht setzbar: {e}");
         }
         self.icon.set_icon_as_template(true);
     }

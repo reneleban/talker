@@ -1101,7 +1101,7 @@ pub(crate) fn upsert_rule(
 fn open_privacy_pane(pane: &str) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     if let Err(e) = Command::new("open").arg(url).spawn() {
-        eprintln!("talker: Systemeinstellungen nicht öffenbar: {e}");
+        log::warn!("Systemeinstellungen nicht öffenbar: {e}");
     }
 }
 
