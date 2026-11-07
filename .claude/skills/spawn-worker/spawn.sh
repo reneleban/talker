@@ -13,6 +13,7 @@ MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 WT_ROOT="$(dirname "$MAIN")/talker-wt"
 INTEGRATION="$WT_ROOT/integration"
 READY_MS=${SPAWN_READY_TIMEOUT_MS:-60000}
+ROLES_RE="product-owner|architect|tech-lead|rust-developer|test-engineer|code-reviewer|security-auditor|performance-engineer|merger|release-engineer"
 
 require_clean() {
   [ -z "$(git -C "$1" status --porcelain)" ] || die "$1 hat uncommittete Änderungen"
@@ -70,6 +71,17 @@ case $ROLE in
   *) die "unbekannte Rolle: $ROLE" ;;
 esac
 [ -d "$INTEGRATION" ] || die "Integrations-Worktree fehlt, zuerst: spawn.sh init $TICKET $FEATURE"
+
+# Obergrenze: Umgebungsvariable (auch leer) vor team.env des Haupt-Checkouts; der Orchestrator zählt nicht.
+if [ "${TEAM_MAX_SESSIONS+set}" = set ]; then
+  MAX=$TEAM_MAX_SESSIONS
+else
+  MAX=$(sed -n 's/^TEAM_MAX_SESSIONS=//p' "$MAIN/team.env" 2>/dev/null | head -n 1)
+fi
+case $MAX in ''|0*|*[!0-9]*) die "TEAM_MAX_SESSIONS ungültig: '$MAX'" ;; esac
+ACTIVE=$(herdr agent list | jq --arg re "^($ROLES_RE)-[0-9]{4}(-[0-9]+)?\$" '[.result.agents[] | select((.name // "") | test($re))] | length')
+[ $((ACTIVE + 1)) -le "$MAX" ] || die "Obergrenze erreicht: $ACTIVE Rollen-Sessions aktiv, TEAM_MAX_SESSIONS=$MAX"
+
 [ "$INSTANCE" = 0 ] || [ "$OWN" = 1 ] || die "--instance gibt es nur für Rollen mit eigenem Worktree, nicht für $ROLE"
 [ "$OWN" = 0 ] || [ ! -d "$DIR" ] || require_clean "$DIR"
 
