@@ -117,4 +117,17 @@ akte_checks release-engineer
 has "R5 security-auditor: env-herdr-Umgehung im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'env herdr'
 has "R5 security-auditor: Kopfzeile im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'Kopfzeile'
 
+# --- T17: Skill spawn-worker (AK-16, AK-17) ---
+f=.claude/skills/spawn-worker/SKILL.md
+lacks "AK-16 spawn-worker: kein SendMessage/ListAgents/osascript/cc-socks" "$f" "$FORBIDDEN"
+lacks "AK-17 spawn-worker: keine Ghostty-Kacheln" "$f" 'Ghostty|Kachel'
+has "AK-17 spawn-worker: herdr-Panes" "$f" 'herdr-Pane'
+has "AK-17 spawn-worker: Session talker" "$f" 'Session `talker`'
+has "AK-17 spawn-worker: make dev" "$f" 'make dev'
+has "AK-7 spawn-worker: --instance" "$f" '--instance'
+has "AK-9 spawn-worker: --kind" "$f" '--kind'
+has "AK-8 spawn-worker: TEAM_MAX_SESSIONS" "$f" 'TEAM_MAX_SESSIONS'
+has "AK-17 spawn-worker: Auftrag über say.sh" "$f" 'scripts/team/say\.sh'
+for c in 0 1 2 3; do has "AK-5 spawn-worker: Exit-Code $c" "$f" "\\*\\*$c\\*\\*"; done
+
 th_summary
