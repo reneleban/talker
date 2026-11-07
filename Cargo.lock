@@ -4241,6 +4241,7 @@ dependencies = [
  "libc",
  "llama-cpp-2",
  "log",
+ "mach2",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-av-foundation",

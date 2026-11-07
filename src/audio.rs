@@ -5,7 +5,8 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
@@ -23,6 +24,63 @@ pub const MIN_UTTERANCE_MS: u64 = 300;
 const CHUNK_MS: u32 = 560;
 /// Samples pro Live-Chunk bei 16 kHz mono.
 pub const CHUNK_16K_SAMPLES: usize = (TARGET_SAMPLE_RATE * CHUNK_MS / 1000) as usize;
+
+/// Gemeinsame Uhr (ADR-0012): Nanosekunden auf der Zeitbasis von `mach_absolute_time`,
+/// identisch zur Umrechnung der cpal-Callback-Zeitstempel. Tastendruck, Callback-Blöcke
+/// und alle Messpunkte der Messzeile liegen auf dieser einen Uhr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HostInstant(u64);
+
+/// `ticks * numer / denom` in u128 — exakt die Formel von cpal (`host_time_to_stream_instant`).
+fn ticks_to_nanos(ticks: u64, numer: u32, denom: u32) -> u64 {
+    if denom == 0 {
+        return ticks;
+    }
+    u64::try_from(u128::from(ticks) * u128::from(numer) / u128::from(denom)).unwrap_or(u64::MAX)
+}
+
+impl HostInstant {
+    pub fn now() -> Self {
+        static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
+        let (numer, denom) = *TIMEBASE.get_or_init(|| {
+            let mut info = mach2::mach_time::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: `info` ist ein gültiger, beschreibbarer Out-Parameter.
+            let status = unsafe { mach2::mach_time::mach_timebase_info(&mut info) };
+            if status == 0 {
+                (info.numer, info.denom)
+            } else {
+                (1, 1)
+            }
+        });
+        // SAFETY: `mach_absolute_time` hat keine Vorbedingungen.
+        let ticks = unsafe { mach2::mach_time::mach_absolute_time() };
+        Self(ticks_to_nanos(ticks, numer, denom))
+    }
+
+    pub fn from_nanos(ns: u64) -> Self {
+        Self(ns)
+    }
+
+    pub fn as_nanos(self) -> u64 {
+        self.0
+    }
+
+    /// Abstand zu `earlier`; liegt `earlier` später, ist er 0.
+    pub fn saturating_since(self, earlier: Self) -> Duration {
+        Duration::from_nanos(self.0.saturating_sub(earlier.0))
+    }
+
+    pub fn saturating_add(self, d: Duration) -> Self {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        Self(self.0.saturating_add(ns))
+    }
+}
+
+impl From<cpal::StreamInstant> for HostInstant {
+    fn from(instant: cpal::StreamInstant) -> Self {
+        Self(u64::try_from(instant.as_nanos()).unwrap_or(u64::MAX))
+    }
+}
 
 /// Live-Pegel der laufenden Aufnahme (RMS des letzten Callback-Frames,
 /// als f32-Bits in einem Atomic — lockfrei lesbar aus dem UI-Thread).
@@ -477,5 +535,62 @@ mod tests {
         assert_eq!(duration_ms(&vec![0.0; 16_000]), 1000);
         assert_eq!(duration_ms(&vec![0.0; 1600]), 100);
         assert_eq!(duration_ms(&[]), 0);
+    }
+
+    /// REQ-DIAG-013: die gemeinsame Uhr ist monoton.
+    #[test]
+    fn host_instant_now_is_monotonic() {
+        let a = HostInstant::now();
+        let b = HostInstant::now();
+        assert!(b >= a);
+        assert!(a.as_nanos() > 0);
+    }
+
+    #[test]
+    fn host_instant_arithmetic_saturates_and_roundtrips() {
+        let early = HostInstant::from_nanos(1_000);
+        let late = HostInstant::from_nanos(4_000);
+        assert_eq!(late.saturating_since(early), Duration::from_nanos(3_000));
+        assert_eq!(early.saturating_since(late), Duration::ZERO);
+        assert_eq!(early.saturating_since(early), Duration::ZERO);
+        assert_eq!(
+            early.saturating_add(Duration::from_micros(1)),
+            HostInstant::from_nanos(2_000)
+        );
+        assert_eq!(HostInstant::from_nanos(7).as_nanos(), 7);
+        let max = HostInstant::from_nanos(u64::MAX);
+        assert_eq!(max.saturating_add(Duration::from_secs(1)), max);
+        assert_eq!(
+            max.saturating_add(Duration::from_secs(u64::MAX)),
+            max,
+            "übergroße Dauer läuft nicht über"
+        );
+    }
+
+    /// REQ-DIAG-013: Umrechnung bitgleich zu cpal (Grenzen 0, u32::MAX s, 999_999_999 ns).
+    #[test]
+    fn stream_instant_converts_to_the_same_nanoseconds() {
+        let cases = [
+            (0u64, 0u32),
+            (0, 1),
+            (1, 0),
+            (12, 999_999_999),
+            (u64::from(u32::MAX), 999_999_999),
+        ];
+        for (secs, nanos) in cases {
+            let instant = cpal::StreamInstant::new(secs, nanos);
+            let expected = secs * 1_000_000_000 + u64::from(nanos);
+            assert_eq!(HostInstant::from(instant).as_nanos(), expected);
+        }
+    }
+
+    /// cpal: `m_host_time * numer / denom` in u128 (Apple Silicon: 125/3).
+    #[test]
+    fn ticks_convert_like_cpal_without_overflow() {
+        assert_eq!(ticks_to_nanos(24_000_000, 125, 3), 1_000_000_000);
+        assert_eq!(ticks_to_nanos(0, 125, 3), 0);
+        assert_eq!(ticks_to_nanos(5, 1, 1), 5);
+        assert_eq!(ticks_to_nanos(u64::MAX, 125, 3), u64::MAX);
+        assert_eq!(ticks_to_nanos(10, 1, 0), 10);
     }
 }
