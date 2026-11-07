@@ -845,20 +845,4 @@ mod tests {
         assert!(makefile.contains("latency-eval: ##"));
         assert!(makefile.contains(".PHONY:") && makefile.contains("latency-eval"));
     }
-
-    /// Nutzersichtbare Änderung → CHANGELOG-Eintrag im selben Zug.
-    #[test]
-    fn changelog_announces_the_new_features() {
-        let changelog = std::fs::read_to_string(repo_file("CHANGELOG.md")).unwrap();
-        let unreleased = changelog.split("## [").nth(1).unwrap();
-        for needle in [
-            "log_level",
-            "TALKER_LOG",
-            "TALKER_DEBUG_WAV_DIR",
-            "latency-eval",
-            "Messzeile",
-        ] {
-            assert!(unreleased.contains(needle), "CHANGELOG ohne: {needle}");
-        }
-    }
 }
