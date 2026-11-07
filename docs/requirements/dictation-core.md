@@ -16,8 +16,10 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
   sichtbaren Hinweis statt einer stillen Aufnahme liefern.
   (`src/pipeline.rs:PttSession::press`, `PressOutcome::Blocked`)
 - **REQ-DICT-003**: Das System soll aufgenommenes Audio ausschließlich
-  in-memory halten, ohne es auf Platte zu schreiben oder zu übertragen.
-  (`src/audio.rs:Recording`, Ticket-0003 AK4)
+  in-memory halten, ohne es auf Platte zu schreiben oder zu übertragen —
+  ausgenommen der per Umgebungsvariable `TALKER_DEBUG_WAV_DIR` ausdrücklich
+  eingeschaltete Debug-Mitschnitt (REQ-DIAG-019, REQ-DIAG-022).
+  (`src/audio.rs:Recording`, Ticket-0003 AK4, Ticket-0038)
 - **REQ-DICT-004**: WENN der Nutzer die PTT-Taste loslässt, soll das System
   die Aufnahme beenden und das Audio als 16 kHz mono PCM bereitstellen
   (Downmix bei Mehrkanal, Resampling bei abweichender Gerätesamplerate).

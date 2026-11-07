@@ -32,6 +32,7 @@ aktuelle Soll-Zustand):
 - `context-awareness.md` — Per-App-Modus-Auflösung
 - `model-downloader.md` — Modell-Download, Lizenz-Consent, Checksum, Resume
 - `streaming-dictation.md` — Live-Diktat: Einfüge-Verhalten, Korrektur-Matrix, Fallback
+- `diagnostics.md` — Logging, Messzeile, Debug-Mitschnitt, Audioquelle, Latenz-Messreihe
 
 Bei neuen Features: erst die EARS-Sätze hier ergänzen, dann Tests schreiben,
 dann implementieren (TDD-Reihenfolge aus `CLAUDE.md`).
