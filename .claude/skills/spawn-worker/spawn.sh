@@ -19,19 +19,25 @@ require_clean() {
   [ -z "$(git -C "$1" status --porcelain)" ] || die "$1 hat uncommittete Änderungen"
 }
 
-USAGE="Aufruf: spawn.sh init <ticket> <feature-branch> | [--instance] <rolle> <ticket> <feature-branch> | close <name>"
+USAGE="Aufruf: spawn.sh init <ticket> <feature-branch> | [--kind claude|codex] [--instance] <rolle> <ticket> <feature-branch> | close <name>"
 need_herdr() {
   [ "${HERDR_ENV:-}" = 1 ] || die "außerhalb von herdr (HERDR_ENV ist nicht 1), Einstieg: make dev"
 }
 
 INSTANCE=0
+KIND=claude
 while [ $# -gt 0 ]; do
   case $1 in
     --instance) INSTANCE=1; shift ;;
+    --kind)
+      [ $# -ge 2 ] || die "--kind braucht einen Wert (claude|codex). $USAGE" 2
+      KIND=$2; shift 2 ;;
     -*) die "unbekannte Option: $1. $USAGE" 2 ;;
     *) break ;;
   esac
 done
+
+case $KIND in claude|codex) ;; *) die "unbekannter --kind: $KIND (erlaubt: claude|codex)" 2 ;; esac
 
 if [ "${1:-}" = close ]; then
   [ $# -eq 2 ] || die "$USAGE" 2
@@ -138,12 +144,18 @@ new_pane() {
 PANE=$(new_pane) || die "Pane konnte nicht angelegt werden (Worktree $DIR besteht bereits)" 3
 [ -n "$PANE" ] || die "keine Pane angelegt (Worktree $DIR besteht bereits)" 3
 
+# Claude bekommt Rolle, Name, Modus und Haupt-Checkout; Codex startet ohne Argumente (Codex-Setup ist ein Folgeticket).
+if [ "$KIND" = claude ]; then
+  set -- -- --agent "$ROLE" --name "$NAME" --permission-mode auto --add-dir "$MAIN"
+else
+  set --
+fi
+
 # Eine frische Pane ist kurz „busy", bis ihre Shell den Prompt zeigt: agent_pane_busy wiederholen.
 START=$(date +%s)
 i=0
 while :; do
-  err=$(herdr agent start "$NAME" --kind claude --pane "$PANE" --timeout "$READY_MS" -- \
-    --agent "$ROLE" --name "$NAME" --permission-mode auto --add-dir "$MAIN" 2>&1 >/dev/null) && break
+  err=$(herdr agent start "$NAME" --kind "$KIND" --pane "$PANE" --timeout "$READY_MS" "$@" 2>&1 >/dev/null) && break
   case $err in
     *agent_pane_busy*) i=$((i + 1)); [ $i -le 75 ] || die "Pane $PANE wird nicht frei (Worktree $DIR und Pane bestehen)" 3; sleep 0.2 ;;
     *agent_not_ready*)
