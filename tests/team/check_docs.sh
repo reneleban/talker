@@ -27,4 +27,35 @@ else
   skip "bestehende Einträge: Basis-Commit 586bff4 nicht vorhanden"
 fi
 
+
+# --- Hilfen für die Agent-Definitionen ---
+AGENTS_DIR=.claude/agents
+frontmatter() { awk '/^---$/ { n++; next } n == 1' "$1"; }
+fm_line() { frontmatter "$1" | grep "^$2:" || true; }
+# has <name> <datei> <regex>: Datei enthält das Muster (Grundlage der grep-Prüfungen)
+has() { if grep -Eq -e "$3" "$2"; then ok "$1"; else fail "$1 ($2: '$3' fehlt)"; fi; }
+lacks() { if grep -Eq -e "$3" "$2"; then fail "$1 ($2: '$3' kommt vor)"; else ok "$1"; fi; }
+FORBIDDEN='SendMessage|ListAgents|osascript|/tmp/cc-socks'
+
+# Gemeinsam für jede Rolle (AK-16, AK-22): kein altes Messaging, Meldung über say.sh
+agent_common() { # <rolle>
+  f=$AGENTS_DIR/$1.md
+  lacks "AK-16 $1: kein SendMessage/ListAgents/osascript/cc-socks" "$f" "$FORBIDDEN"
+  has "AK-16 $1: Meldung über say.sh" "$f" 'scripts/team/say\.sh orchestrator'
+}
+
+# --- T13: tech-lead.md (AK-15, AK-16, AK-20) ---
+f=$AGENTS_DIR/tech-lead.md
+agent_common tech-lead
+case $(fm_line "$f" tools) in *Bash*) ok "AK-15 tech-lead: Bash in tools" ;; *) fail "AK-15 tech-lead: Bash in tools" ;; esac
+case $(fm_line "$f" disallowedTools) in *Bash*) fail "AK-15 tech-lead: Bash nicht in disallowedTools" ;; *) ok "AK-15 tech-lead: Bash nicht in disallowedTools" ;; esac
+case $(fm_line "$f" tools) in *Write*) fail "AK-22 tech-lead: kein Write in tools" ;; *) ok "AK-22 tech-lead: kein Write in tools" ;; esac
+has "AK-15 tech-lead: PreToolUse-Hook" "$f" 'PreToolUse:'
+has "AK-15 tech-lead: Matcher Bash" "$f" 'matcher: Bash'
+has "AK-15 tech-lead: Hook say-only.sh" "$f" 'command: sh \.claude/hooks/say-only\.sh'
+has "AK-20 tech-lead: Task nennt Dateien" "$f" 'Dateien:'
+has "AK-20 tech-lead: Task nennt hängt ab von" "$f" 'hängt ab von:'
+has "AK-22 tech-lead: Akte nur per Edit, nie Write" "$f" 'nie `Write`'
+has "Rückfall tech-lead: letzte Abschnittszeile fertig/blockiert" "$f" 'letzte Zeile.*(fertig|blockiert)'
+
 th_summary
