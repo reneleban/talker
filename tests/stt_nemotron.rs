@@ -115,3 +115,340 @@ fn streaming_silence_and_empty_input_give_nothing() {
     assert!(updates.iter().all(|u| !u.endpoint && u.text.is_empty()));
     assert!(rest.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Regression „erstes Wort" (Ticket 0038, REQ-DIAG-032/-033): WAV-Quelle → PttSession →
+// process_job mit dem echten Nemotron (Cleanup Roh), ohne Injection. Braucht das Modell.
+// ---------------------------------------------------------------------------
+
+#[path = "support/first_word.rs"]
+mod first_word_support;
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use talker::audio::{AudioFormat, HostInstant, Pace, SourceDone, WavOptions, WavSource};
+use talker::cleanup::{CleanupMode, GemmaCleaner};
+use talker::config::{Config, InsertMode};
+use talker::diagnostics::{DictationTrace, TraceReport};
+use talker::models::{ModelState, ModelsState};
+use talker::pipeline::{
+    DictationWorker, MicReady, PressOutcome, PttSession, ReleaseOutcome, SttJob, process_job,
+};
+
+use first_word_support::{first_word, normalize_words};
+
+/// Ein Modell im Speicher genügt — die Fälle laufen nacheinander (650 MB je Modell).
+static MODEL_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy, Debug)]
+enum FixtureSet {
+    /// Mit `say` erzeugte Fixtures (alles außer `fleurs-*`).
+    Say,
+    /// FLEURS-Clips (`fleurs-de-*`).
+    Fleurs,
+}
+
+fn fixtures(set: FixtureSet) -> Vec<(String, PathBuf)> {
+    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir("tests/fixtures/stt")
+        .expect("tests/fixtures/stt fehlt")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+        .filter_map(|p| {
+            let name = p.file_stem()?.to_string_lossy().into_owned();
+            let is_fleurs = name.starts_with("fleurs-");
+            match set {
+                FixtureSet::Say => !is_fleurs,
+                FixtureSet::Fleurs => is_fleurs,
+            }
+            .then_some((name, p))
+        })
+        .collect();
+    found.sort();
+    assert!(!found.is_empty(), "keine Fixtures für {set:?}");
+    found
+}
+
+fn reference(wav: &Path) -> String {
+    std::fs::read_to_string(wav.with_extension("ref.txt")).expect(".ref.txt fehlt")
+}
+
+type NemotronWorker = DictationWorker<NemotronTranscriber, GemmaCleaner>;
+
+fn worker() -> NemotronWorker {
+    let mut stt = Some(transcriber());
+    DictationWorker::new(
+        &Config::default(),
+        Arc::new(ModelsState::new(ModelState::Ready, ModelState::Missing)),
+        Box::new(move |_| {
+            stt.take()
+                .ok_or_else(|| talker::error::TalkerError::Stt("nur einmal geladen".into()))
+        }),
+        Box::new(|| (None, false)),
+    )
+}
+
+/// Ein Diktat über die App-Pipeline; liefert die eingefügten Stücke und die Messpunkte.
+fn dictate(
+    worker: &mut NemotronWorker,
+    pcm: Vec<f32>,
+    start_delay_ms: u64,
+    insert_mode: InsertMode,
+) -> (Vec<String>, DictationTrace) {
+    let cfg = Config {
+        insert_mode,
+        cleanup_mode: CleanupMode::Raw,
+        ..Config::default()
+    };
+    let (done_tx, done_rx) = channel::<SourceDone>();
+    let done_tx = Mutex::new(done_tx);
+    let report: TraceReport = Arc::new(|_| {});
+    let mut session = PttSession::new(
+        Box::new(move |_| {
+            let (source, done) = WavSource::from_samples(
+                pcm.clone(),
+                WavOptions {
+                    format: AudioFormat {
+                        channels: 1,
+                        sample_rate: 16_000,
+                    },
+                    block_frames: 480,
+                    start_delay: Duration::from_millis(start_delay_ms),
+                    pace: Pace::Immediate,
+                    epoch: HostInstant::now(),
+                },
+            );
+            let _ = done_tx.lock().unwrap().send(done);
+            Box::new(source)
+        }),
+        report,
+    );
+    let (ready_tx, ready_rx) = channel();
+    let models = ModelsState::new(ModelState::Ready, ModelState::Missing);
+    let outcome = session.press(HostInstant::now(), &cfg, &models, move |ready| {
+        let _ = ready_tx.send(ready);
+    });
+    assert!(matches!(outcome, PressOutcome::Starting));
+    let live = match ready_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+        MicReady::Recording { live, .. } => live,
+        MicReady::Failed(e) => panic!("Quelle ließ sich nicht öffnen: {e}"),
+    };
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .wait(Duration::from_secs(60))
+    );
+    let mut pieces = Vec::new();
+    let mut inject = |text: &str| {
+        pieces.push(text.to_string());
+        Ok(())
+    };
+    let job = match session.release(HostInstant::now()) {
+        ReleaseOutcome::Ready {
+            pcm,
+            frontmost,
+            captured,
+            trace,
+            ..
+        } => SttJob::Utterance {
+            pcm,
+            frontmost,
+            captured,
+            trace,
+        },
+        ReleaseOutcome::LiveEnded => SttJob::Live {
+            feed: live.expect("Live-Aufnahme hat einen Feed"),
+        },
+        other => panic!("Diktat endete vorzeitig: {other:?}"),
+    };
+    let (_, trace) = process_job(worker, job, &cfg, &mut inject, None);
+    (pieces, trace)
+}
+
+fn read_pcm(wav: &Path) -> Vec<f32> {
+    read_wav_16k_mono(wav.to_str().unwrap())
+}
+
+fn since_press(trace: &DictationTrace, at: Option<HostInstant>) -> String {
+    at.map_or_else(
+        || "—".to_string(),
+        |at| format!("{} ms", at.saturating_since(trace.pressed_at).as_millis()),
+    )
+}
+
+/// REQ-DIAG-032: das erste Referenzwort steht am Anfang des Ergebnisses.
+/// Schlägt mit einer Tabelle (erwartet / erkannt / →erstes Signal) fehl, wenn nicht.
+fn assert_first_word_present(start_delay_ms: u64, insert_mode: InsertMode, set: FixtureSet) {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut worker = worker();
+    let mut failures = Vec::new();
+    for (name, wav) in fixtures(set) {
+        let expected = first_word(&reference(&wav)).expect("Referenz ohne Wort");
+        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), start_delay_ms, insert_mode);
+        let result = pieces.concat();
+        let got = normalize_words(&result).into_iter().next();
+        if got.as_deref() != Some(expected.as_str()) {
+            failures.push(format!(
+                "| {name} | {expected} | {} | {} | {result:?} |",
+                got.as_deref().unwrap_or("—"),
+                since_press(&trace, trace.first_signal_at),
+            ));
+        }
+    }
+    println!(
+        "{set:?} · {} ms · {insert_mode:?}: {} Fehlfälle",
+        start_delay_ms,
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "erstes Wort fehlt ({start_delay_ms} ms, {insert_mode:?}, {set:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
+        failures.join("\n")
+    );
+}
+
+macro_rules! first_word_case {
+    ($name:ident, $delay:expr, $mode:expr, $set:expr) => {
+        #[test]
+        fn $name() {
+            assert_first_word_present($delay, $mode, $set);
+        }
+    };
+    ($name:ident, $delay:expr, $mode:expr, $set:expr, ignore = $reason:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            assert_first_word_present($delay, $mode, $set);
+        }
+    };
+}
+
+first_word_case!(
+    first_word_at_end_say_0ms,
+    0,
+    InsertMode::AtEnd,
+    FixtureSet::Say,
+    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 90 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_at_end_say_100ms,
+    100,
+    InsertMode::AtEnd,
+    FixtureSet::Say,
+    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 190 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_at_end_say_300ms,
+    300,
+    InsertMode::AtEnd,
+    FixtureSet::Say,
+    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 390 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_at_end_fleurs_0ms,
+    0,
+    InsertMode::AtEnd,
+    FixtureSet::Fleurs,
+    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 30 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_at_end_fleurs_100ms,
+    100,
+    InsertMode::AtEnd,
+    FixtureSet::Fleurs,
+    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 130 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_at_end_fleurs_300ms,
+    300,
+    InsertMode::AtEnd,
+    FixtureSet::Fleurs,
+    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 330 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_per_sentence_say_0ms,
+    0,
+    InsertMode::PerSentence,
+    FixtureSet::Say,
+    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 90 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_per_sentence_say_100ms,
+    100,
+    InsertMode::PerSentence,
+    FixtureSet::Say,
+    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 190 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_per_sentence_say_300ms,
+    300,
+    InsertMode::PerSentence,
+    FixtureSet::Say,
+    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 390 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_per_sentence_fleurs_0ms,
+    0,
+    InsertMode::PerSentence,
+    FixtureSet::Fleurs,
+    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 30 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_per_sentence_fleurs_100ms,
+    100,
+    InsertMode::PerSentence,
+    FixtureSet::Fleurs,
+    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 130 ms, Behebung in 0039"
+);
+first_word_case!(
+    first_word_per_sentence_fleurs_300ms,
+    300,
+    InsertMode::PerSentence,
+    FixtureSet::Fleurs,
+    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 330 ms, Behebung in 0039"
+);
+
+/// REQ-DIAG-033: zwei Sätze mit kurzer Pause, Satzweise → das erste Wort des zweiten Satzes
+/// steht am Anfang des zuletzt eingefügten Stücks.
+#[test]
+#[ignore = "bekannt: erste Wörter des zweiten Satzes fehlen nach der Pause (3 von 3 Paaren, z. B. »Hast du schon« fehlt), Behebung in 0039"]
+fn first_word_of_the_second_sentence_survives_the_pause() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut worker = worker();
+    let pairs = [
+        ("de-business", "de-frage"),
+        ("fleurs-de-06", "fleurs-de-01"),
+        ("fleurs-de-08", "fleurs-de-05"),
+    ];
+    let mut failures = Vec::new();
+    for (first, second) in pairs {
+        let dir = Path::new("tests/fixtures/stt");
+        let (a, b) = (
+            dir.join(format!("{first}.wav")),
+            dir.join(format!("{second}.wav")),
+        );
+        let mut pcm = read_pcm(&a);
+        pcm.extend(std::iter::repeat_n(0.0, 19_200)); // 1,2 s Pause
+        pcm.extend(read_pcm(&b));
+        let expected = first_word(&reference(&b)).expect("Referenz ohne Wort");
+        let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence);
+        let last_first = pieces
+            .last()
+            .and_then(|p| normalize_words(p).into_iter().next());
+        if pieces.len() < 2 || last_first.as_deref() != Some(expected.as_str()) {
+            failures.push(format!(
+                "| {first} + {second} | {expected} | {} | {} | {pieces:?} |",
+                last_first.as_deref().unwrap_or("—"),
+                pieces.len()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "erstes Wort des zweiten Satzes fehlt:\n| Paar | erwartet | erkannt | Stücke | Ergebnis |\n|---|---|---|---|---|\n{}",
+        failures.join("\n")
+    );
+}
