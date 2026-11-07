@@ -3,9 +3,10 @@
 //! Aufnahme via cpal (CoreAudio); Downmix + Resampling als pure, unit-getestete
 //! Funktionen. Kein Platten-I/O, kein Upload.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use cpal::SampleFormat;
@@ -375,6 +376,203 @@ impl AudioSource for MicSource {
     }
 }
 
+/// Takt der [`WavSource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    /// Blöcke im Echtzeittakt, Zeitstempel = `HostInstant::now()` bei der Lieferung.
+    RealTime,
+    /// Alle Blöcke sofort, Zeitstempel virtuell ab `epoch + start_delay`.
+    Immediate,
+}
+
+/// Einstellungen der [`WavSource`]: Format, wie es ein Gerät liefern würde.
+#[derive(Clone, Copy, Debug)]
+pub struct WavOptions {
+    pub format: AudioFormat,
+    /// Frames je Block (mind. 1).
+    pub block_frames: usize,
+    /// Zeit bis zum ersten Block (Mikrofon-Anlaufzeit).
+    pub start_delay: Duration,
+    pub pace: Pace,
+    /// Zeitnullpunkt der virtuellen Zeitstempel bei `Pace::Immediate`.
+    pub epoch: HostInstant,
+}
+
+/// Meldet, dass die [`WavSource`] ihren letzten Block geliefert hat (oder beendet wurde).
+#[derive(Clone)]
+pub struct SourceDone(Arc<(Mutex<bool>, Condvar)>);
+
+impl SourceDone {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    fn signal(&self) {
+        let (flag, cv) = &*self.0;
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+
+    /// Wartet höchstens `timeout`; `true`, wenn die Lieferung beendet ist.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        let (flag, cv) = &*self.0;
+        let guard = flag.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = cv
+            .wait_timeout_while(guard, timeout, |done| !*done)
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+}
+
+/// Test- und Messquelle: liefert eine WAV-Aufnahme als Blöcke (ADR-0012).
+pub struct WavSource {
+    mono_16k: Vec<f32>,
+    opts: WavOptions,
+    name: String,
+    done: SourceDone,
+}
+
+impl WavSource {
+    /// Liest `path` (beliebige Rate/Kanäle/Bittiefe) und wandelt auf 16 kHz mono.
+    pub fn from_file(path: &Path, opts: WavOptions) -> Result<(Self, SourceDone)> {
+        let fail = |what: &str| TalkerError::Audio(format!("WAV {}: {what}", path.display()));
+        let mut reader = hound::WavReader::open(path).map_err(|e| fail(&e.to_string()))?;
+        let spec = reader.spec();
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| fail(&e.to_string()))?,
+            hound::SampleFormat::Int => {
+                let scale = 2f32.powi(i32::from(spec.bits_per_sample) - 1);
+                reader
+                    .samples::<i32>()
+                    .map(|s| s.map(|v| v as f32 / scale))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| fail(&e.to_string()))?
+            }
+        };
+        let mono = to_mono_16k(&samples, spec.channels, spec.sample_rate)
+            .map_err(|e| fail(&e.to_string()))?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(Self::build(mono, opts, name))
+    }
+
+    /// Aus 16-kHz-mono-Samples, z. B. mit führenden Null-Blöcken.
+    pub fn from_samples(mono_16k: Vec<f32>, opts: WavOptions) -> (Self, SourceDone) {
+        Self::build(mono_16k, opts, "Samples".into())
+    }
+
+    fn build(mono_16k: Vec<f32>, opts: WavOptions, name: String) -> (Self, SourceDone) {
+        let done = SourceDone::new();
+        (
+            Self {
+                mono_16k,
+                opts,
+                name,
+                done: done.clone(),
+            },
+            done,
+        )
+    }
+}
+
+/// Beendet den Lieferthread beim Drop und wartet auf ihn — danach kommt kein Block mehr.
+struct WavGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for WavGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
+impl AudioSource for WavSource {
+    fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+        let WavSource {
+            mono_16k,
+            opts,
+            name,
+            done,
+        } = *self;
+        let channels = opts.format.channels.max(1);
+        let rate = opts.format.sample_rate;
+        if rate == 0 {
+            return Err(TalkerError::Audio("WAV-Quelle: Abtastrate 0".into()));
+        }
+        let mono = if rate == TARGET_SAMPLE_RATE || mono_16k.is_empty() {
+            mono_16k
+        } else {
+            resample(&mono_16k, TARGET_SAMPLE_RATE, rate)?
+        };
+        let block_frames = opts.block_frames.max(1);
+        let info = SourceInfo {
+            format: AudioFormat {
+                channels,
+                sample_rate: rate,
+            },
+            device: format!("WAV: {name}"),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("talker-wav-source".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let mut frames_done: u64 = 0;
+                for frames in mono.chunks(block_frames) {
+                    frames_done += frames.len() as u64;
+                    // Der Block gilt als geliefert, sobald seine letzte Frame aufgenommen ist.
+                    let offset = opts.start_delay
+                        + Duration::from_nanos(frames_done * 1_000_000_000 / u64::from(rate));
+                    let at = match opts.pace {
+                        Pace::Immediate => opts.epoch.saturating_add(offset),
+                        Pace::RealTime => {
+                            while started.elapsed() < offset {
+                                if thread_stop.load(Ordering::SeqCst) {
+                                    done.signal();
+                                    return;
+                                }
+                                std::thread::park_timeout(
+                                    offset
+                                        .saturating_sub(started.elapsed())
+                                        .min(Duration::from_millis(20)),
+                                );
+                            }
+                            HostInstant::now()
+                        }
+                    };
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let interleaved: Vec<f32> = frames
+                        .iter()
+                        .flat_map(|&s| std::iter::repeat_n(s, usize::from(channels)))
+                        .collect();
+                    on_block(&interleaved, at);
+                }
+                done.signal();
+            })
+            .map_err(|e| TalkerError::Audio(format!("WAV-Quelle: Thread-Start: {e}")))?;
+        Ok(Opened {
+            info,
+            stop: Box::new(WavGuard {
+                stop,
+                handle: Some(handle),
+            }),
+        })
+    }
+}
+
 /// Startet die Aufnahme über `source`. `live`: optionaler zusätzlicher Verbraucher
 /// (Live-Diktat) — bekommt jeden Block roh als `Feed::Block`, am Ende `Feed::End`.
 pub fn start(source: Box<dyn AudioSource>, live: Option<Sender<Feed>>) -> Result<Recording> {
@@ -481,7 +679,7 @@ fn downmix(interleaved: &[f32], channels: u16) -> Vec<f32> {
         .collect()
 }
 
-fn resample(mono: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
+pub(crate) fn resample(mono: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     let map_err = |e: &dyn std::fmt::Display| TalkerError::Audio(format!("Resampling: {e}"));
     let mut resampler = Fft::<f32>::new(from as usize, to as usize, 1024, 2, 1, FixedSync::Input)
         .map_err(|e| map_err(&e))?;
@@ -970,5 +1168,247 @@ mod tests {
         assert_eq!(captured(10, 1, 0).recorded(), Duration::ZERO);
         // Unvollständiges letztes Frame zählt nicht.
         assert_eq!(captured(3, 2, 1).recorded(), Duration::from_secs(1));
+    }
+
+    // ---- WavSource ----
+
+    fn wav_opts(channels: u16, rate: u32, block_frames: usize, delay_ms: u64) -> WavOptions {
+        WavOptions {
+            format: AudioFormat {
+                channels,
+                sample_rate: rate,
+            },
+            block_frames,
+            start_delay: Duration::from_millis(delay_ms),
+            pace: Pace::Immediate,
+            epoch: HostInstant::from_nanos(1_000_000),
+        }
+    }
+
+    /// Öffnet die Quelle und sammelt alle Blöcke (Samples, Zeitstempel) bis `SourceDone`.
+    fn collect(source: WavSource, done: &SourceDone) -> (Vec<Vec<f32>>, Vec<HostInstant>) {
+        let got = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let sink = Arc::clone(&got);
+        let opened = Box::new(source)
+            .open(Box::new(move |data, at| {
+                let mut g = sink.lock().unwrap();
+                g.0.push(data.to_vec());
+                g.1.push(at);
+            }))
+            .unwrap();
+        assert!(done.wait(Duration::from_secs(10)), "SourceDone blieb aus");
+        drop(opened);
+        let g = got.lock().unwrap();
+        (g.0.clone(), g.1.clone())
+    }
+
+    fn ramp(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 + 1.0) / 100_000.0).collect()
+    }
+
+    /// REQ-DIAG-024: bei 0/100/300 ms Startverzögerung geht kein Sample verloren (bitgleich).
+    #[test]
+    fn immediate_source_delivers_every_sample_for_each_start_delay() {
+        let input = ramp(16_000);
+        for delay_ms in [0, 100, 300] {
+            let (source, done) =
+                WavSource::from_samples(input.clone(), wav_opts(1, 16_000, 480, delay_ms));
+            let (blocks, times) = collect(source, &done);
+            let flat: Vec<f32> = blocks.concat();
+            assert_eq!(flat, input, "Verzögerung {delay_ms} ms");
+            assert!(
+                times[0]
+                    >= HostInstant::from_nanos(1_000_000)
+                        .saturating_add(Duration::from_millis(delay_ms))
+            );
+        }
+    }
+
+    /// 44,1/48 kHz, 1/2 Kanäle: Frames·Kanäle konsistent, Dauer ±1 Block, Kanäle identisch.
+    #[test]
+    fn immediate_source_adapts_rate_and_channels() {
+        let input = ramp(16_000);
+        for (channels, rate) in [(1u16, 44_100u32), (2, 44_100), (1, 48_000), (2, 48_000)] {
+            let block_frames = 1_024;
+            let (source, done) =
+                WavSource::from_samples(input.clone(), wav_opts(channels, rate, block_frames, 0));
+            let (blocks, _) = collect(source, &done);
+            let flat: Vec<f32> = blocks.concat();
+            assert_eq!(flat.len() % usize::from(channels), 0);
+            let frames = flat.len() / usize::from(channels);
+            let expected = input.len() * rate as usize / 16_000;
+            assert!(
+                frames.abs_diff(expected) <= block_frames,
+                "{channels} Kanäle {rate} Hz: {frames} statt ~{expected}"
+            );
+            if channels == 2 {
+                assert!(flat.chunks_exact(2).all(|f| f[0] == f[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn block_size_edge_cases_and_empty_input() {
+        let input = ramp(10);
+        let (source, done) = WavSource::from_samples(input.clone(), wav_opts(1, 16_000, 1, 0));
+        assert_eq!(collect(source, &done).0.len(), 10);
+        let (source, done) =
+            WavSource::from_samples(input.clone(), wav_opts(1, 16_000, 1_000_000, 0));
+        let (blocks, _) = collect(source, &done);
+        assert_eq!(blocks, std::slice::from_ref(&input));
+        let (source, done) = WavSource::from_samples(input, wav_opts(1, 16_000, 0, 0));
+        assert_eq!(
+            collect(source, &done).0.len(),
+            10,
+            "Blockgröße 0 gilt als 1"
+        );
+        let (source, done) = WavSource::from_samples(vec![], wav_opts(1, 16_000, 480, 0));
+        assert!(collect(source, &done).0.is_empty());
+    }
+
+    /// Virtuelle Zeitstempel sind streng monoton und beginnen frühestens bei epoch + Startverzögerung.
+    #[test]
+    fn immediate_timestamps_are_strictly_increasing_and_start_after_the_delay() {
+        let (source, done) = WavSource::from_samples(ramp(16_000), wav_opts(1, 16_000, 160, 100));
+        let (_, times) = collect(source, &done);
+        assert_eq!(times.len(), 100);
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+        let epoch = HostInstant::from_nanos(1_000_000);
+        assert!(times[0] >= epoch.saturating_add(Duration::from_millis(100)));
+        assert_eq!(
+            *times.last().unwrap(),
+            epoch.saturating_add(Duration::from_millis(1_100))
+        );
+    }
+
+    /// Im Echtzeittakt dauert die Lieferung mindestens ungefähr so lange wie der Clip.
+    #[test]
+    fn real_time_pace_takes_at_least_about_the_clip_duration() {
+        let mut opts = wav_opts(1, 16_000, 160, 0);
+        opts.pace = Pace::RealTime;
+        let (source, done) = WavSource::from_samples(ramp(3_200), opts);
+        let t0 = std::time::Instant::now();
+        let (blocks, times) = collect(source, &done);
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(blocks.concat().len(), 3_200);
+        assert!(times.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// `SourceDone` meldet sich nicht, solange die Quelle nie geöffnet wurde.
+    #[test]
+    fn source_done_stays_false_until_delivery_ends() {
+        let (_source, done) = WavSource::from_samples(ramp(10), wav_opts(1, 16_000, 5, 0));
+        assert!(!done.wait(Duration::from_millis(10)));
+    }
+
+    /// Drop von `Opened.stop` beendet die Lieferung: danach kommt kein Block mehr.
+    #[test]
+    fn dropping_stop_ends_delivery_without_late_blocks() {
+        let mut opts = wav_opts(1, 16_000, 160, 0);
+        opts.pace = Pace::RealTime;
+        let (source, _done) = WavSource::from_samples(ramp(16_000 * 30), opts);
+        let count = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&count);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opened = Box::new(source)
+            .open(Box::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(());
+            }))
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let t0 = std::time::Instant::now();
+        drop(opened);
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "Drop wartete auf den Clip"
+        );
+        let after = count.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(count.load(Ordering::SeqCst), after);
+    }
+
+    fn temp_wav(
+        name: &str,
+        bytes: Option<&[u8]>,
+        spec: hound::WavSpec,
+        samples: &[f32],
+    ) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("talker-wav-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.wav"));
+        match bytes {
+            Some(b) => std::fs::write(&path, b).unwrap(),
+            None => {
+                let mut w = hound::WavWriter::create(&path, spec).unwrap();
+                for &s in samples {
+                    w.write_sample((s * 32767.0) as i16).unwrap();
+                }
+                w.finalize().unwrap();
+            }
+        }
+        path
+    }
+
+    #[test]
+    fn from_file_reads_a_wav_and_names_the_device() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let samples = vec![0.0, 0.5, -0.5, 0.25];
+        let path = temp_wav("ok", None, spec, &samples);
+        let (source, done) = WavSource::from_file(&path, wav_opts(1, 16_000, 2, 0)).unwrap();
+        let info_name = source.name.clone();
+        let (blocks, _) = collect(source, &done);
+        let flat = blocks.concat();
+        assert_eq!(info_name, "ok");
+        assert_eq!(flat.len(), 4);
+        assert!((flat[1] - 0.5).abs() < 1e-3 && (flat[2] + 0.5).abs() < 1e-3);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Defekte oder fehlende WAV → Err mit Grund (Pfad im Text).
+    #[test]
+    fn from_file_reports_broken_and_missing_files() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let broken = temp_wav("kaputt", Some(b"kein wav"), spec, &[]);
+        let err = WavSource::from_file(&broken, wav_opts(1, 16_000, 160, 0))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("kaputt.wav"));
+        let missing = broken.with_file_name("fehlt.wav");
+        assert!(WavSource::from_file(&missing, wav_opts(1, 16_000, 160, 0)).is_err());
+        let _ = std::fs::remove_dir_all(broken.parent().unwrap());
+    }
+
+    #[test]
+    fn zero_sample_rate_fails_at_open_not_with_a_panic() {
+        let (source, _done) = WavSource::from_samples(ramp(10), wav_opts(1, 0, 160, 0));
+        assert!(Box::new(source).open(Box::new(|_, _| {})).is_err());
+    }
+
+    /// Führende Null-Blöcke über `Recording` → erster Block < erstes Signal (AK-10 mit WavSource).
+    #[test]
+    fn wav_source_with_leading_zeros_marks_first_signal_after_first_block() {
+        let mut input = vec![0.0; 3_200];
+        input.extend(ramp(1_600));
+        let (source, done) = WavSource::from_samples(input, wav_opts(1, 16_000, 160, 0));
+        let rec = start(Box::new(source), None).unwrap();
+        assert!(done.wait(Duration::from_secs(10)));
+        let captured = rec.stop();
+        assert!(captured.marks.first_block < captured.marks.first_signal);
+        assert_eq!(captured.raw.len(), 4_800);
     }
 }
