@@ -72,8 +72,8 @@ impl DebugCapture {
             dir: PathBuf::from(v),
         })?;
         log::warn!(
-            "Debug-Mitschnitt aktiv: {} — Audio wird gespeichert",
-            capture.dir.display()
+            "Debug-Mitschnitt aktiv: {:?} — Audio wird gespeichert",
+            capture.dir
         );
         Some(capture)
     }
@@ -833,6 +833,19 @@ mod tests {
             .collect();
         assert_eq!(warns.len(), 1);
         assert!(warns[0].1.contains("/tmp/talker-x"));
+    }
+
+    /// SEC-7: ein Zeilenumbruch im Verzeichniswert fälscht keine zweite Logzeile.
+    #[test]
+    fn newline_in_the_directory_value_stays_on_one_log_line() {
+        let (_, lines) = crate::logging::capture(|| {
+            DebugCapture::from_var(Some("/tmp/x\n2026-01-01 ERROR fake"));
+        });
+        let warn = lines
+            .iter()
+            .find(|(_, text)| text.contains("Debug-Mitschnitt aktiv"))
+            .unwrap();
+        assert!(!warn.1.contains('\n'));
     }
 
     /// 0 Kanäle (unbrauchbare Quelle) → kein Panic im Mitschnitt.
