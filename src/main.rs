@@ -212,9 +212,7 @@ fn main() -> ExitCode {
             }
 
             // Eine Messzeile je Dictation, auf `info` (ADR-0011/-0012).
-            let trace_report: TraceReport = Arc::new(|t| {
-                log::info!(target: "talker::messung", "{t}");
-            });
+            let trace_report: TraceReport = talker::diagnostics::log_report();
             let stt_tx = spawn_stt_worker(
                 Arc::clone(&config),
                 Arc::clone(&indicator),

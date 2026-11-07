@@ -47,6 +47,11 @@ pub struct DictationTrace {
 /// Meldet die fertige Messzeile (App: `log::info!(target: "talker::messung", …)`).
 pub type TraceReport = Arc<dyn Fn(DictationTrace) + Send + Sync>;
 
+/// Der Report der App: genau eine Zeile je Dictation auf `info`, Ziel `talker::messung`.
+pub fn log_report() -> TraceReport {
+    Arc::new(|trace| log::info!(target: "talker::messung", "{trace}"))
+}
+
 const MISSING: &str = "—";
 
 /// Unter 1 s in ms, sonst Sekunden mit Komma und einer Nachkommastelle.

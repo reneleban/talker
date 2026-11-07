@@ -502,6 +502,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
         match assembler.push(&block) {
             Ok(chunks) => {
                 for chunk in chunks {
+                    log::debug!("Live-Chunk: {} Samples @16 kHz", chunk.len());
                     worker.live_chunk(&chunk).into_iter().for_each(&mut *emit);
                 }
             }
@@ -2800,5 +2801,47 @@ mod tests {
         let ended = blocks.take_ended().unwrap();
         assert_eq!(ended.released_at, audio::HostInstant::from_nanos(5));
         assert!(blocks.take_ended().is_none());
+    }
+
+    /// REQ-DIAG-009/-012: auf `info` genau eine Zeile (die Messzeile) für eine Live-Dictation
+    /// mit 3 Segmenten; auf `debug` kommen Chunk- und Segment-Zeilen dazu.
+    #[test]
+    fn live_dictation_with_three_segments_logs_exactly_one_line_on_info() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(
+            &cfg,
+            "Dritter.",
+            &[
+                ("a", false),
+                ("Erster.", true),
+                ("b", false),
+                ("Zweiter.", true),
+            ],
+        );
+        let report = crate::diagnostics::log_report();
+        let injected: Injected = Rc::default();
+        let (_, lines) = crate::logging::capture(|| {
+            let (_, trace) = process_job(
+                &mut w,
+                live_job(&cfg, 4),
+                &cfg,
+                &mut recording_inject(&injected),
+            );
+            report(trace);
+        });
+        assert_eq!(injected.borrow().len(), 3);
+        let on_info: Vec<_> = lines
+            .iter()
+            .filter(|(l, _)| *l <= log::Level::Info)
+            .collect();
+        assert_eq!(on_info.len(), 1, "auf info: {on_info:?}");
+        assert!(on_info[0].1.starts_with("talker::messung: Diktat #1: "));
+        assert!(on_info[0].1.contains("Segmente 3"));
+        let detail: Vec<_> = lines
+            .iter()
+            .filter(|(l, _)| *l == log::Level::Debug)
+            .collect();
+        assert!(detail.iter().any(|(_, l)| l.contains("Live-Chunk")));
+        assert!(detail.iter().any(|(_, l)| l.contains("Live-Segment")));
     }
 }
