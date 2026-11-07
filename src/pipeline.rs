@@ -512,6 +512,9 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
             }
         }
     }
+    // Der Block-Strom endet mit `Feed::End`: ab hier läuft nur noch der Rest nach dem
+    // Loslassen. Die Zeit der Chunks davor gehört nicht in „Loslassen→Text (STT · Cleanup)“.
+    let _ = worker.take_timing();
     match assembler.flush() {
         Ok(rest) if !rest.is_empty() => {
             worker.live_chunk(&rest).into_iter().for_each(&mut *emit);
@@ -3029,6 +3032,8 @@ mod tests {
         reply: &'static str,
         fail: bool,
         updates: std::collections::VecDeque<crate::stt::StreamUpdate>,
+        /// Künstliche Dauer je `feed` (Live-Messung).
+        feed_delay: StdDuration,
     }
 
     impl RecordingStt {
@@ -3038,6 +3043,7 @@ mod tests {
                 reply,
                 fail: false,
                 updates: Default::default(),
+                feed_delay: StdDuration::ZERO,
             }
         }
     }
@@ -3055,6 +3061,7 @@ mod tests {
     impl StreamingTranscriber for RecordingStt {
         fn begin(&mut self) {}
         fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+            std::thread::sleep(self.feed_delay);
             Ok(self
                 .updates
                 .pop_front()
@@ -3176,6 +3183,31 @@ mod tests {
             ),
             _ => None,
         }
+    }
+
+    /// AK-11/CR-3: im Live-Modus zählt STT nur ab dem Loslassen (`Feed::End`) — die Chunks
+    /// während des Sprechens stehen nicht in der Klammer hinter „Loslassen→Text“.
+    #[test]
+    fn live_stt_time_counts_only_after_the_release() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = e2e_worker(&cfg, || RecordingStt {
+            feed_delay: StdDuration::from_millis(60),
+            ..RecordingStt::new(&Rc::default(), "Rest.")
+        });
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 3),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        let stt = trace.stt.expect("STT nach dem Loslassen gemessen");
+        assert!(
+            stt < StdDuration::from_millis(60),
+            "3 Chunks à 60 ms vor dem Loslassen dürfen nicht zählen: {stt:?}"
+        );
+        assert_eq!(injected.borrow().as_slice(), ["Rest."]);
     }
 
     /// AK-9/-12/-21: Batch-Diktat Ende zu Ende → vollständige Messzeile; #1 Kaltstart, #2 nicht.
