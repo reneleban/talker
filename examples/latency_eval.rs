@@ -20,7 +20,7 @@ use talker::config::{Config, InsertMode};
 use talker::diagnostics::{DictationTrace, cleanup_name};
 use talker::error::TalkerError;
 use talker::models::{ModelState, ModelsState};
-use talker::pipeline::{DictationWorker, LiveFeed, SttJob, process_job};
+use talker::pipeline::{CleanerLoader, DictationWorker, LiveFeed, SttJob, process_job};
 use talker::stt::{NemotronTranscriber, StreamingTranscriber, Transcriber};
 
 /// Dieselbe Wortnormalisierung wie die Regression „erstes Wort“ (`tests/stt_nemotron.rs`).
@@ -485,6 +485,15 @@ fn load_models(cfg: &EvalConfig) -> Result<Models, String> {
     })
 }
 
+/// Loader für den Worker: der Roh-Lauf verwirft den Cleaner, der nächste Natürlich-Lauf lädt neu.
+fn cleaner_loader<C: 'static>(
+    preloaded: Option<C>,
+    mut reload: impl FnMut() -> Option<C> + 'static,
+) -> CleanerLoader<C> {
+    let mut slot = preloaded;
+    Box::new(move || (slot.take().or_else(&mut reload), false))
+}
+
 fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
     let Models {
         stt,
@@ -526,8 +535,8 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
         },
         ..Config::default()
     };
+    let gemma_path = cfg.gemma_path.clone();
     let mut stt_slot = Some(stt);
-    let mut cleaner_slot = cleaner;
     let mut worker = DictationWorker::new(
         &preload,
         Arc::new(ModelsState::new(
@@ -543,7 +552,7 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
                 .take()
                 .ok_or_else(|| TalkerError::Stt("Nemotron nur einmal geladen".into()))
         }),
-        Box::new(move || (cleaner_slot.take(), false)),
+        cleaner_loader(cleaner, move || load_cleaner(&gemma_path).ok()),
     );
     let mut progress = |label: &str| eprintln!("… {label}");
     let (combos, run_skipped) = measure(
@@ -887,6 +896,12 @@ mod tests {
     }
 
     fn fake_worker() -> DictationWorker<EvalStt, BracketCleaner> {
+        fake_worker_with(Box::new(|| (Some(BracketCleaner), false)))
+    }
+
+    fn fake_worker_with(
+        load_cleaner: CleanerLoader<BracketCleaner>,
+    ) -> DictationWorker<EvalStt, BracketCleaner> {
         let cfg = Config::default();
         DictationWorker::new(
             &cfg,
@@ -903,7 +918,7 @@ mod tests {
                     reply: "hallo welt",
                 })
             }),
-            Box::new(|| (Some(BracketCleaner), false)),
+            load_cleaner,
         )
     }
 
@@ -943,6 +958,33 @@ mod tests {
         .unwrap();
         assert_eq!(cleaned.text, "hallo welt!");
         assert!(cleaned.cleanup.is_some());
+    }
+
+    /// AK-22 (PERF-5): Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh den Cleaner verworfen hat.
+    #[test]
+    fn casual_cases_get_cleanup_after_raw_dropped_the_cleaner() {
+        let fx = TempFixtures::new("natuerlich");
+        fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        let mut worker = fake_worker_with(cleaner_loader(Some(BracketCleaner), || {
+            Some(BracketCleaner)
+        }));
+        let (combos, skipped) = measure(
+            &mut worker,
+            &[fixture],
+            2,
+            &cleanup_modes(true),
+            &mut |_: &str| {},
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        for combo in combos.iter().filter(|c| c.cleanup == CleanupMode::Casual) {
+            assert_eq!(
+                combo.stats.cleanup.len(),
+                2,
+                "{} · Natürlich ohne Cleanup-Werte",
+                combo.insert.label()
+            );
+        }
     }
 
     /// Gesamtlauf mit Fakes: 4 Fälle, Aufwärmlauf verworfen, defekte Quelle übersprungen, WER gebildet.
