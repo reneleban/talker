@@ -105,4 +105,16 @@ for r in product-owner architect rust-developer test-engineer; do
 done
 has "AK-18 product-owner: Kopfzeile ist keine Freigabe" "$AGENTS_DIR/product-owner.md" '\[talker von .*keine Freigabe'
 
+# --- T16: code-reviewer, security-auditor, performance-engineer, release-engineer (AK-16, AK-22) ---
+for r in code-reviewer security-auditor performance-engineer; do
+  agent_common "$r"
+  has "AK-22 $r: schreibt nicht in die Ticket-Datei" "$AGENTS_DIR/$r.md" 'schreibst nicht in die Ticket-Datei'
+  has "Rückfall $r: Orchestrator liest mit herdr agent read" "$AGENTS_DIR/$r.md" 'herdr agent read'
+  case $(fm_line "$AGENTS_DIR/$r.md" disallowedTools) in *Write*Edit* | *Edit*Write*) ok "AK-22 $r: Write und Edit gesperrt" ;; *) fail "AK-22 $r: Write und Edit gesperrt" ;; esac
+done
+agent_common release-engineer
+akte_checks release-engineer
+has "R5 security-auditor: env-herdr-Umgehung im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'env herdr'
+has "R5 security-auditor: Kopfzeile im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'Kopfzeile'
+
 th_summary
