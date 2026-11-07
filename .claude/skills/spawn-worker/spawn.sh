@@ -79,21 +79,34 @@ else
   MAX=$(sed -n 's/^TEAM_MAX_SESSIONS=//p' "$MAIN/team.env" 2>/dev/null | head -n 1)
 fi
 case $MAX in ''|0*|*[!0-9]*) die "TEAM_MAX_SESSIONS ungültig: '$MAX'" ;; esac
-ACTIVE=$(herdr agent list | jq --arg re "^($ROLES_RE)-[0-9]{4}(-[0-9]+)?\$" '[.result.agents[] | select((.name // "") | test($re))] | length')
+AGENTS=$(herdr agent list)
+ACTIVE=$(printf '%s' "$AGENTS" | jq --arg re "^($ROLES_RE)-[0-9]{4}(-[0-9]+)?\$" '[.result.agents[] | select((.name // "") | test($re))] | length')
 [ $((ACTIVE + 1)) -le "$MAX" ] || die "Obergrenze erreicht: $ACTIVE Rollen-Sessions aktiv, TEAM_MAX_SESSIONS=$MAX"
 
 [ "$INSTANCE" = 0 ] || [ "$OWN" = 1 ] || die "--instance gibt es nur für Rollen mit eigenem Worktree, nicht für $ROLE"
+
+# Name: Basisname, bei laufender Basis mit --instance die kleinste freie Instanz n >= 2 (Lücken werden gefüllt).
+BASE="$ROLE-$TICKET"
+BRANCH="wt/$ROLE"
+NAME=$BASE
+NAMES=$(printf '%s' "$AGENTS" | jq -r '[.result.agents[].name // empty] | join(" ")')
+running() { case " $NAMES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+if running "$BASE"; then
+  [ "$INSTANCE" = 1 ] || die "Session $BASE läuft bereits (weitere Instanz der Rolle: --instance)"
+  n=2
+  while running "$BASE-$n"; do n=$((n + 1)); done
+  NAME="$BASE-$n"; DIR="$WT_ROOT/$ROLE-$n"; BRANCH="wt/$ROLE-$n"
+fi
+[ ${#NAME} -le 32 ] || die "Name länger als 32 Zeichen (herdr): $NAME"
 [ "$OWN" = 0 ] || [ ! -d "$DIR" ] || require_clean "$DIR"
 
 if [ "$OWN" = 1 ]; then
   if [ -d "$DIR" ]; then
-    git -C "$DIR" switch -C "wt/$ROLE" "$FEATURE"
+    git -C "$DIR" switch -C "$BRANCH" "$FEATURE"
   else
-    git -C "$MAIN" worktree add -B "wt/$ROLE" "$DIR" "$FEATURE"
+    git -C "$MAIN" worktree add -B "$BRANCH" "$DIR" "$FEATURE"
   fi
 fi
-
-NAME="$ROLE-$TICKET"
 
 # Pane-ID immer aus der JSON-Antwort von herdr, nie geraten.
 new_pane() {
