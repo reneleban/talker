@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
 use crate::config::{Config, InsertMode};
-use crate::diagnostics::{DictationResult, DictationTrace, TraceReport};
+use crate::diagnostics::{DebugCapture, DictationResult, DictationTrace, TraceReport};
 use crate::error::TalkerError;
 use crate::injection;
 use crate::models::{ModelId, ModelsState};
-use crate::stt::{PhraseCommitter, StreamingTranscriber, Transcriber};
+use crate::stt::{ModelTap, PhraseCommitter, StreamingTranscriber, Transcriber};
 use crate::{audio, vocab_match};
 
 /// Hinweis, wenn kein Text erkannt wurde.
@@ -675,27 +675,33 @@ fn deliver(
 /// Verarbeitet einen Auftrag vollständig: STT → Cleanup → Einfügen über `inject`.
 /// Liefert den ersten Hinweis für den Indicator und die fertige Messzeile.
 /// Bricht nie hart ab: jeder Fehlerpfad wird zu Hinweis + Ergebnis in der Trace.
+/// `debug`: Debug-Mitschnitt; geschrieben wird erst NACH dem Einfügen.
 pub fn process_job<T, C>(
     worker: &mut DictationWorker<T, C>,
     job: SttJob,
     cfg: &Config,
     inject: &mut dyn FnMut(&str) -> crate::error::Result<()>,
+    debug: Option<(&DebugCapture, &ModelTap)>,
 ) -> (Option<&'static str>, DictationTrace)
 where
     T: Transcriber + StreamingTranscriber,
     C: LlmCleaner,
 {
     let mut delivery = Delivery::default();
-    let mut trace = match job {
+    // Reste eines früheren, nicht abgeholten Auftrags verwerfen.
+    if let Some((_, tap)) = debug {
+        tap.take();
+    }
+    let (mut trace, captured) = match job {
         SttJob::Utterance {
             pcm,
             frontmost,
+            captured,
             trace,
-            ..
         } => {
             let outcome = worker.handle(&pcm, frontmost.as_deref(), cfg);
             deliver(outcome, inject, &mut delivery);
-            *trace
+            (*trace, Some(captured))
         }
         SttJob::Live { feed } => {
             let mut trace = *feed.trace;
@@ -708,12 +714,14 @@ where
                 cfg,
                 &mut |outcome| deliver(outcome, inject, &mut delivery),
             );
+            let mut captured = None;
             if let Some(ended) = blocks.take_ended() {
                 trace.apply_capture(ended.released_at, &ended.captured);
+                captured = Some(ended.captured);
             }
             trace.segments = Some(delivery.segments);
             trace.first_segment_at = delivery.first_segment_at;
-            trace
+            (trace, captured)
         }
     };
     let timing = worker.take_timing();
@@ -728,6 +736,12 @@ where
     trace.text_at = delivery.text_at;
     trace.injected = delivery.injected;
     trace.model_loads = worker.take_model_loads();
+    if let Some((capture, tap)) = debug {
+        match &captured {
+            Some(captured) => capture.write(trace.nr, captured, &tap.take()),
+            None => log::debug!("Debug-Mitschnitt: keine Rohaufnahme vorhanden"),
+        }
+    }
     (delivery.hint, trace)
 }
 
@@ -2471,6 +2485,7 @@ mod tests {
             utterance_job(&cfg),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(hint, None);
         assert_eq!(injected.borrow().as_slice(), ["[hallo]"]);
@@ -2492,6 +2507,7 @@ mod tests {
             utterance_job(&cfg),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(injected.borrow().as_slice(), ["hallo"]);
         assert!(trace.stt.is_some());
@@ -2510,6 +2526,7 @@ mod tests {
             utterance_job(&cfg),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(hint, Some("Nichts erkannt"));
         assert!(injected.borrow().is_empty());
@@ -2549,6 +2566,7 @@ mod tests {
             utterance_job(&cfg),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(hint, Some("Spracherkennung fehlgeschlagen"));
         assert!(injected.borrow().is_empty());
@@ -2581,6 +2599,7 @@ mod tests {
             utterance_job(&cfg),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(hint, Some("Cleanup übersprungen — Rohtext eingefügt"));
         assert_eq!(injected.borrow().as_slice(), ["hallo"]);
@@ -2593,7 +2612,7 @@ mod tests {
         let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
         let mut w = streaming_worker(&cfg, "hallo", &[]);
         let mut failing = |_: &str| Err(TalkerError::Keystroke("kein Zugriff".into()));
-        let (hint, trace) = process_job(&mut w, utterance_job(&cfg), &cfg, &mut failing);
+        let (hint, trace) = process_job(&mut w, utterance_job(&cfg), &cfg, &mut failing, None);
         assert_eq!(hint, Some("Einfügen fehlgeschlagen"));
         assert!(matches!(&trace.result, DictationResult::Error(e) if e.contains("kein Zugriff")));
     }
@@ -2618,6 +2637,7 @@ mod tests {
             live_job(&cfg, 4),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(hint, None);
         assert_eq!(
@@ -2650,6 +2670,7 @@ mod tests {
             live_job(&cfg, 2),
             &cfg,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(
             hint, None,
@@ -2677,7 +2698,7 @@ mod tests {
             },
         };
         let injected: Injected = Rc::default();
-        let (_, trace) = process_job(&mut w, job, &cfg, &mut recording_inject(&injected));
+        let (_, trace) = process_job(&mut w, job, &cfg, &mut recording_inject(&injected), None);
         assert_eq!(trace.released_at, None);
         assert_eq!(trace.recorded, None);
     }
@@ -2739,6 +2760,7 @@ mod tests {
             utterance_job(&business),
             &business,
             &mut recording_inject(&injected),
+            None,
         );
         assert_eq!(trace.model_loads.len(), 1);
         assert_eq!(trace.model_loads[0].0, ModelId::Gemma);
@@ -2758,12 +2780,14 @@ mod tests {
                 live_job(&cfg, 2),
                 &cfg,
                 &mut recording_inject(&injected),
+                None,
             );
             process_job(
                 &mut batch,
                 utterance_job(&batch_cfg),
                 &batch_cfg,
                 &mut recording_inject(&injected),
+                None,
             );
         });
         assert!(!lines.is_empty(), "auf Debug entstehen Detailzeilen");
@@ -2826,6 +2850,7 @@ mod tests {
                 live_job(&cfg, 4),
                 &cfg,
                 &mut recording_inject(&injected),
+                None,
             );
             report(trace);
         });
@@ -2843,5 +2868,152 @@ mod tests {
             .collect();
         assert!(detail.iter().any(|(_, l)| l.contains("Live-Chunk")));
         assert!(detail.iter().any(|(_, l)| l.contains("Live-Segment")));
+    }
+
+    // ---- Debug-Mitschnitt in process_job (T15) ----
+
+    struct DebugDir(PathBuf);
+    impl DebugDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("talker-job-debug-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn files(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&self.0)
+                .map(|d| {
+                    d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        }
+    }
+    impl Drop for DebugDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn debug_capture(dir: &Path) -> DebugCapture {
+        // Nie über die Umgebung: parallele Tests würden sich stören.
+        DebugCapture::from_var(dir.to_str()).unwrap()
+    }
+
+    /// REQ-DIAG-019/-022: Mitschnitt wird NACH dem Einfügen geschrieben; mic.wav = Rohaufnahme,
+    /// model.wav = Tap-Inhalt; Dateien tragen die Diktat-Nummer.
+    #[test]
+    fn debug_wavs_are_written_after_injection_with_the_dictation_number() {
+        let dir = DebugDir::new("order");
+        let capture = debug_capture(&dir.0);
+        let tap = ModelTap::default();
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let watched = dir.0.clone();
+        let tap_in_worker = tap.clone();
+        let seen_before_inject = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&seen_before_inject);
+        let mut inject = move |_: &str| {
+            *seen.borrow_mut() = Some(std::fs::read_dir(&watched).unwrap().count());
+            // Der Transcriber füllt den Tap während der Verarbeitung.
+            tap_in_worker.push(&[0.5; 100]);
+            Ok(())
+        };
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut inject,
+            Some((&capture, &tap)),
+        );
+        assert_eq!(
+            *seen_before_inject.borrow(),
+            Some(0),
+            "inject vor dem Schreiben"
+        );
+        assert_eq!(dir.files(), ["1-mic.wav", "1-model.wav"]);
+        assert_eq!(trace.nr, 1);
+        let mic = hound::WavReader::open(dir.0.join("1-mic.wav")).unwrap();
+        assert_eq!(mic.len(), 16_000);
+        let model = hound::WavReader::open(dir.0.join("1-model.wav")).unwrap();
+        assert_eq!(model.len(), 100);
+        assert!(tap.take().is_empty(), "der Tap wurde abgeholt");
+    }
+
+    /// Live: mic.wav stammt aus `End.captured`.
+    #[test]
+    fn live_job_writes_the_debug_wavs_from_the_end_capture() {
+        let dir = DebugDir::new("live");
+        let capture = debug_capture(&dir.0);
+        let tap = ModelTap::default();
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "Rest.", &[]);
+        let injected: Injected = Rc::default();
+        process_job(
+            &mut w,
+            live_job(&cfg, 2),
+            &cfg,
+            &mut recording_inject(&injected),
+            Some((&capture, &tap)),
+        );
+        assert_eq!(dir.files(), ["1-mic.wav", "1-model.wav"]);
+        let mic = hound::WavReader::open(dir.0.join("1-mic.wav")).unwrap();
+        assert_eq!(mic.len() as usize, 2 * crate::audio::CHUNK_16K_SAMPLES);
+    }
+
+    /// REQ-DIAG-021: nicht beschreibbares Verzeichnis → Warnung, Text wurde normal eingefügt.
+    #[test]
+    fn unwritable_debug_dir_does_not_affect_the_inserted_text() {
+        let dir = DebugDir::new("blocked");
+        let blocker = dir.0.join("datei");
+        std::fs::write(&blocker, "x").unwrap();
+        let capture = debug_capture(&blocker.join("unter"));
+        let tap = ModelTap::default();
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        let ((hint, trace), lines) = crate::logging::capture(|| {
+            process_job(
+                &mut w,
+                utterance_job(&cfg),
+                &cfg,
+                &mut recording_inject(&injected),
+                Some((&capture, &tap)),
+            )
+        });
+        assert_eq!(hint, None);
+        assert_eq!(injected.borrow().as_slice(), ["hallo"]);
+        assert_eq!(trace.result, DictationResult::Inserted);
+        assert!(lines.iter().any(|(l, _)| *l == log::Level::Warn));
+    }
+
+    /// REQ-DIAG-022/REQ-DICT-003: ohne Debug (None) wird nichts auf die Platte geschrieben.
+    #[test]
+    fn without_debug_nothing_is_written() {
+        let dir = DebugDir::new("none");
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert!(dir.files().is_empty());
+    }
+
+    /// AK-16: im Audio-Modul gibt es keine Datei-I/O (kein Schreiben im Callback-Pfad).
+    #[test]
+    fn audio_module_has_no_file_writing() {
+        let source = include_str!("audio.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for forbidden in ["WavWriter", "std::fs", "File::create", "OpenOptions"] {
+            assert!(!production.contains(forbidden), "{forbidden} in audio.rs");
+        }
     }
 }

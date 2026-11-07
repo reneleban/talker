@@ -3,6 +3,7 @@
 //! absichtlich kein Textfeld — Transcript-Text kann nie in die Zeile gelangen.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,70 @@ pub type TraceReport = Arc<dyn Fn(DictationTrace) + Send + Sync>;
 /// Der Report der App: genau eine Zeile je Dictation auf `info`, Ziel `talker::messung`.
 pub fn log_report() -> TraceReport {
     Arc::new(|trace| log::info!(target: "talker::messung", "{trace}"))
+}
+
+/// Debug-Mitschnitt (REQ-DIAG-019 … 022): nur mit `TALKER_DEBUG_WAV_DIR`. Schreibt je Dictation
+/// `<nr>-mic.wav` (Rohblöcke im Geräteformat) und `<nr>-model.wav` (Modell-Eingang, 16 kHz mono),
+/// beide 32-bit Float. Läuft nie im Audio-Callback und nie vor dem Einfügen.
+pub struct DebugCapture {
+    dir: PathBuf,
+}
+
+impl DebugCapture {
+    pub fn from_env() -> Option<Self> {
+        Self::from_var(std::env::var("TALKER_DEBUG_WAV_DIR").ok().as_deref())
+    }
+
+    /// Leer oder nicht gesetzt → kein Mitschnitt.
+    pub(crate) fn from_var(value: Option<&str>) -> Option<Self> {
+        value.filter(|v| !v.trim().is_empty()).map(|v| Self {
+            dir: PathBuf::from(v),
+        })
+    }
+
+    /// Schreibt beide Dateien; Fehler werden zur Warnung, nie zum Panic oder Abbruch.
+    pub fn write(&self, nr: u64, mic: &Captured, model: &[f32]) {
+        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+            log::warn!(
+                "Debug-Mitschnitt: {} nicht anlegbar ({e})",
+                self.dir.display()
+            );
+            return;
+        }
+        let float_spec = |channels: u16, sample_rate: u32| hound::WavSpec {
+            channels: channels.max(1),
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let format = mic.info.format;
+        write_wav(
+            &self.dir.join(format!("{nr}-mic.wav")),
+            float_spec(format.channels, format.sample_rate),
+            &mic.raw,
+        );
+        write_wav(
+            &self.dir.join(format!("{nr}-model.wav")),
+            float_spec(1, crate::audio::TARGET_SAMPLE_RATE),
+            model,
+        );
+    }
+}
+
+fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
+    let result = (|| -> Result<(), hound::Error> {
+        let mut writer = hound::WavWriter::create(path, spec)?;
+        for &sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()
+    })();
+    if let Err(e) = result {
+        log::warn!(
+            "Debug-Mitschnitt: {} nicht schreibbar ({e})",
+            path.display()
+        );
+    }
 }
 
 const MISSING: &str = "—";
@@ -487,5 +552,197 @@ mod tests {
         assert_eq!(t.first_block_at, at(380));
         assert_eq!(t.first_signal_at, None);
         assert_eq!(t.device.unwrap().device, "Mikro");
+    }
+
+    // ---- DebugCapture ----
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "talker-debug-test-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn captured(raw: Vec<f32>, channels: u16, sample_rate: u32) -> Captured {
+        Captured {
+            raw,
+            info: SourceInfo {
+                format: AudioFormat {
+                    channels,
+                    sample_rate,
+                },
+                device: "Mikro".into(),
+            },
+            marks: crate::audio::StartMarks::default(),
+        }
+    }
+
+    fn read_wav(path: &Path) -> (hound::WavSpec, Vec<f32>) {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        let spec = reader.spec();
+        (spec, reader.samples::<f32>().map(Result::unwrap).collect())
+    }
+
+    /// REQ-DIAG-022: ohne (oder mit leerer) Variable kein Mitschnitt.
+    #[test]
+    fn debug_capture_needs_a_non_empty_directory_variable() {
+        assert!(DebugCapture::from_var(None).is_none());
+        assert!(DebugCapture::from_var(Some("")).is_none());
+        assert!(DebugCapture::from_var(Some("   ")).is_none());
+        assert!(DebugCapture::from_var(Some("/tmp/x")).is_some());
+    }
+
+    /// REQ-DIAG-019: mic.wav im Geräteformat bitgleich, model.wav 16 kHz mono, beide 32-bit Float.
+    #[test]
+    fn writes_mic_and_model_wavs_bit_identical() {
+        let t = TestDir::new();
+        let raw = vec![
+            0.0,
+            -0.0,
+            0.25,
+            -1.0,
+            1e-30,
+            f32::MIN_POSITIVE,
+            0.999_999,
+            0.5,
+        ];
+        let model: Vec<f32> = (0..32_000).map(|i| (i as f32 / 32_000.0) - 0.5).collect();
+        let capture = DebugCapture::from_var(t.0.to_str()).unwrap();
+        capture.write(17, &captured(raw.clone(), 2, 44_100), &model);
+
+        let (spec, mic) = read_wav(&t.0.join("17-mic.wav"));
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (2, 44_100, 32)
+        );
+        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+        assert_eq!(
+            mic.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            raw.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+        let (spec, got) = read_wav(&t.0.join("17-model.wav"));
+        assert_eq!(
+            (spec.channels, spec.sample_rate, spec.bits_per_sample),
+            (1, 16_000, 32)
+        );
+        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+        assert_eq!(got, model);
+    }
+
+    /// REQ-DIAG-021: fehlendes (auch verschachteltes) Verzeichnis wird angelegt.
+    #[test]
+    fn creates_a_missing_nested_directory() {
+        let t = TestDir::new();
+        let nested = t.0.join("a/b/c");
+        DebugCapture::from_var(nested.to_str()).unwrap().write(
+            1,
+            &captured(vec![0.5], 1, 16_000),
+            &[0.5],
+        );
+        assert!(nested.join("1-mic.wav").is_file() && nested.join("1-model.wav").is_file());
+    }
+
+    /// Grenzfall: 0 Samples → gültige, leere WAVs.
+    #[test]
+    fn empty_recording_gives_valid_empty_wavs() {
+        let t = TestDir::new();
+        DebugCapture::from_var(t.0.to_str())
+            .unwrap()
+            .write(2, &captured(vec![], 1, 48_000), &[]);
+        assert!(read_wav(&t.0.join("2-mic.wav")).1.is_empty());
+        assert!(read_wav(&t.0.join("2-model.wav")).1.is_empty());
+    }
+
+    /// Grenzfall: 60-s-Utterance vollständig, Sample-Zahl exakt.
+    #[test]
+    fn sixty_second_utterance_is_written_completely() {
+        let t = TestDir::new();
+        let raw = vec![0.1; 16_000 * 60];
+        DebugCapture::from_var(t.0.to_str()).unwrap().write(
+            3,
+            &captured(raw, 1, 16_000),
+            &vec![0.2; 16_000 * 62],
+        );
+        assert_eq!(
+            hound::WavReader::open(t.0.join("3-mic.wav")).unwrap().len(),
+            960_000
+        );
+        assert_eq!(
+            hound::WavReader::open(t.0.join("3-model.wav"))
+                .unwrap()
+                .len(),
+            992_000
+        );
+    }
+
+    /// „Darf nicht passieren": bestehende Dateien werden nicht gelöscht oder angefasst.
+    #[test]
+    fn existing_files_in_the_directory_are_left_alone() {
+        let t = TestDir::new();
+        std::fs::write(t.0.join("alt.wav"), "alt").unwrap();
+        DebugCapture::from_var(t.0.to_str()).unwrap().write(
+            4,
+            &captured(vec![0.5], 1, 16_000),
+            &[0.5],
+        );
+        assert_eq!(std::fs::read_to_string(t.0.join("alt.wav")).unwrap(), "alt");
+    }
+
+    /// REQ-DIAG-021: nicht anlegbar → Warnung, kein Panic, keine Dateien.
+    #[test]
+    fn unusable_directory_warns_instead_of_failing() {
+        let t = TestDir::new();
+        let blocker = t.0.join("datei");
+        std::fs::write(&blocker, "x").unwrap();
+        let capture = DebugCapture::from_var(blocker.join("sub").to_str()).unwrap();
+        let (_, lines) = crate::logging::capture(|| {
+            capture.write(5, &captured(vec![0.5], 1, 16_000), &[0.5]);
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|(l, text)| *l == log::Level::Warn && text.contains("Debug-Mitschnitt"))
+        );
+    }
+
+    /// Eine unbeschreibbare Datei (Verzeichnis statt Datei) → Warnung je Datei, kein Panic.
+    #[test]
+    fn unwritable_file_warns() {
+        let t = TestDir::new();
+        std::fs::create_dir(t.0.join("6-mic.wav")).unwrap();
+        let (_, lines) = crate::logging::capture(|| {
+            DebugCapture::from_var(t.0.to_str()).unwrap().write(
+                6,
+                &captured(vec![0.5], 1, 16_000),
+                &[0.5],
+            );
+        });
+        assert!(lines.iter().any(|(l, _)| *l == log::Level::Warn));
+        assert!(t.0.join("6-model.wav").is_file());
+    }
+
+    /// 0 Kanäle (unbrauchbare Quelle) → kein Panic im Mitschnitt.
+    #[test]
+    fn zero_channels_do_not_panic() {
+        let t = TestDir::new();
+        DebugCapture::from_var(t.0.to_str()).unwrap().write(
+            7,
+            &captured(vec![0.5], 0, 16_000),
+            &[],
+        );
     }
 }

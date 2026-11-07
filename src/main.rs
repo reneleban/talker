@@ -57,18 +57,27 @@ fn spawn_stt_worker(
         let snapshot = |cfg: &Arc<RwLock<config::Config>>| cfg.read().map(|c| c.clone()).ok();
 
         let Some(cfg) = snapshot(&config) else { return };
+        // Debug-Mitschnitt nur mit TALKER_DEBUG_WAV_DIR; der Tap nur dann (REQ-DIAG-022).
+        let debug = talker::diagnostics::DebugCapture::from_env();
+        let tap = debug.as_ref().map(|_| stt::ModelTap::default());
         let mut worker = pipeline::DictationWorker::new(
             &cfg,
             models_state,
             Box::new({
                 let config = Arc::clone(&config);
+                let tap = tap.clone();
                 move |dir: &std::path::Path| {
                     let pause = config
                         .read()
                         .map_or(config::DEFAULT_ENDPOINT_SILENCE_MS, |c| {
                             c.endpoint_silence_ms
                         });
-                    stt::NemotronTranscriber::with_endpoint_silence(dir, pause)
+                    stt::NemotronTranscriber::with_endpoint_silence(dir, pause).map(
+                        |t| match &tap {
+                            Some(tap) => t.with_model_tap(tap.clone()),
+                            None => t,
+                        },
+                    )
                 }
             }),
             Box::new(try_load_cleaner),
@@ -88,7 +97,13 @@ fn spawn_stt_worker(
                 report(&|ind| ind.fail(Instant::now(), "Interner Fehler (Config)"));
                 continue;
             };
-            let (hint, trace) = pipeline::process_job(&mut worker, job, &cfg, &mut inject);
+            let (hint, trace) = pipeline::process_job(
+                &mut worker,
+                job,
+                &cfg,
+                &mut inject,
+                debug.as_ref().zip(tap.as_ref()),
+            );
             trace_report(trace);
             match hint {
                 Some(hint) => report(&|ind| ind.fail(Instant::now(), hint)),
