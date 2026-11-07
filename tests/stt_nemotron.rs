@@ -279,15 +279,17 @@ fn since_press(trace: &DictationTrace, at: Option<HostInstant>) -> String {
     )
 }
 
-/// REQ-DIAG-032: das erste Referenzwort steht am Anfang des Ergebnisses.
+/// REQ-DIAG-032: das erste Referenzwort steht am Anfang des Ergebnisses. Prüft nur „die Pipeline
+/// verliert nichts, was die Quelle liefert“; die Startverzögerungen 0/100/300 ms prüft der CI-Test
+/// `e2e_no_sample_is_lost_for_any_start_delay_and_format` (AK-20).
 /// Schlägt mit einer Tabelle (erwartet / erkannt / →erstes Signal) fehl, wenn nicht.
-fn assert_first_word_present(start_delay_ms: u64, insert_mode: InsertMode, set: FixtureSet) {
+fn assert_first_word_present(insert_mode: InsertMode, set: FixtureSet) {
     let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut worker = worker();
     let mut failures = Vec::new();
     for (name, wav) in fixtures(set) {
         let expected = first_word(&reference(&wav)).expect("Referenz ohne Wort");
-        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), start_delay_ms, insert_mode);
+        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), 0, insert_mode);
         let result = pieces.concat();
         let got = normalize_words(&result).into_iter().next();
         if got.as_deref() != Some(expected.as_str()) {
@@ -298,117 +300,53 @@ fn assert_first_word_present(start_delay_ms: u64, insert_mode: InsertMode, set: 
             ));
         }
     }
-    println!(
-        "{set:?} · {} ms · {insert_mode:?}: {} Fehlfälle",
-        start_delay_ms,
-        failures.len()
-    );
+    println!("{set:?} · {insert_mode:?}: {} Fehlfälle", failures.len());
     assert!(
         failures.is_empty(),
-        "erstes Wort fehlt ({start_delay_ms} ms, {insert_mode:?}, {set:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
+        "erstes Wort fehlt ({insert_mode:?}, {set:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
         failures.join("\n")
     );
 }
 
 macro_rules! first_word_case {
-    ($name:ident, $delay:expr, $mode:expr, $set:expr) => {
+    ($name:ident, $mode:expr, $set:expr) => {
         #[test]
         fn $name() {
-            assert_first_word_present($delay, $mode, $set);
+            assert_first_word_present($mode, $set);
         }
     };
-    ($name:ident, $delay:expr, $mode:expr, $set:expr, ignore = $reason:expr) => {
+    ($name:ident, $mode:expr, $set:expr, ignore = $reason:expr) => {
         #[test]
         #[ignore = $reason]
         fn $name() {
-            assert_first_word_present($delay, $mode, $set);
+            assert_first_word_present($mode, $set);
         }
     };
 }
 
 first_word_case!(
-    first_word_at_end_say_0ms,
-    0,
+    first_word_at_end_say,
     InsertMode::AtEnd,
     FixtureSet::Say,
     ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 90 ms, Behebung in 0039"
 );
 first_word_case!(
-    first_word_at_end_say_100ms,
-    100,
-    InsertMode::AtEnd,
-    FixtureSet::Say,
-    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 190 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_at_end_say_300ms,
-    300,
-    InsertMode::AtEnd,
-    FixtureSet::Say,
-    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 390 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_at_end_fleurs_0ms,
-    0,
+    first_word_at_end_fleurs,
     InsertMode::AtEnd,
     FixtureSet::Fleurs,
     ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 30 ms, Behebung in 0039"
 );
 first_word_case!(
-    first_word_at_end_fleurs_100ms,
-    100,
-    InsertMode::AtEnd,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 130 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_at_end_fleurs_300ms,
-    300,
-    InsertMode::AtEnd,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 330 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_per_sentence_say_0ms,
-    0,
+    first_word_per_sentence_say,
     InsertMode::PerSentence,
     FixtureSet::Say,
     ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 90 ms, Behebung in 0039"
 );
 first_word_case!(
-    first_word_per_sentence_say_100ms,
-    100,
-    InsertMode::PerSentence,
-    FixtureSet::Say,
-    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 190 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_per_sentence_say_300ms,
-    300,
-    InsertMode::PerSentence,
-    FixtureSet::Say,
-    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 390 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_per_sentence_fleurs_0ms,
-    0,
+    first_word_per_sentence_fleurs,
     InsertMode::PerSentence,
     FixtureSet::Fleurs,
     ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 30 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_per_sentence_fleurs_100ms,
-    100,
-    InsertMode::PerSentence,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 130 ms, Behebung in 0039"
-);
-first_word_case!(
-    first_word_per_sentence_fleurs_300ms,
-    300,
-    InsertMode::PerSentence,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 330 ms, Behebung in 0039"
 );
 
 /// REQ-DIAG-033: zwei Sätze mit kurzer Pause, Satzweise → das erste Wort des zweiten Satzes
