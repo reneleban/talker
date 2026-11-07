@@ -113,7 +113,7 @@ impl DebugCapture {
 
 /// Legt die Datei nur neu an (0600, kein Symlink-Folgen); eine vorhandene wird nie überschrieben.
 fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
-    let result = (|| -> Result<(), WriteError> {
+    let result = (|| -> Result<(), hound::Error> {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -124,7 +124,7 @@ fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
         for &sample in samples {
             writer.write_sample(sample)?;
         }
-        Ok(writer.finalize()?)
+        writer.finalize()
     })();
     if let Err(e) = result {
         log::warn!(
@@ -132,14 +132,6 @@ fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
             path.display()
         );
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum WriteError {
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-    #[error("{0}")]
-    Wav(#[from] hound::Error),
 }
 
 const MISSING: &str = "—";
