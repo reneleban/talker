@@ -1,8 +1,9 @@
 //! Logging (ADR-0011): `log`-Fassade, eigener Datei-Logger mit Rotation.
 
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +42,11 @@ fn log_path(dir: &Path, index: usize) -> PathBuf {
 impl RotatingFile {
     /// Öffnet `talker.log` im Anhängemodus; die Größe kommt aus der Dateilänge.
     pub fn open(dir: &Path, max_bytes: u64, keep: usize) -> io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(log_path(dir, 0))?;
         let size = file.metadata()?.len();
         Ok(Self {
@@ -75,6 +77,7 @@ impl RotatingFile {
             .create(true)
             .write(true)
             .truncate(true)
+            .mode(0o600)
             .open(log_path(&self.dir, 0))?;
         self.size = 0;
         Ok(())
@@ -245,27 +248,26 @@ impl LogSink for StderrSink {
     }
 }
 
-/// `TALKER_LOG` gegen den Config-Wert auflösen: gültig übersteuert, leer gilt als nicht
-/// gesetzt, ungültig → Config-Wert plus Warntext (REQ-DIAG-006/-007).
-pub fn resolve_level(env: Option<&str>, cfg: LogLevel) -> (LogLevel, Option<String>) {
+/// `TALKER_LOG` gegen den Config-Wert auflösen: gültig übersteuert (`Some` im Override), leer
+/// gilt als nicht gesetzt, ungültig → Config-Wert plus Warntext (REQ-DIAG-006/-007).
+pub fn resolve_level(
+    env: Option<&str>,
+    cfg: LogLevel,
+) -> (LogLevel, Option<LogLevel>, Option<String>) {
     match env {
-        None => (cfg, None),
-        Some(raw) if raw.trim().is_empty() => (cfg, None),
+        None => (cfg, None, None),
+        Some(raw) if raw.trim().is_empty() => (cfg, None, None),
         Some(raw) => match LogLevel::parse_env(raw) {
-            Some(level) => (level, None),
+            Some(level) => (level, Some(level), None),
             None => (
                 cfg,
+                None,
                 Some(format!(
-                    "TALKER_LOG=\"{raw}\" ungültig (erlaubt: error, warn, info, debug) — nutze log_level aus der Config"
+                    "TALKER_LOG={raw:?} ungültig (erlaubt: error, warn, info, debug) — nutze log_level aus der Config"
                 )),
             ),
         },
     }
-}
-
-/// Der Grad, den `apply_config_level` setzen würde; `None` bei gültigem Env-Override.
-fn level_to_apply(env_override: Option<LogLevel>, cfg: LogLevel) -> Option<LogLevel> {
-    env_override.is_none().then_some(cfg)
 }
 
 fn to_filter(level: LogLevel) -> LevelFilter {
@@ -278,18 +280,10 @@ fn to_filter(level: LogLevel) -> LevelFilter {
 }
 
 static ENV_OVERRIDE: OnceLock<Option<LogLevel>> = OnceLock::new();
-static ENV_WARNING: OnceLock<Option<String>> = OnceLock::new();
 
 /// Gültiges `TALKER_LOG` dieses Prozesses (für die Settings-Sperre).
 pub fn env_override() -> Option<LogLevel> {
     ENV_OVERRIDE.get().copied().flatten()
-}
-
-/// Warnt (über den Logger), falls `TALKER_LOG` ungültig war; nach `Config::load()` aufrufen.
-pub fn warn_if_env_invalid() {
-    if let Some(Some(text)) = ENV_WARNING.get() {
-        log::warn!(target: "talker::logging", "{text}");
-    }
 }
 
 /// Setzt den Grad aus der Config; No-op, solange `TALKER_LOG` gültig übersteuert.
@@ -299,56 +293,55 @@ pub fn apply_config_level(level: LogLevel) {
 
 /// Wie [`apply_config_level`] mit explizitem Override; liefert den gesetzten Filter.
 pub(crate) fn apply_level(env_override: Option<LogLevel>, cfg: LogLevel) -> Option<LevelFilter> {
-    let filter = to_filter(level_to_apply(env_override, cfg)?);
+    if env_override.is_some() {
+        return None;
+    }
+    let filter = to_filter(cfg);
     log::set_max_level(filter);
     Some(filter)
 }
 
+/// `<home>/Library/Logs/talker`; ohne absolutes HOME `None` (sonst würde ein relativer Pfad
+/// je nach Arbeitsverzeichnis, z. B. `/Library/Logs`, geschrieben).
+fn log_dir_from(home: Option<OsString>) -> Option<PathBuf> {
+    let home = PathBuf::from(home?);
+    home.is_absolute().then(|| home.join("Library/Logs/talker"))
+}
+
 /// `~/Library/Logs/talker`.
-pub fn default_log_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join("Library/Logs/talker")
+pub fn default_log_dir() -> Option<PathBuf> {
+    log_dir_from(std::env::var_os("HOME"))
 }
 
-/// `~/Library/Logs/talker/talker.log`.
-pub fn log_file_path() -> PathBuf {
-    default_log_dir().join("talker.log")
-}
-
-fn build_logger(dir: &Path) -> (Logger, LogInit) {
-    match RotatingFile::open(dir, MAX_BYTES, KEEP) {
-        Ok(file) => (Logger::spawn(Box::new(file), QUEUE_CAPACITY), LogInit::File),
-        Err(e) => {
-            eprintln!(
-                "talker: Logdatei in {} nicht nutzbar ({e}) — logge auf stderr",
-                dir.display()
-            );
-            (
-                Logger::spawn(Box::new(StderrSink), QUEUE_CAPACITY),
-                LogInit::Stderr,
-            )
-        }
-    }
+fn build_logger(dir: Option<&Path>) -> (Logger, LogInit) {
+    let reason = match dir {
+        Some(dir) => match RotatingFile::open(dir, MAX_BYTES, KEEP) {
+            Ok(file) => return (Logger::spawn(Box::new(file), QUEUE_CAPACITY), LogInit::File),
+            Err(e) => format!("in {} nicht nutzbar ({e})", dir.display()),
+        },
+        None => "ohne absolutes HOME nicht anlegbar".to_string(),
+    };
+    eprintln!("talker: Logdatei {reason} — logge auf stderr");
+    (
+        Logger::spawn(Box::new(StderrSink), QUEUE_CAPACITY),
+        LogInit::Stderr,
+    )
 }
 
 /// Installiert den Logger (einmal, vor `Config::load()`). Grad zunächst `TALKER_LOG`
-/// bzw. Info; die Config setzt danach `apply_config_level`.
-pub fn init(log_dir: &Path) -> LogInit {
+/// bzw. Info; die Config setzt danach `apply_config_level`. Ohne Log-Verzeichnis (`None`)
+/// oder bei Fehler geht das Log auf stderr.
+pub fn init(log_dir: Option<&Path>) {
     let env = std::env::var("TALKER_LOG").ok();
-    let (level, warning) = resolve_level(env.as_deref(), LogLevel::Info);
-    let _ = ENV_OVERRIDE.set(
-        env.as_deref()
-            .filter(|_| warning.is_none())
-            .and_then(LogLevel::parse_env),
-    );
-    let _ = ENV_WARNING.set(warning);
-    let (logger, result) = build_logger(log_dir);
+    let (level, env_level, warning) = resolve_level(env.as_deref(), LogLevel::Info);
+    let _ = ENV_OVERRIDE.set(env_level);
+    let (logger, _) = build_logger(log_dir);
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
         log::set_max_level(to_filter(level));
     }
-    result
+    if let Some(text) = warning {
+        log::warn!(target: "talker::logging", "{text}");
+    }
 }
 
 /// Argumente für `open`: Datei vorhanden → `-R <datei>` (im Finder markieren), sonst Ordner.
@@ -362,7 +355,11 @@ fn reveal_args(dir: &Path, file: &Path) -> Vec<OsString> {
 
 /// Zeigt `talker.log` im Finder (REQ-DIAG-008).
 pub fn reveal_in_finder() {
-    let args = reveal_args(&default_log_dir(), &log_file_path());
+    let Some(dir) = default_log_dir() else {
+        log::warn!(target: "talker::logging", "Kein Log-Verzeichnis (HOME fehlt oder ist relativ)");
+        return;
+    };
+    let args = reveal_args(&dir, &dir.join("talker.log"));
     if let Err(e) = std::process::Command::new("open").args(args).spawn() {
         log::warn!(target: "talker::logging", "Finder konnte nicht geöffnet werden: {e}");
     }
@@ -791,41 +788,81 @@ mod tests {
     #[test]
     fn env_level_resolution_table() {
         use LogLevel::*;
-        assert_eq!(resolve_level(None, Warn), (Warn, None));
-        assert_eq!(resolve_level(Some("debug"), Warn), (Debug, None));
-        assert_eq!(resolve_level(Some(" ERROR "), Info), (Error, None));
-        assert_eq!(resolve_level(Some(""), Warn), (Warn, None));
-        assert_eq!(resolve_level(Some("   "), Warn), (Warn, None));
-        let (level, warning) = resolve_level(Some("laut"), Warn);
-        assert_eq!(level, Warn);
+        assert_eq!(resolve_level(None, Warn), (Warn, None, None));
+        assert_eq!(
+            resolve_level(Some("debug"), Warn),
+            (Debug, Some(Debug), None)
+        );
+        assert_eq!(
+            resolve_level(Some(" ERROR "), Info),
+            (Error, Some(Error), None)
+        );
+        assert_eq!(resolve_level(Some(""), Warn), (Warn, None, None));
+        assert_eq!(resolve_level(Some("   "), Warn), (Warn, None, None));
+        let (level, over, warning) = resolve_level(Some("laut"), Warn);
+        assert_eq!((level, over), (Warn, None));
         assert!(warning.unwrap().contains("TALKER_LOG"));
+    }
+
+    /// SEC-6: Zeilenumbrüche im ungültigen Wert können keine Logzeile fälschen.
+    #[test]
+    fn invalid_env_value_is_escaped_in_the_warning() {
+        let (_, _, warning) = resolve_level(Some("x\n2026-01-01 ERROR fake"), LogLevel::Info);
+        let warning = warning.unwrap();
+        assert!(!warning.contains('\n'));
+        assert!(warning.contains("\\n"));
     }
 
     /// REQ-DIAG-006: Config-Änderung wirkt nur ohne gültigen Env-Override.
     #[test]
     fn config_level_is_ignored_while_env_overrides() {
-        assert_eq!(level_to_apply(None, LogLevel::Debug), Some(LogLevel::Debug));
-        assert_eq!(level_to_apply(Some(LogLevel::Error), LogLevel::Debug), None);
+        assert_eq!(apply_level(Some(LogLevel::Error), LogLevel::Debug), None);
         assert_eq!(to_filter(LogLevel::Error), LevelFilter::Error);
         assert_eq!(to_filter(LogLevel::Debug), LevelFilter::Debug);
     }
 
     #[test]
-    fn default_paths_end_in_library_logs_talker() {
-        assert!(default_log_dir().ends_with("Library/Logs/talker"));
-        assert!(log_file_path().ends_with("Library/Logs/talker/talker.log"));
+    fn default_dir_is_library_logs_talker_below_an_absolute_home() {
+        let dir = log_dir_from(Some(OsString::from("/Users/x"))).unwrap();
+        assert_eq!(dir, PathBuf::from("/Users/x/Library/Logs/talker"));
+    }
+
+    /// SEC-3: ohne HOME oder mit relativem HOME gibt es kein Log-Verzeichnis (→ stderr).
+    #[test]
+    fn missing_empty_or_relative_home_gives_no_log_dir() {
+        assert_eq!(log_dir_from(None), None);
+        assert_eq!(log_dir_from(Some(OsString::new())), None);
+        assert_eq!(log_dir_from(Some(OsString::from("home/x"))), None);
+        let (_, init) = build_logger(None);
+        assert_eq!(init, LogInit::Stderr);
+    }
+
+    /// SEC-2: Verzeichnis 0700, Dateien 0600 — auch die nach einer Rotation neu angelegte.
+    #[test]
+    fn log_dir_and_files_are_private_also_after_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TestDir::new();
+        let dir = t.0.join("a/logs");
+        let mut f = RotatingFile::open(&dir, 10, 2).unwrap();
+        f.write_line(&line(10, 'a')).unwrap();
+        f.write_line(&line(10, 'b')).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&t.0.join("a")), 0o700);
+        assert_eq!(mode(&dir.join("talker.log")), 0o600);
+        assert_eq!(mode(&dir.join("talker.1.log")), 0o600);
     }
 
     /// REQ-DIAG-010: Verzeichnis nicht nutzbar → stderr-Fallback, kein Panic.
     #[test]
     fn unusable_log_dir_falls_back_to_stderr() {
         let t = TestDir::new();
-        let (_, ok) = build_logger(&t.0.join("logs"));
+        let (_, ok) = build_logger(Some(&t.0.join("logs")));
         assert_eq!(ok, LogInit::File);
         // Datei statt Verzeichnis: nicht anlegbar, auch als root.
         let blocker = t.0.join("datei");
         std::fs::write(&blocker, "x").unwrap();
-        let (_, fallback) = build_logger(&blocker.join("logs"));
+        let (_, fallback) = build_logger(Some(&blocker.join("logs")));
         assert_eq!(fallback, LogInit::Stderr);
     }
 
@@ -853,7 +890,8 @@ mod tests {
         }
     }
 
-    /// REQ-DIAG-010: kein `eprintln!` in `src/` außer dem stderr-Fallback in `logging.rs`.
+    /// REQ-DIAG-010: kein `eprintln!` in `src/` außer den drei Stellen des stderr-Fallbacks
+    /// in `logging.rs` (Writer-Fehler, StderrSink, nicht nutzbares Verzeichnis).
     #[test]
     fn no_eprintln_outside_the_stderr_fallback() {
         let mut files = Vec::new();
@@ -871,5 +909,10 @@ mod tests {
             .filter(|f| std::fs::read_to_string(f).unwrap().contains("eprintln!"))
             .collect();
         assert!(offenders.is_empty(), "eprintln! in {offenders:?}");
+        let logging =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logging.rs"))
+                .unwrap();
+        let production = logging.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(production.matches("eprintln!").count(), 3);
     }
 }

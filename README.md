@@ -164,7 +164,10 @@ Nicht erreichte Messpunkte stehen als `—`. Satzweise/Wortgruppenweise ergänze
 **Debug-Mitschnitt.** Nur mit gesetzter Umgebungsvariable `TALKER_DEBUG_WAV_DIR` schreibt talker
 je Diktat `<nr>-mic.wav` (rohe Mikrofon-Blöcke im Geräteformat) und `<nr>-model.wav` (exakt der
 Modell-Eingang, 16 kHz mono) in dieses Verzeichnis (32-bit Float; `<nr>` = Nummer der Messzeile).
-Das Verzeichnis wird angelegt, Dateien werden nie gelöscht. Ohne die Variable schreibt talker
+Das Verzeichnis wird (0700) angelegt, die Dateien sind nur für dich lesbar (0600). Dateien werden nie
+gelöscht oder überschrieben: Gibt es `<nr>-mic.wav` schon (die Nummer beginnt bei jedem App-Start
+wieder bei 1), warnt talker im Log und schreibt sie nicht — nimm ein leeres Verzeichnis je Sitzung.
+Bei aktivem Mitschnitt steht beim Start eine Warnung im Log. Ohne die Variable schreibt talker
 kein Audio auf die Platte. Beim Bundle über `open` starten:
 
 ```sh
@@ -174,7 +177,10 @@ open --env TALKER_DEBUG_WAV_DIR="$HOME/talker-debug" ~/Applications/talker.app
 **Messreihe.** `make latency-eval` verarbeitet alle STT-Fixtures je Am Ende/Satzweise ×
 Roh/Natürlich ohne Einfügen und gibt eine Markdown-Tabelle mit p50/p95 aus. `N=<zahl>` setzt
 die Läufe je Fall (Default 10, dazu ein verworfener Aufwärmlauf), `LATENCY_OUT=<datei>` schreibt
-die Tabelle zusätzlich in eine Datei. Braucht das Nemotron- und das Gemma-Modell.
+die Tabelle zusätzlich in eine Datei. `N=3` ist der Schnelllauf; `N=10` dauert über 30 Minuten,
+weil Satzweise im Echtzeittakt läuft. Die Spalte „je Audio-s“ setzt `Loslassen→Text` ins
+Verhältnis zur Clip-Länge (die Latenz am Ende wächst mit ihr). Braucht das Nemotron-Modell;
+ohne Gemma laufen nur die Roh-Fälle, die Natürlich-Fälle stehen unter „Übersprungen“.
 
 **Fixtures.** Die zehn FLEURS-Clips (`tests/fixtures/stt/fleurs-de-*`, CC-BY-4.0, siehe
 `tests/fixtures/stt/ATTRIBUTION.md`) erzeugt `scripts/fetch_fleurs_fixtures.sh` neu; das
