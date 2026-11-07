@@ -984,7 +984,8 @@ mod tests {
         assert!(cleaned.cleanup.is_some());
     }
 
-    /// AK-22 (PERF-5), REQ-DIAG-034 AK-2: Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh den Cleaner-Handle verworfen hat.
+    /// AK-22 (PERF-5), REQ-DIAG-034 AK-2: Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh
+    /// das Cleaner-Handle verworfen hat.
     #[test]
     fn casual_cases_get_cleanup_after_raw_dropped_the_cleaner() {
         let fx = TempFixtures::new("natuerlich");
