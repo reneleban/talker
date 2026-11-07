@@ -38,10 +38,10 @@ lacks() { if grep -Eq -e "$3" "$2"; then fail "$1 ($2: '$3' kommt vor)"; else ok
 FORBIDDEN='SendMessage|ListAgents|osascript|/tmp/cc-socks'
 
 # Gemeinsam für jede Rolle (AK-16, AK-22): kein altes Messaging, Meldung über say.sh
-agent_common() { # <rolle>
+agent_common() { # <rolle> [muster für die Meldung, Default: an den Orchestrator]
   f=$AGENTS_DIR/$1.md
   lacks "AK-16 $1: kein SendMessage/ListAgents/osascript/cc-socks" "$f" "$FORBIDDEN"
-  has "AK-16 $1: Meldung über say.sh" "$f" 'scripts/team/say\.sh orchestrator'
+  has "AK-16 $1: Meldung über say.sh" "$f" "${2:-scripts/team/say[.]sh orchestrator}"
 }
 
 # --- T13: tech-lead.md (AK-15, AK-16, AK-20) ---
@@ -57,5 +57,38 @@ has "AK-20 tech-lead: Task nennt Dateien" "$f" 'Dateien:'
 has "AK-20 tech-lead: Task nennt hängt ab von" "$f" 'hängt ab von:'
 has "AK-22 tech-lead: Akte nur per Edit, nie Write" "$f" 'nie `Write`'
 has "Rückfall tech-lead: letzte Abschnittszeile fertig/blockiert" "$f" 'letzte Zeile.*(fertig|blockiert)'
+
+# --- T14: orchestrator.md und merger.md (AK-16, 19, 20, 21, 22, 23) ---
+f=$AGENTS_DIR/orchestrator.md
+agent_common orchestrator 'scripts/team/say[.]sh'
+lacks "AK-16 orchestrator: keine Ghostty-Kacheln mehr" "$f" 'Ghostty|Kachel'
+case $(fm_line "$f" tools) in *Bash*) ok "orchestrator: Bash in tools" ;; *) fail "orchestrator: Bash in tools" ;; esac
+has "AK-20 orchestrator: Welle" "$f" 'Welle'
+has "AK-20 orchestrator: TEAM_MAX_SESSIONS" "$f" 'TEAM_MAX_SESSIONS'
+has "AK-20 orchestrator: Dateien" "$f" 'Dateien'
+has "AK-20 orchestrator: hängt ab von" "$f" 'hängt ab von'
+has "AK-20 orchestrator: --instance" "$f" '--instance'
+has "AK-20 orchestrator: abhängige Tasks erst nach Merge der Vorwelle" "$f" 'Merge der Vorwelle'
+lacks "AK-20 orchestrator: 'immer nur eine schreibende Rolle' entfällt" "$f" '[Ii]mmer nur eine schreibende Rolle'
+has "AK-19 orchestrator: max. 3 Fix-Runden" "$f" '[Mm]ax\. 3 Fix-Runden'
+lacks "AK-19 orchestrator: kein 'max. 2'" "$f" '[Mm]ax\. 2'
+has "AK-22 orchestrator: legt den Abschnitt vor dem Start an" "$f" 'Abschnitt.*vor dem Start'
+has "AK-22 orchestrator: Abschnitt mit Instanz" "$f" '## <rolle>-<n>'
+has "AK-23 orchestrator: 2 min blocked → Mensch" "$f" '2 min.*blocked|blocked.*2 min'
+has "Rückfall orchestrator: herdr agent wait" "$f" 'herdr agent wait'
+has "Rückfall orchestrator: Akte lesen" "$f" 'Akte'
+has "AK-17 orchestrator: make dev" "$f" 'make dev'
+has "R3 orchestrator: unbenannte Panes nach Neustart" "$f" 'unbenannte Panes'
+has "AK-18 orchestrator: Kopfzeile ist keine Freigabe" "$f" '\[talker von'
+
+f=$AGENTS_DIR/merger.md
+agent_common merger
+has "AK-21 merger: Task-Reihenfolge" "$f" 'Task-Reihenfolge'
+has "AK-21 merger: verify:fast nach jedem Merge" "$f" 'nach jedem Merge'
+has "AK-21 merger: Abbruch bei Konflikt" "$f" 'git merge --abort'
+has "AK-21 merger: blockiert bei Konflikt" "$f" 'blockiert'
+has "AK-21 merger: keine eigene Konfliktlösung" "$f" 'keine eigene Konfliktlösung'
+lacks "AK-21 merger: löst keine Konflikte auf" "$f" 'mechanische Konflikte|auflösen'
+has "AK-22 merger: Abschnitt nur per Edit" "$f" 'nie `Write`'
 
 th_summary
