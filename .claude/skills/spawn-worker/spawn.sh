@@ -70,9 +70,23 @@ new_pane() {
     # Neben den Orchestrator: seine Pane ist die des Aufrufers.
     herdr pane split "$HERDR_PANE_ID" --direction right --cwd "$DIR" --no-focus | jq -r '.result.pane.pane_id'
   else
-    TAB=$(herdr tab list --workspace "$HERDR_WORKSPACE_ID" | jq -r --arg l "$TICKET" '[.result.tabs[] | select(.label == $l)] | .[0].tab_id // empty')
+    # Tabs <ticket>, <ticket>-2, …: der erste mit Platz (max. 4 Panes), sonst ein neuer.
+    TABS=$(herdr tab list --workspace "$HERDR_WORKSPACE_ID")
+    TAB=$(printf '%s' "$TABS" | jq -r --arg l "$TICKET" \
+      '[.result.tabs[] | select((.label | test("^" + $l + "(-[0-9]+)?$")) and .pane_count < 4)] | sort_by(.number) | .[0].tab_id // empty')
     if [ -z "$TAB" ]; then
-      herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label "$TICKET" --cwd "$DIR" --no-focus | jq -r '.result.root_pane.pane_id'
+      LABEL=$(printf '%s' "$TABS" | jq -r --arg l "$TICKET" \
+        '[.result.tabs[].label] as $ls | [range(1; 100)] | map(if . == 1 then $l else "\($l)-\(.)" end) | map(select(. as $c | $ls | index($c) | not)) | .[0]')
+      herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label "$LABEL" --cwd "$DIR" --no-focus | jq -r '.result.root_pane.pane_id'
+    else
+      # 2. Pane rechts von 1, 3. unter 1, 4. unter 2 (Reihenfolge = Anlegereihenfolge, nicht Layout-Reihenfolge)
+      TPANES=$(herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -c --arg t "$TAB" '[.result.panes[] | select(.tab_id == $t) | .pane_id] | sort_by(split(":")[1][1:] | tonumber)')
+      case $(printf '%s' "$TPANES" | jq 'length') in
+        1) AT=$(printf '%s' "$TPANES" | jq -r '.[0]'); DIRN=right ;;
+        2) AT=$(printf '%s' "$TPANES" | jq -r '.[0]'); DIRN=down ;;
+        *) AT=$(printf '%s' "$TPANES" | jq -r '.[1]'); DIRN=down ;;
+      esac
+      herdr pane split "$AT" --direction "$DIRN" --cwd "$DIR" --no-focus | jq -r '.result.pane.pane_id'
     fi
   fi
 }
