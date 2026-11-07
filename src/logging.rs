@@ -3,6 +3,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use log::{Level, LevelFilter, Log, Metadata, Record};
 
 /// Ziel für fertig formatierte Logzeilen (ohne Zeilenende).
 pub trait LogSink: Send {
@@ -83,6 +88,180 @@ impl LogSink for RotatingFile {
         self.size += bytes;
         Ok(())
     }
+}
+
+/// Zeitstempel in UTC mit Suffix `Z` (Fallback, wenn die Ortszeit nicht ermittelbar ist).
+fn format_utc(secs: i64, millis: u32) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Zivilkalender aus Tagen seit 1970-01-01 (Howard Hinnant, `civil_from_days`).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+/// Zeitstempel in Ortszeit (`libc::localtime_r`, thread-sicher); sonst UTC.
+fn format_timestamp(now: SystemTime) -> String {
+    let (secs, millis) = match now.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_millis()),
+        Err(_) => (0, 0),
+    };
+    let t = secs as libc::time_t;
+    // SAFETY: `tm` ist ein reiner C-Struct (nur Zahlen/Zeiger), Nullen sind gültig;
+    // `localtime_r` schreibt nur in den übergebenen Puffer und liest `t`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if !ok {
+        return format_utc(secs, millis);
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{millis:03}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+/// Ziele unter `talker` folgen dem gewählten Grad; fremde Crates höchstens `warn`.
+fn allows(target: &str, level: Level, max: LevelFilter) -> bool {
+    let own = target == "talker" || target.starts_with("talker::");
+    let cap = if own { max } else { max.min(LevelFilter::Warn) };
+    level <= cap
+}
+
+fn format_line(now: SystemTime, level: Level, target: &str, text: &std::fmt::Arguments) -> String {
+    let module = target.strip_prefix("talker::").unwrap_or(target);
+    format!("{} {level:<5} {module}: {text}", format_timestamp(now))
+}
+
+/// `log::Log`-Impl: formatiert im aufrufenden Thread, übergibt per `try_send` an den
+/// Writer-Thread. Wartet nie, paniciert nie; volle Warteschlange → verwerfen + zählen.
+pub struct Logger {
+    tx: SyncSender<String>,
+    dropped: std::sync::Arc<AtomicU64>,
+}
+
+impl Logger {
+    pub fn spawn(sink: Box<dyn LogSink>, capacity: usize) -> Self {
+        let (tx, rx) = sync_channel(capacity);
+        let dropped = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = dropped.clone();
+        // Scheitert der Thread-Start, ist `rx` weg: alle Zeilen werden dann verworfen.
+        let _ = std::thread::Builder::new()
+            .name("talker-log".into())
+            .spawn(move || write_loop(rx, sink, &counter));
+        Self { tx, dropped }
+    }
+
+    fn submit(&self, line: String) {
+        match self.tx.try_send(line) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn write_loop(rx: Receiver<String>, mut sink: Box<dyn LogSink>, dropped: &AtomicU64) {
+    let mut reported_error = false;
+    while let Ok(line) = rx.recv() {
+        let lost = dropped.swap(0, Ordering::Relaxed);
+        let notice = (lost > 0).then(|| {
+            format!(
+                "{} WARN  logging: {lost} Logzeilen verworfen (Puffer voll)",
+                format_timestamp(SystemTime::now())
+            )
+        });
+        for text in notice.iter().chain(std::iter::once(&line)) {
+            if let Err(e) = sink.write_line(text)
+                && !reported_error
+            {
+                reported_error = true;
+                eprintln!("talker: Logdatei nicht schreibbar ({e})");
+            }
+        }
+    }
+}
+
+impl Log for Logger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        allows(metadata.target(), metadata.level(), log::max_level())
+    }
+
+    fn log(&self, record: &Record) {
+        // Den gewählten Grad prüfen schon die `log`-Makros (`max_level`); hier bleibt
+        // nur die Obergrenze für fremde Ziele.
+        if allows(record.target(), record.level(), LevelFilter::Trace) {
+            self.submit(format_line(
+                SystemTime::now(),
+                record.level(),
+                record.target(),
+                record.args(),
+            ));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<(Level, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct CaptureLogger;
+
+#[cfg(test)]
+impl Log for CaptureLogger {
+    fn enabled(&self, _: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        CAPTURED.with(|c| {
+            if let Some(lines) = c.borrow_mut().as_mut() {
+                lines.push((
+                    record.level(),
+                    format!("{}: {}", record.target(), record.args()),
+                ));
+            }
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+/// Test-Hilfe: sammelt alle Logzeilen (`<ziel>: <text>`), die `f` auf **diesem** Thread
+/// erzeugt — parallele Tests stören sich nicht. Schreibt nichts in eine Datei.
+#[cfg(test)]
+pub fn capture<R>(f: impl FnOnce() -> R) -> (R, Vec<(Level, String)>) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = log::set_logger(&CaptureLogger);
+    });
+    log::set_max_level(LevelFilter::Debug);
+    CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let lines = CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    (result, lines)
 }
 
 #[cfg(test)]
@@ -248,5 +427,194 @@ mod tests {
             return;
         }
         assert!(result.is_err());
+    }
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn record_to(logger: &Logger, level: Level, target: &str, text: &str) {
+        logger.log(
+            &Record::builder()
+                .level(level)
+                .target(target)
+                .args(format_args!("{text}"))
+                .build(),
+        );
+    }
+
+    struct ChannelSink(mpsc::Sender<String>);
+    impl LogSink for ChannelSink {
+        fn write_line(&mut self, line: &str) -> io::Result<()> {
+            let _ = self.0.send(line.to_string());
+            Ok(())
+        }
+    }
+
+    /// Sink, der beim ersten Schreiben blockiert, bis `release` gesendet wird.
+    struct BlockingSink {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        lines: mpsc::Sender<String>,
+    }
+    impl LogSink for BlockingSink {
+        fn write_line(&mut self, line: &str) -> io::Result<()> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            let _ = self.lines.send(line.to_string());
+            Ok(())
+        }
+    }
+
+    /// REQ-DIAG-011: blockierendes Backend → `log()` kehrt sofort zurück, Verluste gezählt.
+    #[test]
+    fn blocking_sink_never_blocks_callers_and_drops_are_counted() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (lines_tx, lines_rx) = mpsc::channel();
+        let capacity = 8;
+        let logger = Logger::spawn(
+            Box::new(BlockingSink {
+                started: started_tx,
+                release: release_rx,
+                lines: lines_tx,
+            }),
+            capacity,
+        );
+        record_to(&logger, Level::Warn, "talker::x", "erste");
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let t0 = std::time::Instant::now();
+        for i in 0..capacity + 100 {
+            record_to(&logger, Level::Warn, "talker::x", &format!("zeile {i}"));
+        }
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(logger.dropped.load(Ordering::Relaxed), 100);
+        // Backend wieder frei → gepufferte Zeilen laufen durch, danach der Verlust-Hinweis.
+        drop(release_tx);
+        let first = lines_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.contains("erste"));
+        let mut all = String::new();
+        while let Ok(l) = lines_rx.recv_timeout(Duration::from_secs(1)) {
+            all.push_str(&l);
+            all.push('\n');
+        }
+        assert!(all.contains("zeile 0"));
+        assert!(all.contains("100 Logzeilen verworfen"));
+    }
+
+    /// REQ-DIAG-011: Sink-Fehler → kein Panic, Folgezeilen laufen weiter.
+    #[test]
+    fn failing_sink_does_not_panic_and_later_lines_are_still_attempted() {
+        struct Failing(mpsc::Sender<String>);
+        impl LogSink for Failing {
+            fn write_line(&mut self, line: &str) -> io::Result<()> {
+                let _ = self.0.send(line.to_string());
+                Err(io::Error::other("Platte voll"))
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let logger = Logger::spawn(Box::new(Failing(tx)), 16);
+        for i in 0..3 {
+            record_to(&logger, Level::Error, "talker::x", &format!("z{i}"));
+        }
+        for i in 0..3 {
+            let l = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(l.ends_with(&format!("z{i}")));
+        }
+    }
+
+    /// Filter: fremde Crates höchstens `warn`, `talker::*` folgt dem Grad.
+    #[test]
+    fn filter_caps_foreign_targets_at_warn_and_own_targets_follow_the_level() {
+        use Level::*;
+        use LevelFilter as F;
+        let table = [
+            // (target, level, max, erlaubt)
+            ("ureq", Info, F::Info, false),
+            ("egui", Debug, F::Debug, false),
+            ("ureq", Warn, F::Info, true),
+            ("rustls::x", Error, F::Error, true),
+            ("rustls::x", Warn, F::Error, false),
+            ("talker::pipeline", Info, F::Info, true),
+            ("talker::pipeline", Debug, F::Info, false),
+            ("talker::pipeline", Debug, F::Debug, true),
+            ("talker", Info, F::Info, true),
+            ("talker::messung", Warn, F::Error, false),
+            ("talker::messung", Error, F::Error, true),
+            ("talkerx", Info, F::Info, false),
+            ("talker::x", Error, F::Off, false),
+        ];
+        for (target, level, max, expected) in table {
+            assert_eq!(
+                allows(target, level, max),
+                expected,
+                "{target} {level} {max}"
+            );
+        }
+    }
+
+    /// Zeilenformat: Zeitstempel, Level, Ziel ohne `talker::`, Text.
+    #[test]
+    fn line_format_has_timestamp_level_module_and_text() {
+        let (tx, rx) = mpsc::channel();
+        let logger = Logger::spawn(Box::new(ChannelSink(tx)), 4);
+        record_to(&logger, Level::Warn, "talker::models", "hallo");
+        let l = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (ts, rest) = l.split_at(23);
+        let b = ts.as_bytes();
+        assert!(b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && b[7] == b'-');
+        assert!(b[10] == b' ' && b[13] == b':' && b[16] == b':' && b[19] == b'.');
+        assert_eq!(rest, " WARN  models: hallo");
+        assert_eq!(
+            format_line(UNIX_EPOCH, Level::Info, "ureq", &format_args!("x"))
+                .split_at(23)
+                .1,
+            " INFO  ureq: x"
+        );
+    }
+
+    #[test]
+    fn utc_fallback_formats_known_instants() {
+        assert_eq!(format_utc(0, 0), "1970-01-01 00:00:00.000Z");
+        assert_eq!(format_utc(951_782_400, 5), "2000-02-29 00:00:00.005Z");
+        assert_eq!(format_utc(1_794_023_052, 123), "2026-11-07 03:44:12.123Z");
+        assert_eq!(format_utc(-1, 999), "1969-12-31 23:59:59.999Z");
+    }
+
+    #[test]
+    fn dropping_the_logger_ends_the_writer_thread() {
+        let (tx, rx) = mpsc::channel();
+        let logger = Logger::spawn(Box::new(ChannelSink(tx)), 4);
+        record_to(&logger, Level::Error, "talker::x", "a");
+        drop(logger);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        // Sink (und damit `tx`) wird mit dem Thread freigegeben → Kanal schließt.
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    /// `capture` sammelt je Thread; Zeilen anderer Threads und außerhalb bleiben draußen.
+    #[test]
+    fn capture_collects_per_thread() {
+        log::info!(target: "talker::x", "außerhalb");
+        let (value, lines) = capture(|| {
+            std::thread::spawn(|| log::info!(target: "talker::x", "fremder thread"))
+                .join()
+                .unwrap();
+            log::info!(target: "talker::x", "drin");
+            log::debug!(target: "talker::y", "detail");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(
+            lines,
+            [
+                (Level::Info, "talker::x: drin".to_string()),
+                (Level::Debug, "talker::y: detail".to_string())
+            ]
+        );
+        let (_, empty) = capture(|| ());
+        assert!(empty.is_empty());
     }
 }
