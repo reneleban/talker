@@ -32,7 +32,10 @@ pub enum Outcome {
         text: String,
         cleanup_fell_back: bool,
     },
-    /// Utterance verworfen — der Hinweis geht sichtbar an den Indicator.
+    /// Nichts erkannt (leerer Transcript) — Hinweis „Nichts erkannt“, in der Messzeile
+    /// „verworfen (nichts erkannt)“.
+    NothingRecognized,
+    /// Utterance mit Fehler verworfen — der Hinweis geht sichtbar an den Indicator.
     Rejected(&'static str),
 }
 
@@ -232,7 +235,7 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
             Processed::Empty { stt } => {
                 add_time(&mut self.timing.stt, stt);
                 log::debug!("leerer Transcript — nichts einzufügen.");
-                Outcome::Rejected(NOTHING_RECOGNIZED)
+                Outcome::NothingRecognized
             }
             Processed::SttFailed(e) => {
                 log::error!("STT fehlgeschlagen: {e}");
@@ -573,15 +576,6 @@ struct Delivery {
     first_segment_at: Option<audio::HostInstant>,
 }
 
-/// Ablehnungsgrund des Workers → Ergebnis der Messzeile.
-fn rejection_result(hint: &'static str) -> DictationResult {
-    if hint == NOTHING_RECOGNIZED {
-        DictationResult::Discarded(NOTHING_RECOGNIZED_REASON)
-    } else {
-        DictationResult::Error(hint.to_string())
-    }
-}
-
 /// Fügt ein Ergebnis ein und hält fest, was passiert ist.
 fn deliver(
     outcome: Outcome,
@@ -614,8 +608,16 @@ fn deliver(
                 }
             }
         }
+        Outcome::NothingRecognized => {
+            delivery
+                .ended
+                .get_or_insert(DictationResult::Discarded(NOTHING_RECOGNIZED_REASON));
+            Some(NOTHING_RECOGNIZED)
+        }
         Outcome::Rejected(hint) => {
-            delivery.ended.get_or_insert(rejection_result(hint));
+            delivery
+                .ended
+                .get_or_insert(DictationResult::Error(hint.to_string()));
             Some(hint)
         }
     };
@@ -2247,7 +2249,7 @@ mod tests {
         );
         assert!(matches!(
             w.handle(&[], None, &raw_cfg),
-            Outcome::Rejected("Nichts erkannt")
+            Outcome::NothingRecognized
         ));
 
         // STT-Fehler → „Spracherkennung fehlgeschlagen".
