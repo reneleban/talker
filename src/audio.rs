@@ -225,6 +225,7 @@ impl MarkCells {
 }
 
 /// Rohe Aufnahme einer Utterance im Geräteformat.
+#[derive(Debug)]
 pub struct Captured {
     pub raw: Vec<f32>,
     pub info: SourceInfo,

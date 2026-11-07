@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use talker::diagnostics::{DictationResult, DictationTrace, TraceReport};
 use talker::indicator::Indicator;
 use talker::{
     audio, cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline,
@@ -37,7 +38,7 @@ fn try_load_cleaner() -> (Option<cleanup::GemmaCleaner>, bool) {
 /// Auftrag an den STT-Worker: eine fertige Utterance (Am Ende) oder ein
 /// Live-Strom (Satzweise/Wortgruppenweise), der bis zum Ende der Aufnahme läuft.
 enum SttJob {
-    Utterance(Vec<f32>, Option<String>),
+    Utterance(Vec<f32>, Option<String>, Box<DictationTrace>),
     Live(pipeline::LiveFeed),
 }
 
@@ -49,6 +50,7 @@ fn spawn_stt_worker(
     indicator: Arc<Mutex<Indicator>>,
     egui_ctx: eframe::egui::Context,
     models_state: Arc<models::ModelsState>,
+    trace_report: TraceReport,
 ) -> mpsc::Sender<SttJob> {
     // Ergebnis der Pipeline ans Overlay melden (+ Repaint anstoßen).
     let report = move |f: &dyn Fn(&mut Indicator)| {
@@ -117,8 +119,12 @@ fn spawn_stt_worker(
                 report(&|ind| ind.fail(Instant::now(), "Interner Fehler (Config)"));
                 continue;
             };
+            let mut trace = match &job {
+                SttJob::Utterance(_, _, trace) => (**trace).clone(),
+                SttJob::Live(feed) => (*feed.trace).clone(),
+            };
             let hint = match job {
-                SttJob::Utterance(pcm, frontmost) => {
+                SttJob::Utterance(pcm, frontmost, _) => {
                     deliver(worker.handle(&pcm, frontmost.as_deref(), &cfg))
                 }
                 SttJob::Live(feed) => {
@@ -139,6 +145,11 @@ fn spawn_stt_worker(
                     first_hint
                 }
             };
+            trace.result = match hint {
+                None => DictationResult::Inserted,
+                Some(hint) => DictationResult::Discarded(hint),
+            };
+            trace_report(trace);
             match hint {
                 Some(hint) => report(&|ind| ind.fail(Instant::now(), hint)),
                 None => report(&|ind| ind.finish_ok(Instant::now())),
@@ -262,11 +273,16 @@ fn main() -> ExitCode {
                 );
             }
 
+            // Eine Messzeile je Dictation, auf `info` (ADR-0011/-0012).
+            let trace_report: TraceReport = Arc::new(|t| {
+                log::info!(target: "talker::messung", "{t}");
+            });
             let stt_tx = spawn_stt_worker(
                 Arc::clone(&config),
                 Arc::clone(&indicator),
                 egui_ctx.clone(),
                 Arc::clone(&models_state),
+                Arc::clone(&trace_report),
             );
 
             // Tap-Installation als wiederholbare Factory: scheitert sie (z.B.
@@ -292,14 +308,14 @@ fn main() -> ExitCode {
                     // dieser Factory (permissions::should_relaunch_for_tap) findet
                     // nie eine laufende Aufnahme vor, weil der alte Tap dafür schon
                     // aktiv gewesen sein müsste.
-                    let session_press =
-                        Arc::new(Mutex::new(pipeline::PttSession::new(Box::new(|cfg| {
-                            Box::new(audio::MicSource::new(cfg.mic_device.clone()))
-                        }))));
+                    let session_press = Arc::new(Mutex::new(pipeline::PttSession::new(
+                        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone()))),
+                        Arc::clone(&trace_report),
+                    )));
                     let session_release = Arc::clone(&session_press);
                     hotkey::install(
                         Arc::clone(&config),
-                        move || {
+                        move |pressed_at| {
                             let cfg = mic_config.read().map(|c| c.clone()).unwrap_or_default();
                             // Balken sofort zeigen; der Start-Thread schaltet auf
                             // Wellen um, sobald das Mikrofon wirklich läuft.
@@ -335,7 +351,7 @@ fn main() -> ExitCode {
                             };
                             let outcome = session_press
                                 .lock()
-                                .map(|mut s| s.press(&cfg, &models_press, on_ready))
+                                .map(|mut s| s.press(pressed_at, &cfg, &models_press, on_ready))
                                 .unwrap_or(pipeline::PressOutcome::Blocked(
                                     "Interner Fehler (Session)".into(),
                                 ));
@@ -347,10 +363,10 @@ fn main() -> ExitCode {
                                 ctx_press.request_repaint();
                             }
                         },
-                        move || {
+                        move |released_at| {
                             let outcome = session_release
                                 .lock()
-                                .map(|mut s| s.release())
+                                .map(|mut s| s.release(released_at))
                                 .unwrap_or(pipeline::ReleaseOutcome::NoRecording);
                             let update = |f: &dyn Fn(&mut Indicator)| {
                                 if let Ok(mut ind) = ind_release.lock() {
@@ -371,12 +387,21 @@ fn main() -> ExitCode {
                                     eprintln!("talker: Utterance zu kurz ({ms} ms) — verworfen.");
                                     update(&|ind| ind.cancel());
                                 }
-                                pipeline::ReleaseOutcome::Ready { pcm, frontmost, ms } => {
+                                pipeline::ReleaseOutcome::Ready {
+                                    pcm,
+                                    frontmost,
+                                    ms,
+                                    trace,
+                                    ..
+                                } => {
                                     eprintln!(
                                         "talker: Utterance aufgenommen: {ms} ms, {} Samples @16 kHz.",
                                         pcm.len()
                                     );
-                                    if stt_tx.send(SttJob::Utterance(pcm, frontmost)).is_err() {
+                                    if stt_tx
+                                        .send(SttJob::Utterance(pcm, frontmost, trace))
+                                        .is_err()
+                                    {
                                         eprintln!(
                                             "talker: STT-Worker nicht verfügbar — Utterance verworfen."
                                         );

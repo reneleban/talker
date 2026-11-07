@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::audio::{HostInstant, SourceInfo};
+use crate::audio::{Captured, HostInstant, SourceInfo};
 use crate::cleanup::CleanupMode;
 use crate::config::InsertMode;
 use crate::models::ModelId;
@@ -89,6 +89,46 @@ fn model_name(id: ModelId) -> &'static str {
 }
 
 impl DictationTrace {
+    /// Neue Trace beim Tastendruck. `result` steht auf „abgebrochen", bis ein Ende
+    /// es setzt — jeder Pfad meldet seine Trace mit gesetztem Ergebnis.
+    pub fn new(
+        nr: u64,
+        pressed_at: HostInstant,
+        insert_mode: InsertMode,
+        cleanup_mode: CleanupMode,
+    ) -> Self {
+        Self {
+            nr,
+            pressed_at,
+            mic_ready_at: None,
+            first_block_at: None,
+            first_signal_at: None,
+            released_at: None,
+            recorded: None,
+            text_at: None,
+            stt: None,
+            cleanup: None,
+            injected: None,
+            first_segment_at: None,
+            segments: None,
+            model_loads: Vec::new(),
+            device: None,
+            insert_mode,
+            cleanup_mode,
+            cold_start: nr == 1,
+            result: DictationResult::Discarded("abgebrochen"),
+        }
+    }
+
+    /// Übernimmt Loslass-Zeitpunkt, aufgenommene Dauer, Start-Messpunkte und Gerät.
+    pub fn apply_capture(&mut self, released_at: HostInstant, captured: &Captured) {
+        self.released_at = Some(released_at);
+        self.recorded = Some(captured.recorded());
+        self.first_block_at = captured.marks.first_block;
+        self.first_signal_at = captured.marks.first_signal;
+        self.device = Some(captured.info.clone());
+    }
+
     /// Abstand eines Messpunkts zum Tastendruck.
     fn since_press(&self, at: Option<HostInstant>) -> Option<Duration> {
         at.map(|at| at.saturating_since(self.pressed_at))
@@ -390,5 +430,57 @@ mod tests {
         assert!(!line.contains('\n') && !line.contains('\r'));
         assert!(line.contains("Fehler (zeile eins zeile zwei  )"));
         assert!(!example().to_string().contains('\n'));
+    }
+
+    /// `new`: Kaltstart nur bei Nr. 1, nichts gemessen, Ergebnis noch „abgebrochen".
+    #[test]
+    fn new_trace_has_no_marks_and_cold_start_only_for_the_first() {
+        let first = DictationTrace::new(
+            1,
+            HostInstant::from_nanos(T0),
+            InsertMode::AtEnd,
+            CleanupMode::Raw,
+        );
+        assert!(first.cold_start);
+        assert!(first.mic_ready_at.is_none() && first.device.is_none());
+        assert_eq!(first.result, DictationResult::Discarded("abgebrochen"));
+        let second = DictationTrace::new(
+            2,
+            HostInstant::from_nanos(T0),
+            InsertMode::AtEnd,
+            CleanupMode::Raw,
+        );
+        assert!(!second.cold_start);
+    }
+
+    #[test]
+    fn apply_capture_takes_release_marks_and_device() {
+        use crate::audio::StartMarks;
+        let captured = Captured {
+            raw: vec![0.0; 96_000],
+            info: SourceInfo {
+                format: AudioFormat {
+                    channels: 2,
+                    sample_rate: 48_000,
+                },
+                device: "Mikro".into(),
+            },
+            marks: StartMarks {
+                first_block: at(380),
+                first_signal: None,
+            },
+        };
+        let mut t = DictationTrace::new(
+            3,
+            HostInstant::from_nanos(T0),
+            InsertMode::AtEnd,
+            CleanupMode::Raw,
+        );
+        t.apply_capture(at(2_000).unwrap(), &captured);
+        assert_eq!(t.released_at, at(2_000));
+        assert_eq!(t.recorded, ms(1_000));
+        assert_eq!(t.first_block_at, at(380));
+        assert_eq!(t.first_signal_at, None);
+        assert_eq!(t.device.unwrap().device, "Mikro");
     }
 }

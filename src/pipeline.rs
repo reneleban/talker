@@ -6,11 +6,12 @@
 //! Indicator/Injection (Ticket-0034).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
 use crate::config::{Config, InsertMode};
+use crate::diagnostics::{DictationResult, DictationTrace, TraceReport};
 use crate::error::TalkerError;
 use crate::injection;
 use crate::models::{ModelId, ModelsState};
@@ -479,6 +480,12 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
 pub struct PttSession {
     /// Liefert je Tastendruck die Audioquelle (App: Mikrofon, Tests: WAV).
     open_source: SourceFactory,
+    /// Nimmt die Messzeile jeder Dictation entgegen, die in der Session endet.
+    report: TraceReport,
+    /// Laufende Diktat-Nummer ab App-Start (jeder Tastendruck zählt, auch gesperrte).
+    nr: u64,
+    /// Messpunkte der laufenden Dictation; der Start-Thread ergänzt Mikro-Bereitschaft und Gerät.
+    trace: Option<Arc<Mutex<DictationTrace>>>,
     slot: Option<Arc<Mutex<MicSlot<audio::Recording>>>>,
     frontmost: Option<String>,
     /// Die laufende Aufnahme speist das Live-Diktat (Block-Kanal).
@@ -561,8 +568,14 @@ pub enum MicReady {
     Failed(TalkerError),
 }
 
-/// Rohe Audio-Blöcke einer Live-Aufnahme samt Format und Ziel-App.
+fn lock_trace(trace: &Mutex<DictationTrace>) -> MutexGuard<'_, DictationTrace> {
+    trace.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Rohe Audio-Blöcke einer Live-Aufnahme samt Format, Ziel-App und den bis zum
+/// Mikrofon-Start gemessenen Punkten.
 pub struct LiveFeed {
+    pub trace: Box<DictationTrace>,
     pub frontmost: Option<String>,
     pub blocks: std::sync::mpsc::Receiver<audio::Feed>,
     pub format: (u16, u32),
@@ -589,20 +602,26 @@ pub enum ReleaseOutcome {
     LiveEnded,
     /// Utterance zu kurz — gilt als versehentlicher Tastendruck, verworfen.
     TooShort { ms: u64 },
-    /// PCM + der bei Press erfasste Frontmost, bereit für den STT-Worker.
+    /// PCM + der bei Press erfasste Frontmost, bereit für den STT-Worker; `captured`
+    /// ist die rohe Aufnahme, `trace` die Messpunkte bis zum Loslassen.
     Ready {
         pcm: Vec<f32>,
         frontmost: Option<String>,
         ms: u64,
+        captured: audio::Captured,
+        trace: Box<DictationTrace>,
     },
     /// Stop der Aufnahme fehlgeschlagen.
     StopFailed(TalkerError),
 }
 
 impl PttSession {
-    pub fn new(open_source: SourceFactory) -> Self {
+    pub fn new(open_source: SourceFactory, report: TraceReport) -> Self {
         Self {
             open_source,
+            report,
+            nr: 0,
+            trace: None,
             slot: None,
             frontmost: None,
             live: false,
@@ -614,14 +633,19 @@ impl PttSession {
     /// die App während der Utterance wechselt), Mikrofon im Hintergrund
     /// starten. Der Tastendruck-Callback blockiert nie auf CoreAudio;
     /// `on_ready` meldet den Start (oder seinen Fehler) vom Start-Thread aus.
+    /// `pressed_at` stempelt der Event-Tap beim Eintritt (gemeinsame Uhr).
     pub fn press(
         &mut self,
+        pressed_at: audio::HostInstant,
         cfg: &Config,
         models: &ModelsState,
         on_ready: impl FnOnce(MicReady) + Send + 'static,
     ) -> PressOutcome {
-        let pressed_at = Instant::now();
+        self.nr += 1;
+        let mut trace = DictationTrace::new(self.nr, pressed_at, cfg.insert_mode, cfg.cleanup_mode);
         if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
+            trace.result = DictationResult::Blocked;
+            (self.report)(trace);
             return PressOutcome::Blocked(hint);
         }
         let frontmost = injection::frontmost_bundle_id();
@@ -631,29 +655,45 @@ impl PttSession {
             // Im Live-Betrieb zeigt der Indicator den tatsächlich wirkenden Modus.
             mode = cfg.insert_mode.resolve(mode);
         }
+        trace.cleanup_mode = mode;
         let source = (self.open_source)(cfg);
         let slot = Arc::new(Mutex::new(MicSlot::Starting));
+        let trace = Arc::new(Mutex::new(trace));
         self.slot = Some(Arc::clone(&slot));
+        self.trace = Some(Arc::clone(&trace));
         self.frontmost = frontmost.clone();
         self.live = live;
+        let report = Arc::clone(&self.report);
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
             let started = audio::start(source, live.then_some(tx));
-            eprintln!(
-                "talker: Mikrofon-Start dauerte {} ms",
-                pressed_at.elapsed().as_millis()
-            );
+            let ready_at = audio::HostInstant::now();
             complete_start(&slot, started, |result| match result {
-                Ok(rec) => on_ready(MicReady::Recording {
-                    level: rec.level(),
-                    mode,
-                    live: live.then(|| LiveFeed {
-                        frontmost,
-                        blocks: rx,
-                        format: (rec.info().format.channels, rec.info().format.sample_rate),
-                    }),
-                }),
-                Err(e) => on_ready(MicReady::Failed(e)),
+                Ok(rec) => {
+                    let snapshot = {
+                        let mut t = lock_trace(&trace);
+                        t.mic_ready_at = Some(ready_at);
+                        t.device = Some(rec.info().clone());
+                        t.clone()
+                    };
+                    let format = rec.info().format;
+                    on_ready(MicReady::Recording {
+                        level: rec.level(),
+                        mode,
+                        live: live.then(|| LiveFeed {
+                            trace: Box::new(snapshot),
+                            frontmost,
+                            blocks: rx,
+                            format: (format.channels, format.sample_rate),
+                        }),
+                    });
+                }
+                Err(e) => {
+                    let mut failed = lock_trace(&trace).clone();
+                    failed.result = DictationResult::Error(e.to_string());
+                    report(failed);
+                    on_ready(MicReady::Failed(e));
+                }
             });
         });
         PressOutcome::Starting
@@ -661,30 +701,53 @@ impl PttSession {
 
     /// PTT losgelassen: Aufnahme stoppen, Mindestlänge prüfen (versehentlicher
     /// Tastendruck), sonst PCM + Frontmost zum Senden an den STT-Worker freigeben.
-    pub fn release(&mut self) -> ReleaseOutcome {
+    /// `released_at` stempelt der Event-Tap beim Eintritt. Enden, die hier
+    /// vorzeitig abbrechen, meldet die Session selbst über `report`.
+    pub fn release(&mut self, released_at: audio::HostInstant) -> ReleaseOutcome {
         let frontmost = self.frontmost.take();
-        let Some(slot) = self.slot.take() else {
+        let (Some(slot), Some(trace)) = (self.slot.take(), self.trace.take()) else {
             return ReleaseOutcome::NoRecording;
         };
+        let mut trace = lock_trace(&trace).clone();
         let rec = match take_on_release(&slot) {
             Taken::Ready(rec) => rec,
-            Taken::StartAborted => return ReleaseOutcome::StartAborted,
+            Taken::StartAborted => {
+                trace.released_at = Some(released_at);
+                trace.result = DictationResult::Discarded("abgebrochen");
+                (self.report)(trace);
+                return ReleaseOutcome::StartAborted;
+            }
+            // Fehlgeschlagener Start ist schon gemeldet.
             Taken::Gone => return ReleaseOutcome::NoRecording,
         };
         if std::mem::take(&mut self.live) {
-            rec.finish_live(audio::HostInstant::now());
+            rec.finish_live(released_at);
             return ReleaseOutcome::LiveEnded;
         }
-        match rec.stop().to_mono_16k() {
+        let captured = rec.stop();
+        trace.apply_capture(released_at, &captured);
+        match captured.to_mono_16k() {
             Ok(pcm) => {
                 let ms = audio::duration_ms(&pcm);
                 if ms < audio::MIN_UTTERANCE_MS {
+                    trace.result = DictationResult::Discarded("zu kurz");
+                    (self.report)(trace);
                     ReleaseOutcome::TooShort { ms }
                 } else {
-                    ReleaseOutcome::Ready { pcm, frontmost, ms }
+                    ReleaseOutcome::Ready {
+                        pcm,
+                        frontmost,
+                        ms,
+                        captured,
+                        trace: Box::new(trace),
+                    }
                 }
             }
-            Err(e) => ReleaseOutcome::StopFailed(e),
+            Err(e) => {
+                trace.result = DictationResult::Error(e.to_string());
+                (self.report)(trace);
+                ReleaseOutcome::StopFailed(e)
+            }
         }
     }
 }
@@ -960,18 +1023,310 @@ mod tests {
     #[test]
     fn press_blocked_by_setup_gate_never_touches_audio() {
         let models = ModelsState::new(ModelState::Missing, ModelState::Missing);
-        let mut session = PttSession::new(mic_factory());
+        let mut session = PttSession::new(mic_factory(), Arc::new(|_| {}));
 
-        let outcome = session.press(&Config::default(), &models, |_| {});
+        let outcome = session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &models,
+            |_| {},
+        );
 
         assert!(matches!(outcome, PressOutcome::Blocked(_)));
     }
 
     #[test]
     fn release_without_a_press_reports_no_recording() {
-        let mut session = PttSession::new(mic_factory());
+        let mut session = PttSession::new(mic_factory(), Arc::new(|_| {}));
 
-        assert!(matches!(session.release(), ReleaseOutcome::NoRecording));
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+    }
+
+    // ---- PttSession mit WAV-Quelle: Diktat-Nummer, Messpunkte, vorzeitige Enden ----
+
+    type Reports = Arc<Mutex<Vec<DictationTrace>>>;
+
+    fn collecting_report() -> (TraceReport, Reports) {
+        let reports: Reports = Arc::default();
+        let sink = Arc::clone(&reports);
+        (Arc::new(move |t| sink.lock().unwrap().push(t)), reports)
+    }
+
+    fn stt_ready() -> ModelsState {
+        ModelsState::new(ModelState::Ready, ModelState::Missing)
+    }
+
+    fn wav_opts(block_frames: usize, start_delay_ms: u64) -> audio::WavOptions {
+        audio::WavOptions {
+            format: audio::AudioFormat {
+                channels: 1,
+                sample_rate: 16_000,
+            },
+            block_frames,
+            start_delay: std::time::Duration::from_millis(start_delay_ms),
+            pace: audio::Pace::Immediate,
+            epoch: audio::HostInstant::from_nanos(1),
+        }
+    }
+
+    /// Factory über einer WAV-Quelle; die `SourceDone`-Signale kommen über den Kanal heraus.
+    fn wav_factory(
+        samples: Vec<f32>,
+        done: std::sync::mpsc::Sender<audio::SourceDone>,
+    ) -> SourceFactory {
+        let done = Mutex::new(done);
+        Box::new(move |_| {
+            let (source, signal) =
+                audio::WavSource::from_samples(samples.clone(), wav_opts(160, 0));
+            let _ = done.lock().unwrap().send(signal);
+            Box::new(source)
+        })
+    }
+
+    struct FailingSource;
+    impl audio::AudioSource for FailingSource {
+        fn open(self: Box<Self>, _: audio::OnBlock) -> crate::error::Result<audio::Opened> {
+            Err(TalkerError::Audio("kein Mikrofon verfügbar".into()))
+        }
+    }
+
+    /// Ein Diktat vom Tastendruck bis zur Quelle-fertig; liefert das Release-Ergebnis.
+    fn dictate_once(
+        session: &mut PttSession,
+        done: &std::sync::mpsc::Receiver<audio::SourceDone>,
+    ) -> ReleaseOutcome {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let outcome = session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            move |ready| {
+                let _ = ready_tx.send(matches!(ready, MicReady::Recording { .. }));
+            },
+        );
+        assert!(matches!(outcome, PressOutcome::Starting));
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        let signal = done
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(signal.wait(std::time::Duration::from_secs(5)));
+        session.release(audio::HostInstant::now())
+    }
+
+    /// REQ-DIAG-012: Nr. zählt ab 1 fortlaufend, Kaltstart nur bei Nr. 1.
+    #[test]
+    fn dictation_numbers_count_from_one_and_only_the_first_is_a_cold_start() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // 100 ms Audio → „zu kurz" → die Session meldet selbst.
+        let mut session = PttSession::new(wav_factory(vec![0.1; 1_600], done_tx), report);
+        for _ in 0..2 {
+            assert!(matches!(
+                dictate_once(&mut session, &done_rx),
+                ReleaseOutcome::TooShort { .. }
+            ));
+        }
+        let reports = reports.lock().unwrap();
+        let nrs: Vec<_> = reports.iter().map(|t| (t.nr, t.cold_start)).collect();
+        assert_eq!(nrs, [(1, true), (2, false)]);
+        assert!(
+            reports
+                .iter()
+                .all(|t| t.result == DictationResult::Discarded("zu kurz"))
+        );
+    }
+
+    /// Messpunkte bis zum Loslassen: Mikro bereit, Blöcke, Signal, Gerät, Dauer.
+    #[test]
+    fn early_end_trace_carries_start_marks_device_and_recorded_duration() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut session = PttSession::new(wav_factory(vec![0.1; 1_600], done_tx), report);
+        let pressed_at = audio::HostInstant::now();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        session.press(pressed_at, &Config::default(), &stt_ready(), move |_| {
+            let _ = ready_tx.send(());
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            done_rx
+                .recv()
+                .unwrap()
+                .wait(std::time::Duration::from_secs(5))
+        );
+        session.release(audio::HostInstant::now());
+        let t = reports.lock().unwrap()[0].clone();
+        assert!(t.mic_ready_at.unwrap() >= pressed_at);
+        assert!(t.first_block_at.is_some() && t.first_signal_at.is_some());
+        assert!(t.released_at.unwrap() >= t.mic_ready_at.unwrap());
+        assert_eq!(t.recorded, Some(std::time::Duration::from_millis(100)));
+        assert!(t.device.unwrap().device.starts_with("WAV: "));
+    }
+
+    /// REQ-DICT-002: Setup-Gate offen → genau eine Messzeile „gesperrt", Nr. verbraucht.
+    #[test]
+    fn blocked_press_reports_one_trace_and_consumes_the_number() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut session = PttSession::new(wav_factory(vec![0.1; 1_600], done_tx), report);
+        let missing = ModelsState::new(ModelState::Missing, ModelState::Missing);
+        let outcome = session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &missing,
+            |_| {},
+        );
+        assert!(matches!(outcome, PressOutcome::Blocked(_)));
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+        assert!(matches!(
+            dictate_once(&mut session, &done_rx),
+            ReleaseOutcome::Ready { .. } | ReleaseOutcome::TooShort { .. }
+        ));
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports[0].nr, 1);
+        assert_eq!(reports[0].result, DictationResult::Blocked);
+        assert_eq!(reports[1].nr, 2);
+        assert_eq!(reports.len(), 2, "Gesperrt + zu kurz, sonst nichts");
+    }
+
+    /// REQ-DICT-006: Mikrofon-Start scheitert → Fehler wie bisher + `Ergebnis: Fehler`; kein Doppel.
+    #[test]
+    fn mic_start_failure_reports_an_error_trace_once() {
+        let (report, reports) = collecting_report();
+        let mut session = PttSession::new(Box::new(|_| Box::new(FailingSource)), report);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            move |ready| {
+                let _ = ready_tx.send(matches!(ready, MicReady::Failed(_)));
+            },
+        );
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(&reports[0].result, DictationResult::Error(e) if e.contains("kein Mikrofon"))
+        );
+        assert!(reports[0].mic_ready_at.is_none());
+    }
+
+    /// Release vor Mikrofon-Start → „verworfen (abgebrochen)"; die spät fertige Aufnahme meldet nichts.
+    #[test]
+    fn release_before_mic_start_reports_aborted_and_the_late_start_stays_silent() {
+        struct SlowSource {
+            gate: std::sync::mpsc::Receiver<()>,
+            dropped: std::sync::mpsc::Sender<()>,
+        }
+        struct DropSignal(std::sync::mpsc::Sender<()>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        impl audio::AudioSource for SlowSource {
+            fn open(self: Box<Self>, _: audio::OnBlock) -> crate::error::Result<audio::Opened> {
+                let _ = self.gate.recv();
+                Ok(audio::Opened {
+                    info: audio::SourceInfo {
+                        format: audio::AudioFormat {
+                            channels: 1,
+                            sample_rate: 16_000,
+                        },
+                        device: "langsam".into(),
+                    },
+                    stop: Box::new(DropSignal(self.dropped)),
+                })
+            }
+        }
+        let (report, reports) = collecting_report();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let source = Mutex::new(Some(SlowSource {
+            gate: gate_rx,
+            dropped: dropped_tx,
+        }));
+        let mut session = PttSession::new(
+            Box::new(move |_| Box::new(source.lock().unwrap().take().unwrap())),
+            report,
+        );
+        session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            |_| {},
+        );
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::StartAborted
+        ));
+        // Doppeltes Loslassen: nichts mehr da, keine zweite Zeile.
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+        gate_tx.send(()).unwrap();
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "die späte Aufnahme meldet nichts");
+        assert_eq!(reports[0].result, DictationResult::Discarded("abgebrochen"));
+        assert!(reports[0].released_at.is_some());
+    }
+
+    /// Release ohne vorherige Taste oder doppelt: keine Messzeile.
+    #[test]
+    fn release_without_press_reports_nothing() {
+        let (report, reports) = collecting_report();
+        let mut session = PttSession::new(mic_factory(), report);
+        session.release(audio::HostInstant::now());
+        session.release(audio::HostInstant::now());
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// Ausreichend lange Aufnahme → `Ready` mit Trace, noch keine Messzeile (kommt vom Worker).
+    #[test]
+    fn long_enough_recording_hands_a_trace_to_the_worker_without_reporting() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut session = PttSession::new(wav_factory(vec![0.1; 16_000], done_tx), report);
+        match dictate_once(&mut session, &done_rx) {
+            ReleaseOutcome::Ready {
+                trace,
+                captured,
+                ms,
+                ..
+            } => {
+                assert_eq!(ms, 1_000);
+                assert_eq!(captured.raw.len(), 16_000);
+                assert_eq!(trace.nr, 1);
+                assert!(trace.released_at.is_some() && trace.recorded.is_some());
+            }
+            other => panic!("Ready erwartet, bekam {other:?}"),
+        }
+        assert!(reports.lock().unwrap().is_empty());
     }
 
     #[test]
