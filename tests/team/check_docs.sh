@@ -18,6 +18,7 @@ done
 if git cat-file -e 586bff4:"$SETTINGS" 2>/dev/null; then
   for list in allow deny; do
     git show 586bff4:"$SETTINGS" | jq -r ".permissions.$list[]" | while IFS= read -r e; do
+      case $e in 'Bash(gh pr merge*)' | 'Bash(gh pr ready*)') continue ;; esac # AK-31: bewusst entfernt
       if in_list "$list" "$e"; then echo "ok   bestehender $list-Eintrag: $e"; else echo "FAIL bestehender $list-Eintrag fehlt: $e"; fi
     done
   done >"${TMPDIR:-/tmp}/check_docs.$$"
@@ -166,8 +167,39 @@ assert_eq "OoS team.env enthält nur TEAM_MAX_SESSIONS (kein TEAM_MERGE)" "TEAM_
   "$(grep -E '^[A-Z_]+=' team.env | cut -d= -f1 | sort -u | tr '\n' ' ' | sed 's/ $//')"
 assert_eq "OoS kein automatischer Merge nach main in den Team-Skripten" "" \
   "$(grep -nE 'git (merge|push)|gh pr merge' $SCRIPTS || true)"
-assert_eq "OoS Regel 'Merge nach main nur nach OK des Menschen' bleibt in AGENTS.md" 1 \
-  "$(grep -c 'Merge nach `main` nur nach manuellem Review/OK des Menschen' AGENTS.md)"
 assert_eq "OoS kein gemeinsames CARGO_TARGET_DIR in den Team-Skripten" "" "$(grep -n 'CARGO_TARGET_DIR' $SCRIPTS || true)"
+
+# --- Nachtrag 2026-11-08: Merge nach main durch den release-engineer (AK-25 bis AK-31) ---
+git_section() { awk '/^## Git$/ { g = 1; next } /^## / { g = 0 } g' AGENTS.md; }
+assert_eq "AK-25 AGENTS.md: alter Merge-Satz kommt nicht mehr vor" 0 \
+  "$(grep -c 'Merge nach `main` nur nach manuellem Review/OK des Menschen' AGENTS.md)"
+case $(git_section) in *release-engineer*) ok "AK-25 Git: release-engineer" ;; *) fail "AK-25 Git: release-engineer" ;; esac
+case $(git_section) in *Squash*) ok "AK-25 Git: Squash" ;; *) fail "AK-25 Git: Squash" ;; esac
+assert_eq "AK-26 AGENTS.md: 'Merge nur nach OK des Menschen' 0x" 0 "$(grep -c 'Merge nur nach OK des Menschen' AGENTS.md)"
+assert_eq "AK-26 AGENTS.md: 'Draft-PR offen' 0x" 0 "$(grep -c 'Draft-PR offen' AGENTS.md)"
+assert_eq "AK-26 AGENTS.md: 'Einziges Gate' 1x" 1 "$(grep -c 'Einziges Gate' AGENTS.md)"
+has "AK-26 AGENTS.md: Schritt 5 nennt Status: done" AGENTS.md '^5\. .*Status: done'
+f=$AGENTS_DIR/release-engineer.md
+lacks "AK-27 release-engineer: kein 'nie mergen'" "$f" 'nie mergen'
+has "AK-27 release-engineer: gh pr merge --squash" "$f" 'gh pr merge --squash'
+has "AK-27 release-engineer: gh pr ready" "$f" 'gh pr ready'
+has "AK-27 release-engineer: blockiert" "$f" 'blockiert'
+has "AK-27 release-engineer: Breaking" "$f" 'Breaking'
+has "AK-27 release-engineer: Tag" "$f" 'Tag'
+has "AK-27 release-engineer: nie auf main pushen" "$f" '[Nn]ie auf `main` pushen'
+has "AK-27 release-engineer: nie Force-Push" "$f" 'nie Force-Push'
+step7=$(grep -E -A1 '^7\. ' .claude/agents/orchestrator.md)
+case $step7 in *done*) ok "AK-28 orchestrator Schritt 7: done" ;; *) fail "AK-28 orchestrator Schritt 7: done" ;; esac
+case $step7 in *pr-open*) ok "AK-28 orchestrator Schritt 7: pr-open" ;; *) fail "AK-28 orchestrator Schritt 7: pr-open" ;; esac
+lacks "AK-29 git-workflow: ohne 'nur durch den Menschen'" .claude/skills/git-workflow/SKILL.md 'nur durch den Menschen'
+has "AK-29 git-workflow: Merge durch den release-engineer" .claude/skills/git-workflow/SKILL.md 'release-engineer.*Squash|Squash.*release-engineer'
+has "AK-30 ADR-0010: Vermerk 2026-11-08 und 0043" docs/adr/adr-0010-agenten-team.md '2026-11-08.*0043'
+jq_has() { jq -e "$1" "$SETTINGS" >/dev/null 2>&1; }
+if jq_has '.permissions.deny | index("Bash(gh pr merge*)") == null and index("Bash(gh pr ready*)") == null'; then ok "AK-31 deny ohne gh pr merge*/ready*"; else fail "AK-31 deny ohne gh pr merge*/ready*"; fi
+for e in 'Bash(gh pr ready *)' 'Bash(gh pr merge --squash *)' 'Bash(gh pr checks *)'; do
+  if in_list allow "$e"; then ok "AK-31 allow: $e"; else fail "AK-31 allow: $e"; fi
+done
+if in_list deny 'Bash(gh pr merge *--admin*)'; then ok "AK-31 deny: gh pr merge --admin"; else fail "AK-31 deny: gh pr merge --admin"; fi
+assert_eq "OoS CONTRIBUTING.md unverändert" "" "$(git diff --name-only a08241b -- CONTRIBUTING.md .github)"
 
 th_summary

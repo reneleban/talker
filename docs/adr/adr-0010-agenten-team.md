@@ -33,6 +33,9 @@ Der Rollenschnitt ist angelehnt an die Lifecycle-Phasen von addyosmani/agent-ski
 5. **Gates**: Spec-Freigabe durch den Menschen (gilt auch als Push-Freigabe des
    Feature-Branches), Merge nach `main` durch den Menschen, Abnahme (Field-Test)
    vor jedem Release statt je Feature.
+   *Änderung 2026-11-08 (Ticket 0043):* Den Merge nach `main` führt der release-engineer unter
+   Bedingungen aus (CI grün, verify:fast grün, kein blockierender Befund, kein Konflikt; nicht bei
+   Breaking Change, Release, Tag). Spec-Freigabe und Release-Abnahme bleiben Gates des Menschen.
 6. **Abläufe eingebettet**: Was eine Rolle braucht, steht in ihrer Definition;
    was mehrere brauchen, ist ein Projekt-Skill im Repo. Keine Verweise auf
    global installierte Skills.
