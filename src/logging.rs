@@ -294,9 +294,14 @@ pub fn warn_if_env_invalid() {
 
 /// Setzt den Grad aus der Config; No-op, solange `TALKER_LOG` gültig übersteuert.
 pub fn apply_config_level(level: LogLevel) {
-    if let Some(level) = level_to_apply(env_override(), level) {
-        log::set_max_level(to_filter(level));
-    }
+    apply_level(env_override(), level);
+}
+
+/// Wie [`apply_config_level`] mit explizitem Override; liefert den gesetzten Filter.
+pub(crate) fn apply_level(env_override: Option<LogLevel>, cfg: LogLevel) -> Option<LevelFilter> {
+    let filter = to_filter(level_to_apply(env_override, cfg)?);
+    log::set_max_level(filter);
+    Some(filter)
 }
 
 /// `~/Library/Logs/talker`.

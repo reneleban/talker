@@ -14,7 +14,7 @@ use tray_icon::menu::MenuEvent;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::config::{self, Config, OverlayPosition};
+use crate::config::{self, Config, LogLevel, OverlayPosition};
 use crate::indicator::Indicator;
 use crate::login_item::{self, LoginItemStatus};
 use crate::models::{self, ModelId, ModelState, ModelsState};
@@ -468,6 +468,46 @@ impl SettingsApp {
                     }
                 },
             );
+        });
+
+        Self::section_title(ui, "PROTOKOLL");
+        Self::card(ui, |ui| {
+            let choice = log_level_choice(snapshot.log_level, crate::logging::env_override());
+            Self::row(
+                ui,
+                "Protokoll",
+                "Detailgrad der Logdatei: Fehler · Warnungen · Info (eine Zeile pro Diktat) · Debug (mit Details je Block/Segment). Wirkt sofort.",
+                |ui| {
+                    ui.add_enabled_ui(!choice.locked, |ui| {
+                        egui::ComboBox::from_id_salt("log_level")
+                            .selected_text(choice.selected.label())
+                            .show_ui(ui, |ui| {
+                                for level in LogLevel::ALL {
+                                    if ui
+                                        .add(egui::Button::selectable(
+                                            choice.selected == level,
+                                            level.label(),
+                                        ))
+                                        .clicked()
+                                    {
+                                        self.update_config(|c| {
+                                            set_log_level(c, level, crate::logging::env_override());
+                                        });
+                                    }
+                                }
+                            });
+                    });
+                    if let Some(hint) = choice.hint {
+                        ui.label(RichText::new(hint).small().weak());
+                    }
+                },
+            );
+            Self::hairline(ui);
+            Self::row(ui, "Logdatei", "~/Library/Logs/talker/talker.log", |ui| {
+                if ui.button("Log im Finder zeigen").clicked() {
+                    crate::logging::reveal_in_finder();
+                }
+            });
         });
 
         if let Some(note) = &self.save_note {
@@ -1098,6 +1138,40 @@ pub(crate) fn upsert_rule(
     }
 }
 
+/// Darstellung der „Protokoll"-Auswahl (REQ-DIAG-005/-006).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LogLevelChoice {
+    pub selected: LogLevel,
+    pub locked: bool,
+    pub hint: Option<&'static str>,
+}
+
+/// Gültiges `TALKER_LOG` sperrt die Auswahl und zeigt dessen Grad.
+pub(crate) fn log_level_choice(cfg: LogLevel, env_override: Option<LogLevel>) -> LogLevelChoice {
+    match env_override {
+        Some(level) => LogLevelChoice {
+            selected: level,
+            locked: true,
+            hint: Some("durch TALKER_LOG übersteuert"),
+        },
+        None => LogLevelChoice {
+            selected: cfg,
+            locked: false,
+            hint: None,
+        },
+    }
+}
+
+/// Neuen Grad in die Config schreiben und ohne Neustart wirksam machen.
+pub(crate) fn set_log_level(
+    cfg: &mut Config,
+    level: LogLevel,
+    env_override: Option<LogLevel>,
+) -> Option<log::LevelFilter> {
+    cfg.log_level = level;
+    crate::logging::apply_level(env_override, level)
+}
+
 fn open_privacy_pane(pane: &str) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     if let Err(e) = Command::new("open").arg(url).spawn() {
@@ -1219,6 +1293,56 @@ mod tests {
         assert_eq!(
             reloaded.context_rules,
             vec![("com.apple.Terminal".to_string(), CleanupMode::LlmOptimized)]
+        );
+    }
+
+    /// REQ-DIAG-005: Labels der Protokoll-Auswahl.
+    #[test]
+    fn log_level_choice_shows_the_config_level_unlocked() {
+        for level in LogLevel::ALL {
+            let choice = log_level_choice(level, None);
+            assert_eq!(
+                choice,
+                LogLevelChoice {
+                    selected: level,
+                    locked: false,
+                    hint: None
+                }
+            );
+        }
+        let labels: Vec<_> = LogLevel::ALL.iter().map(|l| l.label()).collect();
+        assert_eq!(labels, ["Fehler", "Warnungen", "Info", "Debug"]);
+    }
+
+    /// REQ-DIAG-006: gültiges `TALKER_LOG` sperrt und zeigt dessen Grad.
+    #[test]
+    fn log_level_choice_is_locked_and_shows_env_level_with_override() {
+        let choice = log_level_choice(LogLevel::Info, Some(LogLevel::Debug));
+        assert_eq!(choice.selected, LogLevel::Debug);
+        assert!(choice.locked);
+        assert_eq!(choice.hint, Some("durch TALKER_LOG übersteuert"));
+    }
+
+    /// REQ-DIAG-005: Änderung wirkt ohne Neustart und wird gespeichert.
+    #[test]
+    fn changing_the_log_level_applies_it_and_persists_it() {
+        let dir = std::env::temp_dir().join(format!("talker-ui-loglevel-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut cfg = Config::default();
+        let applied = set_log_level(&mut cfg, LogLevel::Debug, None);
+        assert_eq!(applied, Some(log::LevelFilter::Debug));
+        cfg.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).log_level, LogLevel::Debug);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REQ-DIAG-006 „darf nicht passieren": mit Override ändert sich der Grad nicht.
+    #[test]
+    fn changing_the_log_level_is_not_applied_while_env_overrides() {
+        let mut cfg = Config::default();
+        assert_eq!(
+            set_log_level(&mut cfg, LogLevel::Debug, Some(LogLevel::Error)),
+            None
         );
     }
 }
