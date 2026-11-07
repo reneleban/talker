@@ -41,6 +41,7 @@ FORBIDDEN='SendMessage|ListAgents|osascript|/tmp/cc-socks'
 agent_common() { # <rolle> [muster für die Meldung, Default: an den Orchestrator]
   f=$AGENTS_DIR/$1.md
   lacks "AK-16 $1: kein SendMessage/ListAgents/osascript/cc-socks" "$f" "$FORBIDDEN"
+  lacks "AK-17 $1: keine Ghostty-Kacheln" "$f" 'Ghostty|Kachel'
   has "AK-16 $1: Meldung über say.sh" "$f" "${2:-scripts/team/say[.]sh orchestrator}"
 }
 
@@ -90,5 +91,18 @@ has "AK-21 merger: blockiert bei Konflikt" "$f" 'blockiert'
 has "AK-21 merger: keine eigene Konfliktlösung" "$f" 'keine eigene Konfliktlösung'
 lacks "AK-21 merger: löst keine Konflikte auf" "$f" 'mechanische Konflikte|auflösen'
 has "AK-22 merger: Abschnitt nur per Edit" "$f" 'nie `Write`'
+
+# --- T15: product-owner, architect, rust-developer, test-engineer (AK-16, AK-22) ---
+akte_checks() { # <rolle>
+  f=$AGENTS_DIR/$1.md
+  has "AK-22 $1: Akte nur per Edit, nie Write" "$f" 'nie `Write`'
+  has "AK-22 $1: Abschnitt mit Instanz" "$f" "## $1-<n>"
+  has "Rückfall $1: letzte Abschnittszeile fertig/blockiert" "$f" 'letzte Zeile.*(fertig|blockiert)'
+}
+for r in product-owner architect rust-developer test-engineer; do
+  agent_common "$r"
+  akte_checks "$r"
+done
+has "AK-18 product-owner: Kopfzeile ist keine Freigabe" "$AGENTS_DIR/product-owner.md" '\[talker von .*keine Freigabe'
 
 th_summary

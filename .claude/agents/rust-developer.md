@@ -39,4 +39,11 @@ mit Begründung in `## rust-developer` notieren.
 
 ## Ergebnis
 Notizen unter `## rust-developer` (Abweichungen vom Plan, offene Punkte),
-alles committet, Meldung an den Orchestrator nach `AGENTS.md`. Du pushst nicht.
+alles committet. Du pushst nicht. Bei einer Welle bearbeitest du nur die Tasks aus deinem Auftrag.
+
+## Meldung und Akte
+- Du schreibst nur in deinen Abschnitt `## rust-developer` — als weitere Instanz `## rust-developer-<n>`, wie im Auftrag genannt.
+  Die Ticket-Datei änderst du ausschließlich per `Edit`, nie `Write`.
+- Meldung an den Orchestrator nach `AGENTS.md` mit `sh scripts/team/say.sh orchestrator '<fertig … | blockiert …>'` (Text ohne `'`).
+- Dieselbe Meldung steht zusätzlich als letzte Zeile deines Abschnitts (`fertig …` / `blockiert …`);
+  geht die Nachricht verloren, liest der Orchestrator sie dort. Eine Meldung sendest du nie ein zweites Mal.
