@@ -1,7 +1,7 @@
 //! audio-capture: Mikrofon-Aufnahme (PTT-gesteuert), in-memory, Ausgabe 16 kHz mono PCM.
 //!
 //! Aufnahme via cpal (CoreAudio); Downmix + Resampling als pure, unit-getestete
-//! Funktionen. Kein Platten-I/O, kein Upload.
+//! Funktionen. Aufnahme ohne Platten-I/O und ohne Upload; `WavSource` liest Test-/Mess-WAVs.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -291,6 +291,15 @@ pub fn input_device_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Anfangskapazität des I16-Scratch-Puffers (typische Callback-Größe bei 48 kHz stereo).
+const I16_SCRATCH_SAMPLES: usize = 4_096;
+
+/// I16 → f32 in `[-1, 1)`; ersetzt den Inhalt von `out` und behält dessen Kapazität.
+fn i16_to_f32(data: &[i16], out: &mut Vec<f32>) {
+    out.clear();
+    out.extend(data.iter().map(|&s| f32::from(s) / 32768.0));
+}
+
 /// Mikrofon über cpal (CoreAudio). `device_name`: Gerät per Name aus der Config,
 /// nicht (mehr) vorhanden → Fallback auf das System-Default-Mikrofon.
 pub struct MicSource {
@@ -345,16 +354,19 @@ impl AudioSource for MicSource {
                 err_fn,
                 None,
             ),
-            SampleFormat::I16 => device.build_input_stream(
-                config,
-                move |data: &[i16], info: &cpal::InputCallbackInfo| {
-                    let converted: Vec<f32> =
-                        data.iter().map(|&s| f32::from(s) / 32768.0).collect();
-                    on_block(&converted, info.timestamp().callback.into());
-                },
-                err_fn,
-                None,
-            ),
+            SampleFormat::I16 => {
+                // Scratch-Puffer: keine Allokation je Callback (nur beim ersten größeren Block).
+                let mut scratch: Vec<f32> = Vec::with_capacity(I16_SCRATCH_SAMPLES);
+                device.build_input_stream(
+                    config,
+                    move |data: &[i16], info: &cpal::InputCallbackInfo| {
+                        i16_to_f32(data, &mut scratch);
+                        on_block(&scratch, info.timestamp().callback.into());
+                    },
+                    err_fn,
+                    None,
+                )
+            }
             other => {
                 return Err(TalkerError::Audio(format!(
                     "nicht unterstütztes Sample-Format: {other}"
@@ -786,6 +798,21 @@ mod tests {
         let out = to_mono_16k(&interleaved, 2, 16_000).unwrap();
         assert_eq!(out.len(), 1600);
         assert!(out.iter().all(|&s| (s - 0.5).abs() < f32::EPSILON));
+    }
+
+    /// PERF-2: I16-Konvertierung in einen wiederverwendeten Puffer — Werte stimmen, die
+    /// Kapazität bleibt, kein neuer Speicher bei gleich großen oder kleineren Blöcken.
+    #[test]
+    fn i16_conversion_reuses_the_scratch_buffer() {
+        let mut out = Vec::with_capacity(I16_SCRATCH_SAMPLES);
+        i16_to_f32(&[0, 16_384, -32_768, 32_767], &mut out);
+        assert_eq!(out, [0.0, 0.5, -1.0, 32_767.0 / 32_768.0]);
+        let ptr = out.as_ptr();
+        i16_to_f32(&[8_192; 4_000], &mut out);
+        assert_eq!(out.len(), 4_000);
+        assert_eq!(out.as_ptr(), ptr, "keine neue Allokation");
+        i16_to_f32(&[], &mut out);
+        assert!(out.is_empty() && out.capacity() >= I16_SCRATCH_SAMPLES);
     }
 
     #[test]
