@@ -1,6 +1,6 @@
 # ADR-0010 — Agenten-Team mit eigenen Sessions je Rolle
 
-- Status: akzeptiert
+- Status: akzeptiert; Punkt 2 und die Ghostty-Konsequenzen abgelöst durch ADR-0013
 - Datum: 2026-11-06
 - Kontext: `AGENTS.md` (Team, Ablauf, Übergabe-Protokoll), `.claude/agents/`, `.claude/skills/`
 
