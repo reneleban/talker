@@ -8,8 +8,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream};
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Fft, FixedSync, Resampler};
 
@@ -152,17 +152,77 @@ impl ChunkAssembler {
     }
 }
 
-/// Laufende Aufnahme. `stop()` beendet sie und liefert 16 kHz mono PCM.
-pub struct Recording {
-    stream: Stream,
-    buf: Arc<Mutex<Vec<f32>>>,
-    channels: u16,
-    sample_rate: u32,
-    level: LevelHandle,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioFormat {
+    pub channels: u16,
+    pub sample_rate: u32,
 }
 
-/// Rohe Callback-Blöcke für das Live-Diktat: Sender plus Format.
-pub type RawBlocks = Sender<Vec<f32>>;
+/// Format und Name der geöffneten Quelle (Gerätename erscheint in der Messzeile).
+#[derive(Clone, Debug)]
+pub struct SourceInfo {
+    pub format: AudioFormat,
+    pub device: String,
+}
+
+/// Ein Callback-Block im Geräteformat (interleaved) samt Zeitstempel der gemeinsamen Uhr.
+pub struct Block {
+    pub samples: Vec<f32>,
+    pub at: HostInstant,
+}
+
+/// Der Live-Kanal trägt Blöcke und zum Schluss genau ein `End`.
+pub enum Feed {
+    Block(Block),
+    End(Box<Ended>),
+}
+
+/// Abschluss einer Live-Aufnahme: Loslass-Zeitpunkt und die gesamte Aufnahme.
+pub struct Ended {
+    pub released_at: HostInstant,
+    pub captured: Captured,
+}
+
+/// Rohe Aufnahme einer Utterance im Geräteformat.
+pub struct Captured {
+    pub raw: Vec<f32>,
+    pub info: SourceInfo,
+}
+
+impl Captured {
+    /// Rohsamples → 16 kHz mono.
+    pub fn to_mono_16k(&self) -> Result<Vec<f32>> {
+        to_mono_16k(
+            &self.raw,
+            self.info.format.channels,
+            self.info.format.sample_rate,
+        )
+    }
+}
+
+/// Wird je Block auf dem Thread der Quelle aufgerufen (Audio-Callback: keine Datei-I/O, kein Log).
+pub type OnBlock = Box<dyn FnMut(&[f32], HostInstant) + Send>;
+
+/// Geöffnete Quelle: Drop von `stop` beendet die Lieferung — danach kommt kein Block mehr.
+pub struct Opened {
+    pub info: SourceInfo,
+    pub stop: Box<dyn Send>,
+}
+
+/// Erzeuger von Audio-Blöcken (ADR-0012): Mikrofon in der App, WAV in Tests.
+pub trait AudioSource: Send {
+    fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened>;
+}
+
+/// Laufende Aufnahme über einer [`AudioSource`]: Puffer, Pegel und Live-Kanal
+/// sind für alle Quellen gleich.
+pub struct Recording {
+    stop: Box<dyn Send>,
+    buf: Arc<Mutex<Vec<f32>>>,
+    info: SourceInfo,
+    level: LevelHandle,
+    live: Option<Sender<Feed>>,
+}
 
 /// Namen aller Eingabegeräte (für die Mikrofon-Auswahl in den Settings).
 pub fn input_device_names() -> Vec<String> {
@@ -176,93 +236,121 @@ pub fn input_device_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Startet die Mikrofon-Aufnahme. `device_name`: Gerät per Name aus der Config,
+/// Mikrofon über cpal (CoreAudio). `device_name`: Gerät per Name aus der Config,
 /// nicht (mehr) vorhanden → Fallback auf das System-Default-Mikrofon.
-/// `blocks`: optional zusätzlicher Verbraucher (Live-Diktat) — bekommt jeden
-/// Callback-Block roh; ohne ihn bleibt der Callback wie bisher.
-pub fn start(device_name: Option<&str>, blocks: Option<RawBlocks>) -> Result<Recording> {
-    let host = cpal::default_host();
-    let device = device_name
-        .and_then(|wanted| {
-            let found = host
-                .input_devices()
-                .ok()?
-                .find(|d| d.description().is_ok_and(|desc| desc.name() == wanted));
-            if found.is_none() {
-                eprintln!("talker: Mikrofon »{wanted}« nicht gefunden — nutze System-Default.");
-            }
-            found
-        })
-        .or_else(|| host.default_input_device())
-        .ok_or_else(|| TalkerError::Audio("kein Mikrofon verfügbar".into()))?;
-    let supported = device
-        .default_input_config()
-        .map_err(|e| TalkerError::Audio(format!("Eingabeformat nicht lesbar: {e}")))?;
-    let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
-    let channels = config.channels;
-    let sample_rate = config.sample_rate;
+pub struct MicSource {
+    device_name: Option<String>,
+}
 
+impl MicSource {
+    pub fn new(device_name: Option<String>) -> Self {
+        Self { device_name }
+    }
+}
+
+impl AudioSource for MicSource {
+    fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+        let host = cpal::default_host();
+        let device = self
+            .device_name
+            .as_deref()
+            .and_then(|wanted| {
+                let found = host
+                    .input_devices()
+                    .ok()?
+                    .find(|d| d.description().is_ok_and(|desc| desc.name() == wanted));
+                if found.is_none() {
+                    log::warn!("Mikrofon »{wanted}« nicht gefunden — nutze System-Default.");
+                }
+                found
+            })
+            .or_else(|| host.default_input_device())
+            .ok_or_else(|| TalkerError::Audio("kein Mikrofon verfügbar".into()))?;
+        let device_label = device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_else(|_| "unbekannt".into());
+        let supported = device
+            .default_input_config()
+            .map_err(|e| TalkerError::Audio(format!("Eingabeformat nicht lesbar: {e}")))?;
+        let sample_format = supported.sample_format();
+        let config: cpal::StreamConfig = supported.into();
+        let format = AudioFormat {
+            channels: config.channels,
+            sample_rate: config.sample_rate,
+        };
+        let err_fn = |e| log::warn!("Audio-Stream-Fehler: {e}");
+
+        let stream = match sample_format {
+            SampleFormat::F32 => device.build_input_stream(
+                config,
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    on_block(data, info.timestamp().callback.into());
+                },
+                err_fn,
+                None,
+            ),
+            SampleFormat::I16 => device.build_input_stream(
+                config,
+                move |data: &[i16], info: &cpal::InputCallbackInfo| {
+                    let converted: Vec<f32> =
+                        data.iter().map(|&s| f32::from(s) / 32768.0).collect();
+                    on_block(&converted, info.timestamp().callback.into());
+                },
+                err_fn,
+                None,
+            ),
+            other => {
+                return Err(TalkerError::Audio(format!(
+                    "nicht unterstütztes Sample-Format: {other}"
+                )));
+            }
+        }
+        .map_err(|e| TalkerError::Audio(format!("Aufnahme-Stream fehlgeschlagen: {e}")))?;
+
+        stream
+            .play()
+            .map_err(|e| TalkerError::Audio(format!("Aufnahme-Start fehlgeschlagen: {e}")))?;
+
+        Ok(Opened {
+            info: SourceInfo {
+                format,
+                device: device_label,
+            },
+            stop: Box::new(stream),
+        })
+    }
+}
+
+/// Startet die Aufnahme über `source`. `live`: optionaler zusätzlicher Verbraucher
+/// (Live-Diktat) — bekommt jeden Block roh als `Feed::Block`, am Ende `Feed::End`.
+pub fn start(source: Box<dyn AudioSource>, live: Option<Sender<Feed>>) -> Result<Recording> {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let level = LevelHandle::default();
-    let err_fn = |e| eprintln!("talker: Audio-Stream-Fehler: {e}");
-
-    let stream = match sample_format {
-        SampleFormat::F32 => {
-            let buf = Arc::clone(&buf);
-            let level = level.clone();
-            device.build_input_stream(
-                config,
-                move |data: &[f32], _| {
-                    level.set(rms(data));
-                    if let Ok(mut b) = buf.lock() {
-                        b.extend_from_slice(data);
-                    }
-                    if let Some(tx) = &blocks {
-                        let _ = tx.send(data.to_vec());
-                    }
-                },
-                err_fn,
-                None,
-            )
-        }
-        SampleFormat::I16 => {
-            let buf = Arc::clone(&buf);
-            let level = level.clone();
-            device.build_input_stream(
-                config,
-                move |data: &[i16], _| {
-                    if let Ok(mut b) = buf.lock() {
-                        let start = b.len();
-                        b.extend(data.iter().map(|&s| f32::from(s) / 32768.0));
-                        level.set(rms(&b[start..]));
-                        if let Some(tx) = &blocks {
-                            let _ = tx.send(b[start..].to_vec());
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )
-        }
-        other => {
-            return Err(TalkerError::Audio(format!(
-                "nicht unterstütztes Sample-Format: {other}"
-            )));
-        }
-    }
-    .map_err(|e| TalkerError::Audio(format!("Aufnahme-Stream fehlgeschlagen: {e}")))?;
-
-    stream
-        .play()
-        .map_err(|e| TalkerError::Audio(format!("Aufnahme-Start fehlgeschlagen: {e}")))?;
-
+    let on_block: OnBlock = {
+        let buf = Arc::clone(&buf);
+        let level = level.clone();
+        let live = live.clone();
+        Box::new(move |data, at| {
+            level.set(rms(data));
+            if let Ok(mut b) = buf.lock() {
+                b.extend_from_slice(data);
+            }
+            if let Some(tx) = &live {
+                let _ = tx.send(Feed::Block(Block {
+                    samples: data.to_vec(),
+                    at,
+                }));
+            }
+        })
+    };
+    let opened = source.open(on_block)?;
     Ok(Recording {
-        stream,
+        stop: opened.stop,
         buf,
-        channels,
-        sample_rate,
+        info: opened.info,
         level,
+        live,
     })
 }
 
@@ -272,27 +360,38 @@ impl Recording {
         self.level.clone()
     }
 
-    /// Kanalzahl und Abtastrate des Geräts — Eingabe für [`ChunkAssembler::new`].
-    pub fn format(&self) -> (u16, u32) {
-        (self.channels, self.sample_rate)
+    /// Format und Gerät der Quelle — Eingabe für [`ChunkAssembler::new`].
+    pub fn info(&self) -> &SourceInfo {
+        &self.info
     }
 
-    /// Beendet eine Live-Aufnahme: der Stream (und damit der Block-Kanal) wird
-    /// geschlossen, die Samples hat der Verbraucher bereits bekommen.
-    pub fn finish_live(self) {
-        drop(self.stream);
+    fn into_captured(self) -> (Captured, Option<Sender<Feed>>) {
+        drop(self.stop);
+        let raw = std::mem::take(&mut *self.buf.lock().unwrap_or_else(|e| e.into_inner()));
+        (
+            Captured {
+                raw,
+                info: self.info,
+            },
+            self.live,
+        )
     }
 
-    /// Beendet die Aufnahme und liefert die Utterance als 16 kHz mono PCM.
-    pub fn stop(self) -> Result<Vec<f32>> {
-        drop(self.stream);
-        let raw = std::mem::take(
-            &mut *self
-                .buf
-                .lock()
-                .map_err(|_| TalkerError::Audio("Aufnahme-Puffer vergiftet".into()))?,
-        );
-        to_mono_16k(&raw, self.channels, self.sample_rate)
+    /// Beendet eine Live-Aufnahme: erst die Quelle schließen, dann `Feed::End`
+    /// mit der gesamten Aufnahme senden (die Blöcke hat der Verbraucher schon).
+    pub fn finish_live(self, released_at: HostInstant) {
+        let (captured, live) = self.into_captured();
+        if let Some(tx) = live {
+            let _ = tx.send(Feed::End(Box::new(Ended {
+                released_at,
+                captured,
+            })));
+        }
+    }
+
+    /// Beendet die Aufnahme und liefert die rohe Utterance.
+    pub fn stop(self) -> Captured {
+        self.into_captured().0
     }
 }
 
@@ -592,5 +691,134 @@ mod tests {
         assert_eq!(ticks_to_nanos(5, 1, 1), 5);
         assert_eq!(ticks_to_nanos(u64::MAX, 125, 3), u64::MAX);
         assert_eq!(ticks_to_nanos(10, 1, 0), 10);
+    }
+
+    /// Test-Quelle: liefert die Blöcke synchron aus `open` (virtuelle Zeitstempel 1 µs je Block).
+    struct ScriptedSource {
+        blocks: Vec<Vec<f32>>,
+        info: SourceInfo,
+    }
+
+    impl ScriptedSource {
+        fn new(blocks: Vec<Vec<f32>>, channels: u16, sample_rate: u32) -> Box<Self> {
+            Box::new(Self {
+                blocks,
+                info: SourceInfo {
+                    format: AudioFormat {
+                        channels,
+                        sample_rate,
+                    },
+                    device: "Test-Mikro".into(),
+                },
+            })
+        }
+    }
+
+    impl AudioSource for ScriptedSource {
+        fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+            for (i, block) in self.blocks.iter().enumerate() {
+                on_block(block, HostInstant::from_nanos(1_000 * (i as u64 + 1)));
+            }
+            Ok(Opened {
+                info: self.info,
+                stop: Box::new(()),
+            })
+        }
+    }
+
+    struct FailingSource;
+
+    impl AudioSource for FailingSource {
+        fn open(self: Box<Self>, _: OnBlock) -> Result<Opened> {
+            Err(TalkerError::Audio("kein Mikrofon verfügbar".into()))
+        }
+    }
+
+    /// REQ-DIAG-023: `stop()` liefert genau die gelieferten Rohsamples samt Format/Gerät.
+    #[test]
+    fn recording_over_a_source_returns_input_format_and_device() {
+        let blocks = vec![vec![0.1, 0.2], vec![0.3, 0.4], vec![0.5, 0.6]];
+        let rec = start(ScriptedSource::new(blocks, 2, 48_000), None).unwrap();
+        assert_eq!(rec.info().format.channels, 2);
+        assert_eq!(rec.info().format.sample_rate, 48_000);
+        assert_eq!(rec.info().device, "Test-Mikro");
+        let captured = rec.stop();
+        assert_eq!(captured.raw, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        assert_eq!(captured.info.device, "Test-Mikro");
+        // 48 kHz stereo → 16 kHz mono: Dauer bleibt erhalten (±1 Frame Resampler-Rand).
+        let mono = captured.to_mono_16k().unwrap();
+        assert!(mono.len() <= 1);
+    }
+
+    #[test]
+    fn recording_without_blocks_stops_with_empty_capture() {
+        let captured = start(ScriptedSource::new(vec![], 1, 16_000), None)
+            .unwrap()
+            .stop();
+        assert!(captured.raw.is_empty());
+        assert!(captured.to_mono_16k().unwrap().is_empty());
+    }
+
+    /// Der Pegel folgt dem zuletzt gelieferten Block.
+    #[test]
+    fn recording_level_reacts_to_the_last_block() {
+        let rec = start(
+            ScriptedSource::new(vec![vec![0.0; 4], vec![0.5; 4]], 1, 16_000),
+            None,
+        )
+        .unwrap();
+        assert!((rec.level().get() - 0.5).abs() < 1e-6);
+    }
+
+    /// Live-Kanal: Blöcke in Reihenfolge, genau ein `End` bei `finish_live`, danach nichts mehr.
+    #[test]
+    fn live_channel_gets_blocks_then_exactly_one_end() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rec = start(
+            ScriptedSource::new(vec![vec![1.0], vec![2.0, 3.0]], 1, 16_000),
+            Some(tx),
+        )
+        .unwrap();
+        rec.finish_live(HostInstant::from_nanos(9_000));
+        let feeds: Vec<Feed> = rx.try_iter().collect();
+        assert_eq!(feeds.len(), 3);
+        match (&feeds[0], &feeds[1]) {
+            (Feed::Block(a), Feed::Block(b)) => {
+                assert_eq!(a.samples, [1.0]);
+                assert_eq!(a.at, HostInstant::from_nanos(1_000));
+                assert_eq!(b.samples, [2.0, 3.0]);
+            }
+            _ => panic!("erst zwei Blöcke erwartet"),
+        }
+        match &feeds[2] {
+            Feed::End(ended) => {
+                assert_eq!(ended.released_at, HostInstant::from_nanos(9_000));
+                assert_eq!(ended.captured.raw, [1.0, 2.0, 3.0]);
+            }
+            Feed::Block(_) => panic!("End erwartet"),
+        }
+        // Kanal ist danach geschlossen: kein weiterer Block, kein zweites End.
+        assert!(rx.recv().is_err());
+    }
+
+    /// Fehler aus `open` → `start` gibt `Err`.
+    #[test]
+    fn failing_source_makes_start_fail() {
+        let result = start(Box::new(FailingSource), None);
+        assert!(result.is_err_and(|e| e.to_string().contains("kein Mikrofon")));
+    }
+
+    /// Batch-Aufnahme (ohne Live-Kanal) sendet nichts und bleibt gleich.
+    #[test]
+    fn batch_stop_works_with_a_live_channel_too() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rec = start(
+            ScriptedSource::new(vec![vec![0.25; 8]], 1, 16_000),
+            Some(tx),
+        )
+        .unwrap();
+        assert_eq!(rec.stop().raw.len(), 8);
+        assert!(matches!(rx.recv(), Ok(Feed::Block(_))));
+        assert!(rx.recv().is_err(), "stop() sendet kein End");
     }
 }

@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use talker::indicator::Indicator;
 use talker::{
-    cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline, stt,
-    tray, ui,
+    audio, cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline,
+    stt, tray, ui,
 };
 
 /// Lädt das Cleanup-Modell; das zweite Element meldet den Fehlschlag
@@ -127,7 +127,7 @@ fn spawn_stt_worker(
                     let mut first_hint = None;
                     pipeline::run_live(
                         &mut worker,
-                        feed.blocks,
+                        pipeline::feed_samples(feed.blocks),
                         feed.format,
                         feed.frontmost.as_deref(),
                         &cfg,
@@ -292,7 +292,10 @@ fn main() -> ExitCode {
                     // dieser Factory (permissions::should_relaunch_for_tap) findet
                     // nie eine laufende Aufnahme vor, weil der alte Tap dafür schon
                     // aktiv gewesen sein müsste.
-                    let session_press = Arc::new(Mutex::new(pipeline::PttSession::new()));
+                    let session_press =
+                        Arc::new(Mutex::new(pipeline::PttSession::new(Box::new(|cfg| {
+                            Box::new(audio::MicSource::new(cfg.mic_device.clone()))
+                        }))));
                     let session_release = Arc::clone(&session_press);
                     hotkey::install(
                         Arc::clone(&config),

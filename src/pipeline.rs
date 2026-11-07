@@ -476,13 +476,17 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
 /// ersetzt die früheren `thread_local!`-Zellen in `main.rs` (Ticket-0038).
 /// Läuft ausschließlich auf dem Main-Thread (Hotkey-Callbacks), geteilt über
 /// `Arc<Mutex<PttSession>>`, weil `hotkey::install` `Send`-Closures verlangt.
-#[derive(Default)]
 pub struct PttSession {
+    /// Liefert je Tastendruck die Audioquelle (App: Mikrofon, Tests: WAV).
+    open_source: SourceFactory,
     slot: Option<Arc<Mutex<MicSlot<audio::Recording>>>>,
     frontmost: Option<String>,
     /// Die laufende Aufnahme speist das Live-Diktat (Block-Kanal).
     live: bool,
 }
+
+/// Erzeugt die Audioquelle für eine Aufnahme aus der aktuellen Config.
+pub type SourceFactory = Box<dyn Fn(&Config) -> Box<dyn audio::AudioSource> + Send + Sync>;
 
 /// Zustand des (im Hintergrund startenden) Mikrofons zwischen Press und Release.
 enum MicSlot<R> {
@@ -560,8 +564,18 @@ pub enum MicReady {
 /// Rohe Audio-Blöcke einer Live-Aufnahme samt Format und Ziel-App.
 pub struct LiveFeed {
     pub frontmost: Option<String>,
-    pub blocks: std::sync::mpsc::Receiver<Vec<f32>>,
+    pub blocks: std::sync::mpsc::Receiver<audio::Feed>,
     pub format: (u16, u32),
+}
+
+/// Rohsamples der Blöcke eines Live-Kanals, bis `Feed::End` oder das Kanal-Ende kommt.
+pub fn feed_samples(
+    blocks: std::sync::mpsc::Receiver<audio::Feed>,
+) -> impl Iterator<Item = Vec<f32>> {
+    blocks.into_iter().map_while(|feed| match feed {
+        audio::Feed::Block(block) => Some(block.samples),
+        audio::Feed::End(_) => None,
+    })
 }
 
 /// Ergebnis von [`PttSession::release`].
@@ -586,8 +600,13 @@ pub enum ReleaseOutcome {
 }
 
 impl PttSession {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(open_source: SourceFactory) -> Self {
+        Self {
+            open_source,
+            slot: None,
+            frontmost: None,
+            live: false,
+        }
     }
 
     /// PTT gedrückt: Setup-Gate prüfen, Frontmost-App VOR Aufnahmestart
@@ -612,14 +631,14 @@ impl PttSession {
             // Im Live-Betrieb zeigt der Indicator den tatsächlich wirkenden Modus.
             mode = cfg.insert_mode.resolve(mode);
         }
-        let device = cfg.mic_device.clone();
+        let source = (self.open_source)(cfg);
         let slot = Arc::new(Mutex::new(MicSlot::Starting));
         self.slot = Some(Arc::clone(&slot));
         self.frontmost = frontmost.clone();
         self.live = live;
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
-            let started = audio::start(device.as_deref(), live.then_some(tx));
+            let started = audio::start(source, live.then_some(tx));
             eprintln!(
                 "talker: Mikrofon-Start dauerte {} ms",
                 pressed_at.elapsed().as_millis()
@@ -631,7 +650,7 @@ impl PttSession {
                     live: live.then(|| LiveFeed {
                         frontmost,
                         blocks: rx,
-                        format: rec.format(),
+                        format: (rec.info().format.channels, rec.info().format.sample_rate),
                     }),
                 }),
                 Err(e) => on_ready(MicReady::Failed(e)),
@@ -653,10 +672,10 @@ impl PttSession {
             Taken::Gone => return ReleaseOutcome::NoRecording,
         };
         if std::mem::take(&mut self.live) {
-            rec.finish_live();
+            rec.finish_live(audio::HostInstant::now());
             return ReleaseOutcome::LiveEnded;
         }
-        match rec.stop() {
+        match rec.stop().to_mono_16k() {
             Ok(pcm) => {
                 let ms = audio::duration_ms(&pcm);
                 if ms < audio::MIN_UTTERANCE_MS {
@@ -883,6 +902,10 @@ mod tests {
     // Ticket-0038). Getestet wird deshalb nur, was ohne Hardware entscheidbar
     // ist: das Setup-Gate selbst und der Leerlauf-Fall von `release()`.
 
+    fn mic_factory() -> SourceFactory {
+        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone())))
+    }
+
     // ---- asynchroner Mikrofon-Start (MicSlot) ----
 
     struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
@@ -937,7 +960,7 @@ mod tests {
     #[test]
     fn press_blocked_by_setup_gate_never_touches_audio() {
         let models = ModelsState::new(ModelState::Missing, ModelState::Missing);
-        let mut session = PttSession::new();
+        let mut session = PttSession::new(mic_factory());
 
         let outcome = session.press(&Config::default(), &models, |_| {});
 
@@ -946,7 +969,7 @@ mod tests {
 
     #[test]
     fn release_without_a_press_reports_no_recording() {
-        let mut session = PttSession::new();
+        let mut session = PttSession::new(mic_factory());
 
         assert!(matches!(session.release(), ReleaseOutcome::NoRecording));
     }

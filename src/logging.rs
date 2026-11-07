@@ -836,7 +836,7 @@ mod tests {
     /// Die Allowlist schrumpft mit T13/T14 auf null.
     #[test]
     fn no_eprintln_outside_the_stderr_fallback() {
-        const ALLOWLIST: [&str; 3] = ["pipeline.rs", "main.rs", "audio.rs"];
+        const ALLOWLIST: [&str; 2] = ["pipeline.rs", "main.rs"];
         let mut files = Vec::new();
         rust_files(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
