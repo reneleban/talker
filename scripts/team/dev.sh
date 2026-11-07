@@ -54,8 +54,8 @@ if ! h agent list | jq -e '.result.agents[] | select(.name == "orchestrator")' >
   else
     TAB=$(h tab list --workspace "$WS" | jq -r '.result.tabs | sort_by(.number) | .[0].tab_id')
     PANE=$(h pane list --workspace "$WS" | jq -r --arg t "$TAB" '[.result.panes[] | select(.tab_id == $t)] | .[0].pane_id')
-    if h agent list | jq -e --arg p "$PANE" '.result.agents[] | select(.pane_id == $p and .agent == "claude")' >/dev/null; then
-      # Nach einem Server-Neustart nimmt herdr Claude ohne Namen wieder auf (A5)
+    if h agent list | jq -e --arg p "$PANE" '.result.agents[] | select(.pane_id == $p and .agent == "claude" and (.name // "") == "")' >/dev/null; then
+      # Nach einem Server-Neustart nimmt herdr Claude ohne Namen wieder auf (A5); benannte Agenten bleiben unberührt
       h agent rename "$PANE" orchestrator >/dev/null
     else
       shell_free "$PANE" || PANE=$(h pane split "$PANE" --direction right --cwd "$MAIN" --no-focus | jq -r '.result.pane.pane_id')

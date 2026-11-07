@@ -85,6 +85,17 @@ run_dev 4
 assert_eq "AK-3 orchestrator läuft wieder" 1 "$(orch_count)"
 assert_eq "AK-3 im ersten Tab" "$(first_tab)" "$(orch_tab)"
 
+# C1: benannter Claude-Agent in der ersten Pane (z. B. product-owner-0001) wird nicht zum orchestrator umbenannt
+th_h agent rename orchestrator product-owner-0001 >/dev/null
+assert_eq "C1 Vorbedingung: kein orchestrator, benannter Claude in erster Pane" 0 "$(orch_count)"
+PO_PANE=$(th_h agent list | jq -r '.result.agents[] | select(.name == "product-owner-0001") | .pane_id')
+run_dev 4b
+assert_eq "C1 product-owner-0001 behält seinen Namen" 1 \
+  "$(th_h agent list | jq '[.result.agents[] | select(.name == "product-owner-0001")] | length')"
+assert_eq "C1 orchestrator wird neu gestartet" 1 "$(orch_count)"
+assert_eq "C1 orchestrator läuft nicht in der Pane des benannten Agenten" 1 "$([ "$(orch_pane)" != "$PO_PANE" ] && echo 1 || echo 0)"
+th_h pane close "$PO_PANE" >/dev/null
+
 # Grenzfall: erste Pane des ersten Tabs belegt (keine Shell) → Split rechts
 th_h pane split "$(orch_pane)" --direction right --cwd "$TH_REPO" --no-focus >/dev/null
 th_h pane close "$(orch_pane)" >/dev/null
