@@ -30,7 +30,7 @@ assert_contains "AK-4 ohne jq: Meldung nennt jq" "jq fehlt im PATH" "$out"
 if th_session_exists; then fail "AK-4: Fehlerpfad startet keine Session"; else ok "AK-4: Fehlerpfad startet keine Session"; fi
 
 # --- AK-1: Session + Orchestrator, ohne TTY (stdout in Datei) → attach scheitert erwartet ---
-(cd "$TH_REPO" && TEAM_SESSION=$TS sh "$DEV" >"$TH_TMP/dev1.out" 2>&1 </dev/null); rc=$?
+(cd "$TH_REPO" && env -u HERDR_ENV -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID TEAM_SESSION=$TS sh "$DEV" >"$TH_TMP/dev1.out" 2>&1 </dev/null); rc=$?
 assert_eq "AK-1 ohne TTY endet attach mit Exit ≠ 0" 1 "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
 grep -E '^dev:|^\{"error' "$TH_TMP/dev1.out" | sed 's/^/       /' || true
 assert_contains "AK-1 attach scheitert am Terminal" "usable terminal" "$(cat "$TH_TMP/dev1.out")"
