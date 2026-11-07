@@ -79,6 +79,47 @@ impl InsertMode {
     }
 }
 
+/// Detailgrad des Logs (ADR-0011): Settings-Auswahl und `TALKER_LOG`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    pub const ALL: [LogLevel; 4] = [
+        LogLevel::Error,
+        LogLevel::Warn,
+        LogLevel::Info,
+        LogLevel::Debug,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LogLevel::Error => "Fehler",
+            LogLevel::Warn => "Warnungen",
+            LogLevel::Info => "Info",
+            LogLevel::Debug => "Debug",
+        }
+    }
+
+    /// Wert von `TALKER_LOG`: ohne Groß-/Kleinschreibung und Randleerzeichen;
+    /// leer oder unbekannt → `None`.
+    pub fn parse_env(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "error" => Some(LogLevel::Error),
+            "warn" => Some(LogLevel::Warn),
+            "info" => Some(LogLevel::Info),
+            "debug" => Some(LogLevel::Debug),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -125,6 +166,8 @@ pub struct Config {
     pub insert_mode: InsertMode,
     /// Sprechpause in ms, nach der *Satzweise* einfügt. Nur per TOML einstellbar.
     pub endpoint_silence_ms: u32,
+    /// Detailgrad der Logdatei (`~/Library/Logs/talker/talker.log`); `TALKER_LOG` übersteuert.
+    pub log_level: LogLevel,
 }
 
 /// Default-Farben der Wellen: Weiß, Cyan, Blau, Violett (kühle Siri-Palette).
@@ -185,6 +228,7 @@ impl Default for Config {
             stt_license_consent: false,
             insert_mode: InsertMode::default(),
             endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,
+            log_level: LogLevel::default(),
         }
     }
 }
@@ -492,6 +536,70 @@ mod tests {
         }
         assert!(Config::parse("insert_mode = \"sofort\"").is_err());
         assert!(Config::parse("insert_mode = 3").is_err());
+    }
+
+    /// REQ-DIAG-003/-004: `log_level` — Default Info, fehlt → Info, unbekannter
+    /// Wert/falscher Typ → Parse-Fehler, Roundtrip, `TALKER_LOG`-Parser.
+    #[test]
+    fn log_level_defaults_to_info_and_roundtrips() {
+        assert_eq!(Config::default().log_level, LogLevel::Info);
+        assert_eq!(
+            Config::parse("cleanup_mode = \"raw\"").unwrap().log_level,
+            LogLevel::Info
+        );
+        assert_eq!(
+            LogLevel::ALL,
+            [
+                LogLevel::Error,
+                LogLevel::Warn,
+                LogLevel::Info,
+                LogLevel::Debug
+            ]
+        );
+        for level in LogLevel::ALL {
+            let cfg = Config {
+                log_level: level,
+                ..Config::default()
+            };
+            assert_eq!(
+                Config::parse(&cfg.serialize().unwrap()).unwrap().log_level,
+                level
+            );
+        }
+        assert!(Config::parse("log_level = \"trace\"").is_err());
+        assert!(Config::parse("log_level = 3").is_err());
+    }
+
+    #[test]
+    fn log_level_labels_are_german() {
+        let labels: Vec<_> = LogLevel::ALL.iter().map(|l| l.label()).collect();
+        assert_eq!(labels, ["Fehler", "Warnungen", "Info", "Debug"]);
+    }
+
+    #[test]
+    fn log_level_parse_env_is_trimmed_and_case_insensitive() {
+        assert_eq!(LogLevel::parse_env(""), None);
+        assert_eq!(LogLevel::parse_env("   "), None);
+        assert_eq!(LogLevel::parse_env("DEBUG"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse_env(" warn "), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse_env("error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse_env("Info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse_env("verbose"), None);
+    }
+
+    /// REQ-DIAG-004: kaputtes `log_level` → Defaults, Datei bleibt unverändert.
+    #[test]
+    fn invalid_log_level_loads_defaults_and_keeps_the_file() {
+        let dir = std::env::temp_dir().join(format!("talker-loglevel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "log_level = \"trace\"\n").unwrap();
+        assert_eq!(Config::load_from(&path), Config::default());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "log_level = \"trace\"\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// REQ-STREAM-008: fehlende Pausenlänge → Default; übrige Werte werden gelesen.
