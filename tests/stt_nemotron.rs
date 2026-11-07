@@ -452,3 +452,51 @@ fn first_word_of_the_second_sentence_survives_the_pause() {
         failures.join("\n")
     );
 }
+
+/// REQ-DIAG-019 (AK-15): der Tap enthält exakt, was das Modell bekommt — Batch mit
+/// Vor-/Nachlauf-Stille, Live zusätzlich mit der Stille nach jedem Reset.
+#[test]
+fn model_tap_holds_exactly_the_model_input_including_silence() {
+    use talker::stt::ModelTap;
+    const LEAD: usize = 6_400; // 0,4 s
+    const TAIL: usize = 19_200; // 1,2 s
+    let sentence = read_wav_16k_mono("tests/fixtures/de_test.wav");
+
+    // Batch: Vorlauf + Audio + Nachlauf, und `take` leert.
+    let tap = ModelTap::default();
+    let mut t = transcriber().with_model_tap(tap.clone());
+    t.transcribe(&sentence).unwrap();
+    let batch = tap.take();
+    assert_eq!(batch.len(), LEAD + sentence.len() + TAIL);
+    assert!(batch[..LEAD].iter().all(|s| *s == 0.0));
+    assert_eq!(&batch[LEAD..LEAD + sentence.len()], sentence.as_slice());
+    assert!(batch[LEAD + sentence.len()..].iter().all(|s| *s == 0.0));
+    assert!(tap.take().is_empty());
+
+    // Leeres Audio: nichts ans Modell, nichts im Tap.
+    t.transcribe(&[]).unwrap();
+    assert!(tap.take().is_empty());
+
+    // Live mit Pause: Vorlauf, alle Chunks, 6400 Nullen nach dem Endpoint-Reset, Nachlauf.
+    let mut pcm = sentence.clone();
+    pcm.extend(std::iter::repeat_n(0.0, 24_000));
+    pcm.extend_from_slice(&sentence);
+    let (updates, _) = stream(&mut t, &pcm);
+    let endpoints = updates.iter().filter(|u| u.endpoint).count();
+    assert_eq!(endpoints, 1);
+    let live = tap.take();
+    // Jeder Reset (auch einer ohne Text) hängt 6400 Nullen an — mindestens einer je Endpoint.
+    let extra = live.len() - (LEAD + pcm.len() + TAIL);
+    assert_eq!(extra % LEAD, 0, "Rest {extra}");
+    assert!(
+        extra / LEAD >= endpoints,
+        "{} Resets, {endpoints} Endpoints",
+        extra / LEAD
+    );
+    assert!(live[..LEAD].iter().all(|s| *s == 0.0));
+    assert!(live[live.len() - TAIL..].iter().all(|s| *s == 0.0));
+
+    // Ohne Tap bleibt alles beim Alten (kein Mitschnitt, gleiche Erkennung).
+    let mut plain = transcriber();
+    assert!(!plain.transcribe(&sentence).unwrap().is_empty());
+}
