@@ -1089,6 +1089,37 @@ mod tests {
         );
     }
 
+    /// REQ-DIAG-034 AK-3: Die Instanz überlebt die Roh-Fälle (kein Drop mitten in der Reihe) und wird
+    /// mit dem Worker freigegeben (kein Leck des Handles).
+    #[test]
+    fn cleaner_instance_survives_raw_cases_and_is_freed_with_the_worker() {
+        let fx = TempFixtures::new("lebensdauer");
+        fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        let census = Rc::new(Census::default());
+        let mut worker =
+            fake_worker_with(shared_cleaner_loader(Some(CountedCleaner::new(&census))));
+        measure(
+            &mut worker,
+            &[fixture],
+            2,
+            &cleanup_modes(true),
+            &mut |_: &str| {},
+        );
+        assert_eq!(
+            census.alive.get(),
+            1,
+            "Roh-Fall darf die Instanz nicht zerstören"
+        );
+        drop(worker);
+        assert_eq!(
+            census.alive.get(),
+            0,
+            "Instanz wird mit dem Worker freigegeben"
+        );
+        assert_eq!(census.constructed.get(), 1);
+    }
+
     /// REQ-DIAG-034 Grenzfall N=1 (Absicherung nach T1, kein Rot-Grün-Zyklus).
     #[test]
     fn single_run_per_case_still_constructs_the_cleaner_once() {
