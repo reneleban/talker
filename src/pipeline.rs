@@ -656,9 +656,11 @@ where
             captured,
             trace,
         } => {
+            // Die Rohaufnahme (Geräteformat, bei 60 s Stereo ca. 23 MB) nur für den Mitschnitt halten.
+            let captured = debug.is_some().then_some(captured);
             let outcome = worker.handle(&pcm, frontmost.as_deref(), cfg);
             deliver(outcome, inject, &mut delivery);
-            (*trace, Some(captured))
+            (*trace, captured)
         }
         SttJob::Live { feed } => {
             let mut trace = *feed.trace;
@@ -674,7 +676,7 @@ where
             let mut captured = None;
             if let Some(ended) = blocks.take_ended() {
                 trace.apply_capture(ended.released_at, &ended.captured);
-                captured = Some(ended.captured);
+                captured = debug.is_some().then_some(ended.captured);
             }
             trace.segments = Some(delivery.segments);
             trace.first_segment_at = delivery.first_segment_at;
