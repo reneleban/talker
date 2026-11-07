@@ -515,6 +515,27 @@ mod tests {
         assert_eq!(first("talker.4.log"), 'b');
     }
 
+    /// AK-2: mit den Produktionswerten (1 MB, 4 ältere) bleibt die Summe nach vielen Zeilen ≤ 5 MB
+    /// und es gibt nie mehr als 5 Dateien.
+    #[test]
+    fn production_limits_keep_at_most_five_files_and_five_megabytes() {
+        assert_eq!((MAX_BYTES, KEEP), (1_000_000, 4));
+        let t = TestDir::new();
+        let mut f = RotatingFile::open(&t.0, MAX_BYTES, KEEP).unwrap();
+        let text = "x".repeat(9_999);
+        for _ in 0..800 {
+            f.write_line(&text).unwrap();
+        }
+        let files = names(&t.0);
+        assert_eq!(files.len(), 5, "{files:?}");
+        let total: u64 = files
+            .iter()
+            .map(|n| std::fs::metadata(t.0.join(n)).unwrap().len())
+            .sum();
+        assert!(total <= 5_000_000, "gesamt {total}");
+        assert!(std::fs::metadata(t.0.join("talker.log")).unwrap().len() <= MAX_BYTES);
+    }
+
     /// REQ-DIAG-002 „darf nicht passieren": keine Löschung nach Alter.
     #[test]
     fn old_files_are_not_deleted_by_age() {
