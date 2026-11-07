@@ -447,27 +447,15 @@ struct EvalConfig {
 /// Die geladenen Modelle samt Kaltlade-Dauer; Gemma ist optional (ohne Gemma nur Roh-Fälle).
 struct Models {
     stt: NemotronTranscriber,
-    cleaner: Option<GemmaCleaner>,
+    /// `Err` = Grund, warum die Natürlich-Fälle fehlen (Gemma nicht ladbar).
+    cleaner: Result<GemmaCleaner, String>,
     cold_loads: Vec<(&'static str, Duration)>,
-    /// Grund, warum die Natürlich-Fälle fehlen (Gemma nicht ladbar).
-    cleaner_note: Option<(String, String)>,
 }
 
-/// Lädt Gemma; fehlt es, gibt es statt eines Abbruchs `None` und einen Hinweis für „Übersprungen“.
-fn load_cleaner(path: &Path) -> (Option<GemmaCleaner>, Option<(String, String)>) {
-    match GemmaCleaner::new(path) {
-        Ok(cleaner) => (Some(cleaner), None),
-        Err(e) => (
-            None,
-            Some((
-                cleanup_name(CleanupMode::Casual).to_string(),
-                format!(
-                    "Gemma nicht verfügbar ({e}; erwartet: {}) — Natürlich-Fälle übersprungen",
-                    path.display()
-                ),
-            )),
-        ),
-    }
+/// Lädt Gemma; fehlt es, gibt es statt eines Abbruchs den Hinweis für „Übersprungen“.
+fn load_cleaner(path: &Path) -> Result<GemmaCleaner, String> {
+    GemmaCleaner::new(path)
+        .map_err(|e| format!("Gemma nicht verfügbar ({e}) — Natürlich-Fälle übersprungen"))
 }
 
 /// Die Cleanup-Modi der Messreihe: Roh immer, Natürlich nur mit Gemma.
@@ -486,15 +474,14 @@ fn load_models(cfg: &EvalConfig) -> Result<Models, String> {
     let stt = NemotronTranscriber::new(&cfg.nemotron_dir).map_err(|e| e.to_string())?;
     let mut cold_loads = vec![("Nemotron (STT)", t0.elapsed())];
     let t1 = std::time::Instant::now();
-    let (cleaner, cleaner_note) = load_cleaner(&cfg.gemma_path);
-    if cleaner.is_some() {
+    let cleaner = load_cleaner(&cfg.gemma_path);
+    if cleaner.is_ok() {
         cold_loads.push(("Gemma (Cleanup)", t1.elapsed()));
     }
     Ok(Models {
         stt,
         cleaner,
         cold_loads,
-        cleaner_note,
     })
 }
 
@@ -503,10 +490,16 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
         stt,
         cleaner,
         cold_loads,
-        cleaner_note,
     } = load_models(cfg)?;
-    let has_cleaner = cleaner.is_some();
-    let mut skipped: Vec<(String, String)> = cleaner_note.into_iter().collect();
+    let has_cleaner = cleaner.is_ok();
+    let mut skipped = Vec::new();
+    let cleaner = match cleaner {
+        Ok(cleaner) => Some(cleaner),
+        Err(reason) => {
+            skipped.push((cleanup_name(CleanupMode::Casual).to_string(), reason));
+            None
+        }
+    };
     let mut fixtures = Vec::new();
     for wav in list_wavs(&cfg.fixtures_dir)? {
         match load_fixture(&wav) {
@@ -668,11 +661,15 @@ mod tests {
     /// PERF-1: fehlt Gemma, laufen nur die Roh-Fälle; der Grund steht unter „Übersprungen“.
     #[test]
     fn missing_gemma_leaves_only_the_raw_cases_with_a_note() {
-        let (cleaner, note) = load_cleaner(Path::new("/nicht/vorhanden/gemma.gguf"));
-        assert!(cleaner.is_none());
-        let (name, reason) = note.unwrap();
-        assert_eq!(name, "Natürlich");
-        assert!(reason.contains("/nicht/vorhanden/gemma.gguf"), "{reason}");
+        let reason = load_cleaner(Path::new("/nicht/vorhanden/gemma.gguf"))
+            .err()
+            .unwrap();
+        // PERF-4: der Pfad steht genau einmal im Hinweis.
+        assert_eq!(
+            reason.matches("/nicht/vorhanden/gemma.gguf").count(),
+            1,
+            "{reason}"
+        );
         assert_eq!(cleanup_modes(false), [CleanupMode::Raw]);
         assert_eq!(cleanup_modes(true), [CleanupMode::Raw, CleanupMode::Casual]);
 
