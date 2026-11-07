@@ -108,6 +108,9 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
 - **REQ-DIAG-029**: FALLS eine Fixture nicht lesbar ist, DANN soll die
   Latenz-Messreihe sie überspringen und in der Tabelle als „übersprungen:
   <Grund>" ausweisen.
+- **REQ-DIAG-034**: Die Latenz-Messreihe soll das Cleanup-Modell höchstens
+  einmal pro Messreihe laden und dieselbe Instanz für alle Natürlich-Fälle
+  verwenden, auch wenn ein Roh-Fall vorausging.
 
 ## Fixtures
 
