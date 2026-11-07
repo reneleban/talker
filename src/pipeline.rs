@@ -3016,4 +3016,613 @@ mod tests {
             assert!(!production.contains(forbidden), "{forbidden} in audio.rs");
         }
     }
+
+    // ---- Ende zu Ende ohne Mikrofon und ohne Modell (T16, AK-21) ----
+
+    use crate::audio::AudioSource as _;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration as StdDuration;
+
+    /// STT-Fake, das den Modell-Eingang der Batch-Utterance festhält.
+    struct RecordingStt {
+        received: Rc<RefCell<Vec<f32>>>,
+        reply: &'static str,
+        fail: bool,
+        updates: std::collections::VecDeque<crate::stt::StreamUpdate>,
+    }
+
+    impl RecordingStt {
+        fn new(received: &Rc<RefCell<Vec<f32>>>, reply: &'static str) -> Self {
+            Self {
+                received: Rc::clone(received),
+                reply,
+                fail: false,
+                updates: Default::default(),
+            }
+        }
+    }
+
+    impl Transcriber for RecordingStt {
+        fn transcribe(&mut self, pcm: &[f32]) -> crate::error::Result<String> {
+            if self.fail {
+                return Err(TalkerError::Stt("kaputt".into()));
+            }
+            *self.received.borrow_mut() = pcm.to_vec();
+            Ok(self.reply.to_string())
+        }
+    }
+
+    impl StreamingTranscriber for RecordingStt {
+        fn begin(&mut self) {}
+        fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+            Ok(self
+                .updates
+                .pop_front()
+                .unwrap_or(crate::stt::StreamUpdate {
+                    text: String::new(),
+                    endpoint: false,
+                }))
+        }
+        fn finish(&mut self) -> crate::error::Result<String> {
+            Ok(self.reply.to_string())
+        }
+    }
+
+    fn e2e_worker(
+        cfg: &Config,
+        make: impl Fn() -> RecordingStt + 'static,
+    ) -> DictationWorker<RecordingStt, ScriptedCleaner> {
+        let loads = Rc::new(RefCell::new(0usize));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        DictationWorker::new(
+            cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(move |_: &Path| Ok(make())),
+            counted_cleaner_loader(&loads, &log),
+        )
+    }
+
+    fn opts(channels: u16, rate: u32, delay_ms: u64) -> audio::WavOptions {
+        audio::WavOptions {
+            format: audio::AudioFormat {
+                channels,
+                sample_rate: rate,
+            },
+            block_frames: 480,
+            start_delay: StdDuration::from_millis(delay_ms),
+            pace: audio::Pace::Immediate,
+            epoch: audio::HostInstant::from_nanos(1),
+        }
+    }
+
+    fn wav_factory_with(
+        samples: Vec<f32>,
+        options: audio::WavOptions,
+        done: std::sync::mpsc::Sender<audio::SourceDone>,
+    ) -> SourceFactory {
+        let done = Mutex::new(done);
+        Box::new(move |_| {
+            let (source, signal) = audio::WavSource::from_samples(samples.clone(), options);
+            let _ = done.lock().unwrap().send(signal);
+            Box::new(source)
+        })
+    }
+
+    fn ramp_16k(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| 0.01 + (i % 1_000) as f32 / 10_000.0)
+            .collect()
+    }
+
+    /// Ein Diktat vom Tastendruck bis zur fertigen Messzeile. `None`, wenn die Session selbst
+    /// geendet hat (gesperrt, Mikrofon-Fehler, zu kurz, abgebrochen) — die Zeile steht dann in den Reports.
+    fn dictate_e2e(
+        session: &mut PttSession,
+        cfg: &Config,
+        models: &ModelsState,
+        worker: &mut DictationWorker<RecordingStt, ScriptedCleaner>,
+        done: &Receiver<audio::SourceDone>,
+        injected: &Injected,
+        debug: Option<(&DebugCapture, &ModelTap)>,
+    ) -> Option<DictationTrace> {
+        let (ready_tx, ready_rx) = channel();
+        let outcome = session.press(audio::HostInstant::now(), cfg, models, move |ready| {
+            let _ = ready_tx.send(ready);
+        });
+        if matches!(outcome, PressOutcome::Blocked(_)) {
+            return None;
+        }
+        let live = match ready_rx.recv_timeout(StdDuration::from_secs(5)).unwrap() {
+            MicReady::Recording { live, .. } => live,
+            MicReady::Failed(_) => return None,
+        };
+        // Ein Hilfsthread im echten Ablauf; hier genügt das Warten auf das Quellen-Ende.
+        let signal = done.recv_timeout(StdDuration::from_secs(5)).unwrap();
+        assert!(signal.wait(StdDuration::from_secs(10)));
+        let mut inject = recording_inject(injected);
+        match session.release(audio::HostInstant::now()) {
+            ReleaseOutcome::Ready {
+                pcm,
+                frontmost,
+                captured,
+                trace,
+                ..
+            } => Some(
+                process_job(
+                    worker,
+                    SttJob::Utterance {
+                        pcm,
+                        frontmost,
+                        captured,
+                        trace,
+                    },
+                    cfg,
+                    &mut inject,
+                    debug,
+                )
+                .1,
+            ),
+            ReleaseOutcome::LiveEnded => Some(
+                process_job(
+                    worker,
+                    SttJob::Live {
+                        feed: live.expect("Live-Aufnahme hat einen Feed"),
+                    },
+                    cfg,
+                    &mut inject,
+                    debug,
+                )
+                .1,
+            ),
+            _ => None,
+        }
+    }
+
+    /// AK-9/-12/-21: Batch-Diktat Ende zu Ende → vollständige Messzeile; #1 Kaltstart, #2 nicht.
+    #[test]
+    fn e2e_batch_dictation_gives_a_complete_measurement_line_and_cold_start_only_first() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000 * 2), opts(2, 48_000, 100), done_tx),
+            report,
+        );
+        let cfg = Config::default();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo welt")
+        });
+        let injected: Injected = Rc::default();
+        let models = stt_ready();
+        let first = dictate_e2e(
+            &mut session,
+            &cfg,
+            &models,
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        let second = dictate_e2e(
+            &mut session,
+            &cfg,
+            &models,
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            injected.borrow().as_slice(),
+            ["[hallo welt]", "[hallo welt]"]
+        );
+        let line = first.to_string();
+        assert!(!line.contains('—'), "alle Felder gefüllt: {line}");
+        assert!(line.starts_with("Diktat #1: Taste→Mikro bereit "));
+        assert!(
+            line.contains("Gerät: WAV: Samples (48 kHz, 2 Kanäle)"),
+            "{line}"
+        );
+        assert!(line.contains("Einfügen: Am Ende") && line.contains("Ergebnis: eingefügt"));
+        assert!(line.contains("Kaltstart: ja"));
+        assert!(
+            second.to_string().contains("Diktat #2:")
+                && second.to_string().contains("Kaltstart: nein")
+        );
+        assert!(
+            reports.lock().unwrap().is_empty(),
+            "Worker meldet, nicht die Session"
+        );
+        assert_eq!(first.recorded, Some(StdDuration::from_secs(2)));
+    }
+
+    /// AK-20/-21: Startverzögerung 0/100/300 ms × Formate → kein Sample geht bis zum Modell verloren.
+    #[test]
+    fn e2e_no_sample_is_lost_for_any_start_delay_and_format() {
+        let input = ramp_16k(16_000);
+        for delay_ms in [0, 100, 300] {
+            for (channels, rate) in [(1u16, 16_000u32), (2, 44_100), (1, 48_000)] {
+                let (report, _) = collecting_report();
+                let (done_tx, done_rx) = channel();
+                let mut session = PttSession::new(
+                    wav_factory_with(input.clone(), opts(channels, rate, delay_ms), done_tx),
+                    report,
+                );
+                let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+                let received = Rc::new(RefCell::new(Vec::new()));
+                let mut worker = e2e_worker(&cfg, {
+                    let received = Rc::clone(&received);
+                    move || RecordingStt::new(&received, "hallo")
+                });
+                let injected: Injected = Rc::default();
+                dictate_e2e(
+                    &mut session,
+                    &cfg,
+                    &stt_ready(),
+                    &mut worker,
+                    &done_rx,
+                    &injected,
+                    None,
+                )
+                .unwrap();
+                let got = received.borrow();
+                if rate == 16_000 {
+                    assert_eq!(*got, input, "{delay_ms} ms, {channels} Kanäle, {rate} Hz");
+                } else {
+                    assert!(
+                        got.len().abs_diff(input.len()) <= 2_048,
+                        "{delay_ms} ms, {channels} Kanäle, {rate} Hz: {} statt {}",
+                        got.len(),
+                        input.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// AK-13: nur Null-Blöcke → erstes Signal `—`, Zeile trotzdem vollständig.
+    #[test]
+    fn e2e_only_zero_blocks_leave_first_signal_empty() {
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(vec![0.0; 16_000], opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo")
+        });
+        let injected: Injected = Rc::default();
+        let trace = dictate_e2e(
+            &mut session,
+            &cfg,
+            &stt_ready(),
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        let line = trace.to_string();
+        assert!(line.contains("→erster Block ") && !line.contains("→erster Block —"));
+        assert!(line.contains("→erstes Signal —"), "{line}");
+        assert!(line.contains("Ergebnis: eingefügt"));
+    }
+
+    /// AK-13: zu kurz / gesperrt / Mikrofon-Fehler enden in der Session mit eigener Zeile.
+    #[test]
+    fn e2e_early_endings_report_their_own_line_and_never_reach_the_worker() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo")
+        });
+        let injected: Injected = Rc::default();
+
+        // zu kurz
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(1_600), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        assert!(
+            dictate_e2e(
+                &mut session,
+                &cfg,
+                &stt_ready(),
+                &mut worker,
+                &done_rx,
+                &injected,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            reports.lock().unwrap()[0]
+                .to_string()
+                .ends_with("Ergebnis: verworfen (zu kurz)")
+        );
+
+        // gesperrt
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let closed = ModelsState::new(ModelState::Missing, ModelState::Missing);
+        assert!(
+            dictate_e2e(
+                &mut session,
+                &cfg,
+                &closed,
+                &mut worker,
+                &done_rx,
+                &injected,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            reports.lock().unwrap()[0]
+                .to_string()
+                .ends_with("Ergebnis: gesperrt")
+        );
+
+        // Mikrofon-Start scheitert
+        let (report, reports) = collecting_report();
+        let (_unused_tx, done_rx) = channel();
+        let mut session = PttSession::new(Box::new(|_| Box::new(FailingSource)), report);
+        assert!(
+            dictate_e2e(
+                &mut session,
+                &cfg,
+                &stt_ready(),
+                &mut worker,
+                &done_rx,
+                &injected,
+                None
+            )
+            .is_none()
+        );
+        let line = reports.lock().unwrap()[0].to_string();
+        assert!(
+            line.contains("Taste→Mikro bereit —")
+                && line.contains("Ergebnis: Fehler (Audio-Aufnahme fehlgeschlagen: kein Mikrofon")
+        );
+        assert!(injected.borrow().is_empty(), "nichts erreicht den Worker");
+    }
+
+    /// AK-13: STT-Fehler → Ergebnis Fehler, Zeile vollständig, nichts eingefügt.
+    #[test]
+    fn e2e_stt_error_gives_an_error_line_without_insertion() {
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || {
+                let mut stt = RecordingStt::new(&received, "hallo");
+                stt.fail = true;
+                stt
+            }
+        });
+        let injected: Injected = Rc::default();
+        let trace = dictate_e2e(
+            &mut session,
+            &cfg,
+            &stt_ready(),
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        assert!(injected.borrow().is_empty());
+        assert!(
+            trace
+                .to_string()
+                .ends_with("Ergebnis: Fehler (Spracherkennung fehlgeschlagen)")
+        );
+    }
+
+    /// AK-11/AK-7: Live-Diktat mit 3 Segmenten Ende zu Ende; auf `info` genau eine Zeile.
+    #[test]
+    fn e2e_live_dictation_with_three_segments_logs_one_info_line() {
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000 * 3), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || {
+                let mut stt = RecordingStt::new(&received, "Dritter.");
+                stt.updates = [
+                    ("a", false),
+                    ("Erster.", true),
+                    ("b", false),
+                    ("Zweiter.", true),
+                ]
+                .iter()
+                .map(|(text, endpoint)| crate::stt::StreamUpdate {
+                    text: (*text).to_string(),
+                    endpoint: *endpoint,
+                })
+                .collect();
+                stt
+            }
+        });
+        let injected: Injected = Rc::default();
+        let models = stt_ready();
+        let log_report = crate::diagnostics::log_report();
+        let (trace, lines) = crate::logging::capture(|| {
+            let trace = dictate_e2e(
+                &mut session,
+                &cfg,
+                &models,
+                &mut worker,
+                &done_rx,
+                &injected,
+                None,
+            )
+            .unwrap();
+            log_report(trace.clone());
+            trace
+        });
+        assert_eq!(
+            injected.borrow().as_slice(),
+            ["Erster.", " Zweiter.", " Dritter."]
+        );
+        assert_eq!(trace.segments, Some(3));
+        let line = trace.to_string();
+        assert!(
+            line.contains("→erstes Segment ") && line.contains("Segmente 3"),
+            "{line}"
+        );
+        let on_info: Vec<_> = lines
+            .iter()
+            .filter(|(l, _)| *l <= log::Level::Info)
+            .collect();
+        assert_eq!(on_info.len(), 1, "{on_info:?}");
+    }
+
+    /// AK-15/-21: Debug-Mitschnitt Ende zu Ende; mic.wav = die gelieferten Blöcke (2 Kanäle, 44,1 kHz).
+    #[test]
+    fn e2e_debug_capture_mic_wav_matches_the_delivered_blocks() {
+        let dir = DebugDir::new("e2e");
+        let capture = debug_capture(&dir.0);
+        let tap = ModelTap::default();
+        let input = ramp_16k(16_000);
+        // Erwartete Blöcke: dieselbe Quelle separat vollständig einsammeln.
+        let (reference, reference_done) =
+            audio::WavSource::from_samples(input.clone(), opts(2, 44_100, 0));
+        let delivered = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let sink = Arc::clone(&delivered);
+        let _guard = Box::new(reference)
+            .open(Box::new(move |data, _| {
+                sink.lock().unwrap().extend_from_slice(data)
+            }))
+            .unwrap();
+        assert!(reference_done.wait(StdDuration::from_secs(10)));
+
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session =
+            PttSession::new(wav_factory_with(input, opts(2, 44_100, 0), done_tx), report);
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo")
+        });
+        let injected: Injected = Rc::default();
+        let trace = dictate_e2e(
+            &mut session,
+            &cfg,
+            &stt_ready(),
+            &mut worker,
+            &done_rx,
+            &injected,
+            Some((&capture, &tap)),
+        )
+        .unwrap();
+        let path = dir.0.join(format!("{}-mic.wav", trace.nr));
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(
+            (reader.spec().channels, reader.spec().sample_rate),
+            (2, 44_100)
+        );
+        let written: Vec<f32> = reader.samples::<f32>().map(Result::unwrap).collect();
+        let expected = delivered.lock().unwrap();
+        assert_eq!(
+            written.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(dir.0.join(format!("{}-model.wav", trace.nr)).is_file());
+    }
+
+    /// AK-8 (Pipeline-Seite): blockierendes Log-Backend → Ergebnis unverändert, kein Hängen.
+    #[test]
+    fn e2e_blocking_log_backend_does_not_stall_or_change_the_dictation() {
+        struct StuckSink(std::sync::mpsc::Receiver<()>);
+        impl crate::logging::LogSink for StuckSink {
+            fn write_line(&mut self, _: &str) -> std::io::Result<()> {
+                let _ = self.0.recv();
+                Ok(())
+            }
+        }
+        let (finished_tx, finished_rx) = channel();
+        std::thread::spawn(move || {
+            let (_keep_blocked, gate) = channel();
+            let logger = Arc::new(crate::logging::Logger::spawn(Box::new(StuckSink(gate)), 2));
+            // Puffer überfluten, damit der Kanal voll ist.
+            for i in 0..50 {
+                log::Log::log(
+                    &*logger,
+                    &log::Record::builder()
+                        .level(log::Level::Error)
+                        .target("talker::x")
+                        .args(format_args!("flut {i}"))
+                        .build(),
+                );
+            }
+            let sink_logger = Arc::clone(&logger);
+            let report: TraceReport = Arc::new(move |t| {
+                log::Log::log(
+                    &*sink_logger,
+                    &log::Record::builder()
+                        .level(log::Level::Info)
+                        .target("talker::messung")
+                        .args(format_args!("{t}"))
+                        .build(),
+                );
+            });
+            let (done_tx, done_rx) = channel();
+            let mut session = PttSession::new(
+                wav_factory_with(ramp_16k(16_000), opts(1, 16_000, 0), done_tx),
+                Arc::clone(&report),
+            );
+            let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+            let received = Rc::new(RefCell::new(Vec::new()));
+            let mut worker = e2e_worker(&cfg, {
+                let received = Rc::clone(&received);
+                move || RecordingStt::new(&received, "hallo")
+            });
+            let injected: Injected = Rc::default();
+            let trace = dictate_e2e(
+                &mut session,
+                &cfg,
+                &stt_ready(),
+                &mut worker,
+                &done_rx,
+                &injected,
+                None,
+            )
+            .unwrap();
+            report(trace.clone());
+            let _ = finished_tx.send((trace.result, injected.borrow().clone()));
+        });
+        let (result, injected) = finished_rx
+            .recv_timeout(StdDuration::from_secs(10))
+            .expect("Dictation hängt am blockierenden Log-Backend");
+        assert_eq!(result, DictationResult::Inserted);
+        assert_eq!(injected, ["hallo"]);
+    }
 }
