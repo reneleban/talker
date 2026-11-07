@@ -110,7 +110,7 @@ impl RestoreGuard<'_> {
 impl Drop for RestoreGuard<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.restore() {
-            eprintln!("talker: Clipboard-Restore nach Injection-Fehler fehlgeschlagen: {e}");
+            log::error!("Clipboard-Restore nach Injection-Fehler fehlgeschlagen: {e}");
         }
     }
 }

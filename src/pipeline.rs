@@ -6,16 +6,22 @@
 //! Indicator/Injection (Ticket-0034).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
 use crate::config::{Config, InsertMode};
+use crate::diagnostics::{DebugCapture, DictationResult, DictationTrace, TraceReport};
 use crate::error::TalkerError;
 use crate::injection;
 use crate::models::{ModelId, ModelsState};
-use crate::stt::{PhraseCommitter, StreamingTranscriber, Transcriber};
+use crate::stt::{ModelTap, PhraseCommitter, StreamingTranscriber, Transcriber};
 use crate::{audio, vocab_match};
+
+/// Hinweis, wenn kein Text erkannt wurde.
+const NOTHING_RECOGNIZED: &str = "Nichts erkannt";
+/// Wie die Messzeile „kein Text" nennt.
+const NOTHING_RECOGNIZED_REASON: &str = "nichts erkannt";
 
 /// Ergebnis von [`DictationWorker::handle`] für eine Utterance.
 #[derive(Debug)]
@@ -26,7 +32,10 @@ pub enum Outcome {
         text: String,
         cleanup_fell_back: bool,
     },
-    /// Utterance verworfen — der Hinweis geht sichtbar an den Indicator.
+    /// Nichts erkannt (leerer Transcript) — Hinweis „Nichts erkannt“, in der Messzeile
+    /// „verworfen (nichts erkannt)“.
+    NothingRecognized,
+    /// Utterance mit Fehler verworfen — der Hinweis geht sichtbar an den Indicator.
     Rejected(&'static str),
 }
 
@@ -49,6 +58,23 @@ pub struct DictationWorker<T: Transcriber, C: LlmCleaner> {
     models: Arc<ModelsState>,
     load_transcriber: TranscriberLoader<T>,
     load_cleaner: CleanerLoader<C>,
+    /// Zeit in STT und Cleanup seit dem letzten `take_timing` (Messzeile).
+    timing: JobTiming,
+    /// Modelle, die während einer Dictation geladen wurden (nicht die in `new`).
+    model_loads: Vec<(ModelId, Duration)>,
+}
+
+/// In STT und Cleanup verbrachte Zeit einer Dictation; `None` = nicht gelaufen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JobTiming {
+    pub stt: Option<Duration>,
+    pub cleanup: Option<Duration>,
+    /// Die STT ist (auch nur einmal) gescheitert: Zeiten gelten nicht.
+    pub stt_failed: bool,
+}
+
+fn add_time(total: &mut Option<Duration>, d: Duration) {
+    *total = Some(total.unwrap_or_default() + d);
 }
 
 impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
@@ -71,22 +97,58 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
             models,
             load_transcriber,
             load_cleaner,
+            timing: JobTiming::default(),
+            model_loads: Vec::new(),
         };
         let t0 = Instant::now();
         match (worker.load_transcriber)(&worker.stt_dir) {
             Ok(t) => {
                 worker.transcriber = Some(t);
-                eprintln!(
-                    "talker: STT-Modell geladen in {:.1}s.",
-                    t0.elapsed().as_secs_f32()
-                );
+                log::info!("STT-Modell geladen in {:.1}s.", t0.elapsed().as_secs_f32());
             }
-            Err(e) => eprintln!("talker: STT nicht verfügbar — {e}"),
+            Err(e) => log::warn!("STT nicht verfügbar — {e}"),
         }
         if worker.llm_was_available && config_wants_llm(cfg) {
             (worker.cleaner, worker.cleaner_failed) = (worker.load_cleaner)();
         }
         worker
+    }
+
+    /// Verwirft die Zeiten, behält aber einen STT-Fehler.
+    fn reset_timing(&mut self) {
+        self.timing = JobTiming {
+            stt_failed: self.timing.stt_failed,
+            ..JobTiming::default()
+        };
+    }
+
+    /// Zeit in STT/Cleanup seit dem letzten Aufruf; setzt sie zurück.
+    pub fn take_timing(&mut self) -> JobTiming {
+        std::mem::take(&mut self.timing)
+    }
+
+    /// Modell-Ladevorgänge seit dem letzten Aufruf (nur solche während einer Dictation).
+    pub fn take_model_loads(&mut self) -> Vec<(ModelId, Duration)> {
+        std::mem::take(&mut self.model_loads)
+    }
+
+    /// STT-Engine für `dir` laden und die Ladezeit für die Messzeile merken.
+    fn load_stt_timed(&mut self, dir: &Path) -> crate::error::Result<T> {
+        let t0 = Instant::now();
+        let loaded = (self.load_transcriber)(dir);
+        if loaded.is_ok() {
+            self.model_loads.push((ModelId::Stt, t0.elapsed()));
+        }
+        loaded
+    }
+
+    /// Cleanup-LLM laden und die Ladezeit für die Messzeile merken.
+    fn load_cleaner_timed(&mut self) {
+        let t0 = Instant::now();
+        (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+        if self.cleaner.is_some() {
+            self.model_loads.push((ModelId::Gemma, t0.elapsed()));
+        }
     }
 
     /// Live-Aktivierung (Ticket-0029): wird gemma nachträglich ready,
@@ -107,8 +169,8 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
         // Kontext-Awareness (Ticket-0026): Modus für DIESE Utterance auflösen.
         let resolved = resolve_mode(cfg, frontmost);
         if resolved != cfg.cleanup_mode {
-            eprintln!(
-                "talker: Kontext-Regel aktiv ({}) → Modus {}.",
+            log::debug!(
+                "Kontext-Regel aktiv ({}) → Modus {}.",
                 frontmost.unwrap_or("?"),
                 resolved.label()
             );
@@ -116,22 +178,22 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
 
         // STT-Pfad geändert → Modell neu laden (alter bleibt bei Fehler aktiv).
         if cfg.stt_model_dir != self.stt_dir || self.transcriber.is_none() {
-            match (self.load_transcriber)(&cfg.stt_model_dir) {
+            match self.load_stt_timed(&cfg.stt_model_dir) {
                 Ok(t) => {
                     self.transcriber = Some(t);
                     self.stt_dir = cfg.stt_model_dir.clone();
-                    eprintln!("talker: STT-Modell neu geladen: {}", self.stt_dir.display());
+                    log::info!("STT-Modell neu geladen: {}", self.stt_dir.display());
                 }
-                Err(e) => eprintln!("talker: STT-Neuladen fehlgeschlagen — {e}"),
+                Err(e) => log::warn!("STT-Neuladen fehlgeschlagen — {e}"),
             }
         }
         if self.transcriber.is_none() {
-            eprintln!("talker: kein STT-Modell — Utterance verworfen.");
+            log::warn!("kein STT-Modell — Utterance verworfen.");
             return Outcome::Rejected("Kein STT-Modell");
         }
 
         if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
-            (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+            self.load_cleaner_timed();
         }
         // Entladen/Fehler-Reset folgt dem GESAMT-Bedarf der Config, nicht
         // der einzelnen Utterance — sonst würde jede Raw-geregelte App das
@@ -163,20 +225,31 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
                 c.set_vocab(&cfg.vocabulary);
                 c as &mut dyn LlmCleaner
             });
-        match process_utterance(pcm, &cfg, transcriber, cleaner_ref, self.cleaner_failed) {
+        let processed = process_utterance(pcm, &cfg, transcriber, cleaner_ref, self.cleaner_failed);
+        match processed {
             Processed::Text {
                 text,
                 cleanup_fell_back,
-            } => Outcome::Inject {
-                text,
-                cleanup_fell_back,
-            },
-            Processed::Empty => {
-                eprintln!("talker: leerer Transcript — nichts einzufügen.");
-                Outcome::Rejected("Nichts erkannt")
+                stt,
+                cleanup,
+            } => {
+                add_time(&mut self.timing.stt, stt);
+                if let Some(t) = cleanup {
+                    add_time(&mut self.timing.cleanup, t);
+                }
+                Outcome::Inject {
+                    text,
+                    cleanup_fell_back,
+                }
+            }
+            Processed::Empty { stt } => {
+                add_time(&mut self.timing.stt, stt);
+                log::debug!("leerer Transcript — nichts einzufügen.");
+                Outcome::NothingRecognized
             }
             Processed::SttFailed(e) => {
-                eprintln!("talker: STT fehlgeschlagen: {e}");
+                self.timing.stt_failed = true;
+                log::error!("STT fehlgeschlagen: {e}");
                 Outcome::Rejected("Spracherkennung fehlgeschlagen")
             }
         }
@@ -209,9 +282,12 @@ enum Processed {
     Text {
         text: String,
         cleanup_fell_back: bool,
+        stt: Duration,
+        /// `None`, wenn kein Cleaner lief.
+        cleanup: Option<Duration>,
     },
     /// Leerer Transcript — nichts einzufügen.
-    Empty,
+    Empty { stt: Duration },
     /// Spracherkennung fehlgeschlagen.
     SttFailed(TalkerError),
 }
@@ -228,12 +304,12 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         self.refresh_llm_availability();
         let resolved = cfg.insert_mode.resolve(resolve_mode(cfg, frontmost));
         if cfg.stt_model_dir != self.stt_dir || self.transcriber.is_none() {
-            match (self.load_transcriber)(&cfg.stt_model_dir) {
+            match self.load_stt_timed(&cfg.stt_model_dir) {
                 Ok(t) => {
                     self.transcriber = Some(t);
                     self.stt_dir = cfg.stt_model_dir.clone();
                 }
-                Err(e) => eprintln!("talker: STT-Neuladen fehlgeschlagen — {e}"),
+                Err(e) => log::warn!("STT-Neuladen fehlgeschlagen — {e}"),
             }
         }
         let Some(transcriber) = self.transcriber.as_mut() else {
@@ -241,7 +317,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         };
         transcriber.begin();
         if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
-            (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+            self.load_cleaner_timed();
         }
         self.live = Some(LiveSession {
             insert_mode: cfg.insert_mode,
@@ -261,10 +337,14 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         else {
             return Vec::new();
         };
-        let update = match transcriber.feed(pcm) {
+        let t0 = Instant::now();
+        let fed = transcriber.feed(pcm);
+        add_time(&mut self.timing.stt, t0.elapsed());
+        let update = match fed {
             Ok(update) => update,
             Err(e) => {
-                eprintln!("talker: Live-STT fehlgeschlagen: {e}");
+                self.timing.stt_failed = true;
+                log::error!("Live-STT fehlgeschlagen: {e}");
                 return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
             }
         };
@@ -285,10 +365,14 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         else {
             return Vec::new();
         };
-        let rest = match transcriber.finish() {
+        let t0 = Instant::now();
+        let finished = transcriber.finish();
+        add_time(&mut self.timing.stt, t0.elapsed());
+        let rest = match finished {
             Ok(rest) => rest,
             Err(e) => {
-                eprintln!("talker: Live-STT fehlgeschlagen: {e}");
+                self.timing.stt_failed = true;
+                log::error!("Live-STT fehlgeschlagen: {e}");
                 self.live = None;
                 return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
             }
@@ -322,9 +406,12 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
                 c.set_vocab(&live.cfg.vocabulary);
                 c as &mut dyn LlmCleaner
             });
-        let (text, cleanup_fell_back) =
+        let (text, cleanup_fell_back, cleanup_time) =
             postprocess(raw.to_string(), &live.cfg, cleaner, self.cleaner_failed);
-        eprintln!("talker: Live-Segment: {text}");
+        if let Some(t) = cleanup_time {
+            add_time(&mut self.timing.cleanup, t);
+        }
+        log::debug!("Live-Segment: {} Zeichen", text.chars().count());
         let text = if live.emitted_any {
             format!(" {text}")
         } else {
@@ -355,7 +442,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
     let mut assembler = match audio::ChunkAssembler::new(channels, sample_rate) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("talker: Live-Audio unbrauchbar: {e}");
+            log::error!("Live-Audio unbrauchbar: {e}");
             emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
             return;
         }
@@ -365,7 +452,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
         match audio::to_mono_16k(&raw, channels, sample_rate) {
             Ok(pcm) => emit(worker.handle(&pcm, frontmost, cfg)),
             Err(e) => {
-                eprintln!("talker: Fallback-Aufnahme unbrauchbar: {e}");
+                log::error!("Fallback-Aufnahme unbrauchbar: {e}");
                 emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
             }
         }
@@ -375,33 +462,38 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
         match assembler.push(&block) {
             Ok(chunks) => {
                 for chunk in chunks {
+                    log::debug!("Live-Chunk: {} Samples @16 kHz", chunk.len());
                     worker.live_chunk(&chunk).into_iter().for_each(&mut *emit);
                 }
             }
             Err(e) => {
-                eprintln!("talker: Live-Audio fehlgeschlagen: {e}");
+                log::error!("Live-Audio fehlgeschlagen: {e}");
                 emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
             }
         }
     }
+    // Der Block-Strom endet mit `Feed::End`: ab hier läuft nur noch der Rest nach dem
+    // Loslassen. Die Zeit der Chunks davor gehört nicht in „Loslassen→Text (STT · Cleanup)“.
+    worker.reset_timing();
     match assembler.flush() {
         Ok(rest) if !rest.is_empty() => {
             worker.live_chunk(&rest).into_iter().for_each(&mut *emit);
         }
         Ok(_) => {}
-        Err(e) => eprintln!("talker: Live-Audio-Rest verworfen: {e}"),
+        Err(e) => log::warn!("Live-Audio-Rest verworfen: {e}"),
     }
     worker.live_end().into_iter().for_each(&mut *emit);
 }
 
 /// Vokabular-Korrektur und optionaler Cleanup für einen erkannten Text (ganze
-/// Utterance oder Live-Segment). Liefert Text + „Cleanup fiel auf Rohtext zurück".
+/// Utterance oder Live-Segment). Liefert Text, „Cleanup fiel auf Rohtext zurück" und die
+/// Cleanup-Dauer (`None`, wenn kein Cleaner lief).
 fn postprocess(
     raw: String,
     cfg: &Config,
     cleaner: Option<&mut dyn LlmCleaner>,
     cleaner_failed: bool,
-) -> (String, bool) {
+) -> (String, bool, Option<Duration>) {
     // Deterministische Vokabular-Korrektur (Kölner Phonetik) — vor dem
     // Cleanup, wirkt damit auch im Roh-Modus; per Config abschaltbar.
     let raw = if cfg.phonetic_matching {
@@ -413,16 +505,18 @@ fn postprocess(
         Some(c) => {
             let t2 = Instant::now();
             let (cleaned, fell_back) = cleanup::clean_with_fallback(c, &raw);
-            eprintln!(
-                "talker: Cleaned Transcript (Cleanup {} ms): {cleaned}",
-                t2.elapsed().as_millis()
+            let took = t2.elapsed();
+            log::debug!(
+                "Cleaned Transcript: {} Zeichen (Cleanup {} ms)",
+                cleaned.chars().count(),
+                took.as_millis()
             );
-            (cleaned, fell_back)
+            (cleaned, fell_back, Some(took))
         }
         // Cleanup gewollt, aber Modell nicht ladbar → ebenfalls sichtbar machen.
         None => {
             let degraded = cfg.cleanup_mode.uses_llm() && cleaner_failed;
-            (raw, degraded)
+            (raw, degraded, None)
         }
     }
 }
@@ -439,19 +533,24 @@ fn process_utterance(
 ) -> Processed {
     let audio_ms = audio::duration_ms(pcm);
     let t1 = Instant::now();
-    let raw = match transcriber.transcribe(pcm) {
-        Ok(text) if text.is_empty() => return Processed::Empty,
+    let transcribed = transcriber.transcribe(pcm);
+    let stt = t1.elapsed();
+    let raw = match transcribed {
+        Ok(text) if text.is_empty() => return Processed::Empty { stt },
         Ok(text) => text,
         Err(e) => return Processed::SttFailed(e),
     };
-    eprintln!(
-        "talker: Raw Transcript ({audio_ms} ms Audio, STT {} ms): {raw}",
-        t1.elapsed().as_millis()
+    log::debug!(
+        "Raw Transcript: {} Zeichen ({audio_ms} ms Audio, STT {} ms)",
+        raw.chars().count(),
+        stt.as_millis()
     );
-    let (text, cleanup_fell_back) = postprocess(raw, cfg, cleaner, cleaner_failed);
+    let (text, cleanup_fell_back, cleanup) = postprocess(raw, cfg, cleaner, cleaner_failed);
     Processed::Text {
         text,
         cleanup_fell_back,
+        stt,
+        cleanup,
     }
 }
 
@@ -472,17 +571,170 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
         .unwrap_or(cfg.cleanup_mode)
 }
 
+/// Sammelt, was beim Einfügen der Ergebnisse eines Auftrags passiert.
+#[derive(Default)]
+struct Delivery {
+    /// Erster Hinweis für den Indicator.
+    hint: Option<&'static str>,
+    inserted: bool,
+    /// Erstes Ende ohne Erfolg (Fehler/verworfen); gewinnt gegen `inserted`.
+    ended: Option<DictationResult>,
+    /// Zeitpunkt des zuletzt fertigen Texts (vor dem Einfügen).
+    text_at: Option<audio::HostInstant>,
+    /// Dauer des zuletzt eingefügten Texts.
+    injected: Option<Duration>,
+    segments: u32,
+    first_segment_at: Option<audio::HostInstant>,
+}
+
+/// Fügt ein Ergebnis ein und hält fest, was passiert ist.
+fn deliver(
+    outcome: Outcome,
+    inject: &mut dyn FnMut(&str) -> crate::error::Result<()>,
+    delivery: &mut Delivery,
+) {
+    let t0 = Instant::now();
+    let hint = match outcome {
+        Outcome::Inject {
+            text,
+            cleanup_fell_back,
+        } => {
+            let ready_at = audio::HostInstant::now();
+            delivery.text_at = Some(ready_at);
+            delivery.segments += 1;
+            delivery.first_segment_at.get_or_insert(ready_at);
+            match inject(&text) {
+                Ok(()) => {
+                    delivery.inserted = true;
+                    delivery.injected = Some(t0.elapsed());
+                    // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
+                    cleanup_fell_back.then_some("Cleanup übersprungen — Rohtext eingefügt")
+                }
+                Err(e) => {
+                    log::error!("Injection fehlgeschlagen: {e}");
+                    delivery.ended.get_or_insert(DictationResult::Error(format!(
+                        "Einfügen fehlgeschlagen: {e}"
+                    )));
+                    Some("Einfügen fehlgeschlagen")
+                }
+            }
+        }
+        Outcome::NothingRecognized => {
+            delivery
+                .ended
+                .get_or_insert(DictationResult::Discarded(NOTHING_RECOGNIZED_REASON));
+            Some(NOTHING_RECOGNIZED)
+        }
+        Outcome::Rejected(hint) => {
+            delivery
+                .ended
+                .get_or_insert(DictationResult::Error(hint.to_string()));
+            Some(hint)
+        }
+    };
+    log::debug!(
+        "Einfügen abgeschlossen nach {} ms ({})",
+        t0.elapsed().as_millis(),
+        hint.unwrap_or("ok")
+    );
+    delivery.hint = delivery.hint.or(hint);
+}
+
+/// Verarbeitet einen Auftrag vollständig: STT → Cleanup → Einfügen über `inject`.
+/// Liefert den ersten Hinweis für den Indicator und die fertige Messzeile.
+/// Bricht nie hart ab: jeder Fehlerpfad wird zu Hinweis + Ergebnis in der Trace.
+/// `debug`: Debug-Mitschnitt; geschrieben wird erst NACH dem Einfügen.
+pub fn process_job<T, C>(
+    worker: &mut DictationWorker<T, C>,
+    job: SttJob,
+    cfg: &Config,
+    inject: &mut dyn FnMut(&str) -> crate::error::Result<()>,
+    debug: Option<(&DebugCapture, &ModelTap)>,
+) -> (Option<&'static str>, DictationTrace)
+where
+    T: Transcriber + StreamingTranscriber,
+    C: LlmCleaner,
+{
+    let mut delivery = Delivery::default();
+    // Reste eines früheren, nicht abgeholten Auftrags verwerfen.
+    if let Some((_, tap)) = debug {
+        tap.take();
+    }
+    let (mut trace, captured) = match job {
+        SttJob::Utterance {
+            pcm,
+            frontmost,
+            captured,
+            trace,
+        } => {
+            // Die Rohaufnahme (Geräteformat, bei 60 s Stereo ca. 23 MB) nur für den Mitschnitt halten.
+            let captured = debug.is_some().then_some(captured);
+            let outcome = worker.handle(&pcm, frontmost.as_deref(), cfg);
+            deliver(outcome, inject, &mut delivery);
+            (*trace, captured)
+        }
+        SttJob::Live { feed } => {
+            let mut trace = *feed.trace;
+            let mut blocks = FeedBlocks::new(feed.blocks);
+            run_live(
+                worker,
+                &mut blocks,
+                feed.format,
+                feed.frontmost.as_deref(),
+                cfg,
+                &mut |outcome| deliver(outcome, inject, &mut delivery),
+            );
+            let mut captured = None;
+            if let Some(ended) = blocks.take_ended() {
+                trace.apply_capture(ended.released_at, &ended.captured);
+                captured = debug.is_some().then_some(ended.captured);
+            }
+            trace.segments = Some(delivery.segments);
+            trace.first_segment_at = delivery.first_segment_at;
+            (trace, captured)
+        }
+    };
+    let timing = worker.take_timing();
+    trace.result = match delivery.ended {
+        Some(ended) => ended,
+        None if delivery.inserted => DictationResult::Inserted,
+        None => DictationResult::Discarded(NOTHING_RECOGNIZED_REASON),
+    };
+    trace.stt = timing.stt.filter(|_| !timing.stt_failed);
+    trace.cleanup = timing.cleanup.filter(|_| !timing.stt_failed);
+    trace.text_at = delivery.text_at;
+    trace.injected = delivery.injected;
+    trace.model_loads = worker.take_model_loads();
+    if let Some((capture, tap)) = debug {
+        match &captured {
+            Some(captured) => capture.write(trace.nr, captured, &tap.take()),
+            None => log::debug!("Debug-Mitschnitt: keine Rohaufnahme vorhanden"),
+        }
+    }
+    (delivery.hint, trace)
+}
+
 /// Zustand einer laufenden PTT-Utterance zwischen Tastendruck und Loslassen —
 /// ersetzt die früheren `thread_local!`-Zellen in `main.rs` (Ticket-0038).
 /// Läuft ausschließlich auf dem Main-Thread (Hotkey-Callbacks), geteilt über
 /// `Arc<Mutex<PttSession>>`, weil `hotkey::install` `Send`-Closures verlangt.
-#[derive(Default)]
 pub struct PttSession {
+    /// Liefert je Tastendruck die Audioquelle (App: Mikrofon, Tests: WAV).
+    open_source: SourceFactory,
+    /// Nimmt die Messzeile jeder Dictation entgegen, die in der Session endet.
+    report: TraceReport,
+    /// Laufende Diktat-Nummer ab App-Start (jeder Tastendruck zählt, auch gesperrte).
+    nr: u64,
+    /// Messpunkte der laufenden Dictation; der Start-Thread ergänzt Mikro-Bereitschaft und Gerät.
+    trace: Option<Arc<Mutex<DictationTrace>>>,
     slot: Option<Arc<Mutex<MicSlot<audio::Recording>>>>,
     frontmost: Option<String>,
     /// Die laufende Aufnahme speist das Live-Diktat (Block-Kanal).
     live: bool,
 }
+
+/// Erzeugt die Audioquelle für eine Aufnahme aus der aktuellen Config.
+pub type SourceFactory = Box<dyn Fn(&Config) -> Box<dyn audio::AudioSource> + Send + Sync>;
 
 /// Zustand des (im Hintergrund startenden) Mikrofons zwischen Press und Release.
 enum MicSlot<R> {
@@ -557,11 +809,74 @@ pub enum MicReady {
     Failed(TalkerError),
 }
 
-/// Rohe Audio-Blöcke einer Live-Aufnahme samt Format und Ziel-App.
+fn lock_trace(trace: &Mutex<DictationTrace>) -> MutexGuard<'_, DictationTrace> {
+    trace.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Rohe Audio-Blöcke einer Live-Aufnahme samt Format, Ziel-App und den bis zum
+/// Mikrofon-Start gemessenen Punkten.
 pub struct LiveFeed {
+    pub trace: Box<DictationTrace>,
     pub frontmost: Option<String>,
-    pub blocks: std::sync::mpsc::Receiver<Vec<f32>>,
+    pub blocks: std::sync::mpsc::Receiver<audio::Feed>,
     pub format: (u16, u32),
+}
+
+/// Rohsamples der Blöcke eines Live-Kanals, bis `Feed::End` oder das Kanal-Ende kommt;
+/// das `End` bleibt für die Messzeile erhalten.
+pub struct FeedBlocks {
+    rx: std::sync::mpsc::Receiver<audio::Feed>,
+    ended: Option<Box<audio::Ended>>,
+}
+
+impl FeedBlocks {
+    pub fn new(rx: std::sync::mpsc::Receiver<audio::Feed>) -> Self {
+        Self { rx, ended: None }
+    }
+
+    /// Das Ende der Aufnahme (Loslass-Zeitpunkt + Rohaufnahme), falls es kam.
+    pub fn take_ended(&mut self) -> Option<Box<audio::Ended>> {
+        self.ended.take()
+    }
+}
+
+impl Iterator for FeedBlocks {
+    type Item = Vec<f32>;
+
+    fn next(&mut self) -> Option<Vec<f32>> {
+        match self.rx.recv() {
+            Ok(audio::Feed::Block(block)) => Some(block.samples),
+            Ok(audio::Feed::End(ended)) => {
+                self.ended = Some(ended);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+/// Auftrag an den STT-Worker: eine fertige Utterance (Am Ende) oder ein
+/// Live-Strom (Satzweise/Wortgruppenweise), der bis zum Ende der Aufnahme läuft.
+pub enum SttJob {
+    Utterance {
+        pcm: Vec<f32>,
+        frontmost: Option<String>,
+        captured: audio::Captured,
+        trace: Box<DictationTrace>,
+    },
+    Live {
+        feed: LiveFeed,
+    },
+}
+
+impl SttJob {
+    /// Die Messpunkte des Auftrags — z. B. um ihn mit Fehler zu melden, ohne ihn zu verarbeiten.
+    pub fn into_trace(self) -> DictationTrace {
+        match self {
+            SttJob::Utterance { trace, .. } => *trace,
+            SttJob::Live { feed } => *feed.trace,
+        }
+    }
 }
 
 /// Ergebnis von [`PttSession::release`].
@@ -575,19 +890,30 @@ pub enum ReleaseOutcome {
     LiveEnded,
     /// Utterance zu kurz — gilt als versehentlicher Tastendruck, verworfen.
     TooShort { ms: u64 },
-    /// PCM + der bei Press erfasste Frontmost, bereit für den STT-Worker.
+    /// PCM + der bei Press erfasste Frontmost, bereit für den STT-Worker; `captured`
+    /// ist die rohe Aufnahme, `trace` die Messpunkte bis zum Loslassen.
     Ready {
         pcm: Vec<f32>,
         frontmost: Option<String>,
         ms: u64,
+        captured: audio::Captured,
+        trace: Box<DictationTrace>,
     },
     /// Stop der Aufnahme fehlgeschlagen.
     StopFailed(TalkerError),
 }
 
 impl PttSession {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(open_source: SourceFactory, report: TraceReport) -> Self {
+        Self {
+            open_source,
+            report,
+            nr: 0,
+            trace: None,
+            slot: None,
+            frontmost: None,
+            live: false,
+        }
     }
 
     /// PTT gedrückt: Setup-Gate prüfen, Frontmost-App VOR Aufnahmestart
@@ -595,14 +921,19 @@ impl PttSession {
     /// die App während der Utterance wechselt), Mikrofon im Hintergrund
     /// starten. Der Tastendruck-Callback blockiert nie auf CoreAudio;
     /// `on_ready` meldet den Start (oder seinen Fehler) vom Start-Thread aus.
+    /// `pressed_at` stempelt der Event-Tap beim Eintritt (gemeinsame Uhr).
     pub fn press(
         &mut self,
+        pressed_at: audio::HostInstant,
         cfg: &Config,
         models: &ModelsState,
         on_ready: impl FnOnce(MicReady) + Send + 'static,
     ) -> PressOutcome {
-        let pressed_at = Instant::now();
+        self.nr += 1;
+        let mut trace = DictationTrace::new(self.nr, pressed_at, cfg.insert_mode, cfg.cleanup_mode);
         if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
+            trace.result = DictationResult::Blocked;
+            (self.report)(trace);
             return PressOutcome::Blocked(hint);
         }
         let frontmost = injection::frontmost_bundle_id();
@@ -612,29 +943,45 @@ impl PttSession {
             // Im Live-Betrieb zeigt der Indicator den tatsächlich wirkenden Modus.
             mode = cfg.insert_mode.resolve(mode);
         }
-        let device = cfg.mic_device.clone();
+        trace.cleanup_mode = mode;
+        let source = (self.open_source)(cfg);
         let slot = Arc::new(Mutex::new(MicSlot::Starting));
+        let trace = Arc::new(Mutex::new(trace));
         self.slot = Some(Arc::clone(&slot));
+        self.trace = Some(Arc::clone(&trace));
         self.frontmost = frontmost.clone();
         self.live = live;
+        let report = Arc::clone(&self.report);
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
-            let started = audio::start(device.as_deref(), live.then_some(tx));
-            eprintln!(
-                "talker: Mikrofon-Start dauerte {} ms",
-                pressed_at.elapsed().as_millis()
-            );
+            let started = audio::start(source, live.then_some(tx));
+            let ready_at = audio::HostInstant::now();
             complete_start(&slot, started, |result| match result {
-                Ok(rec) => on_ready(MicReady::Recording {
-                    level: rec.level(),
-                    mode,
-                    live: live.then(|| LiveFeed {
-                        frontmost,
-                        blocks: rx,
-                        format: rec.format(),
-                    }),
-                }),
-                Err(e) => on_ready(MicReady::Failed(e)),
+                Ok(rec) => {
+                    let snapshot = {
+                        let mut t = lock_trace(&trace);
+                        t.mic_ready_at = Some(ready_at);
+                        t.device = Some(rec.info().clone());
+                        t.clone()
+                    };
+                    let format = rec.info().format;
+                    on_ready(MicReady::Recording {
+                        level: rec.level(),
+                        mode,
+                        live: live.then(|| LiveFeed {
+                            trace: Box::new(snapshot),
+                            frontmost,
+                            blocks: rx,
+                            format: (format.channels, format.sample_rate),
+                        }),
+                    });
+                }
+                Err(e) => {
+                    let mut failed = lock_trace(&trace).clone();
+                    failed.result = DictationResult::Error(e.to_string());
+                    report(failed);
+                    on_ready(MicReady::Failed(e));
+                }
             });
         });
         PressOutcome::Starting
@@ -642,30 +989,53 @@ impl PttSession {
 
     /// PTT losgelassen: Aufnahme stoppen, Mindestlänge prüfen (versehentlicher
     /// Tastendruck), sonst PCM + Frontmost zum Senden an den STT-Worker freigeben.
-    pub fn release(&mut self) -> ReleaseOutcome {
+    /// `released_at` stempelt der Event-Tap beim Eintritt. Enden, die hier
+    /// vorzeitig abbrechen, meldet die Session selbst über `report`.
+    pub fn release(&mut self, released_at: audio::HostInstant) -> ReleaseOutcome {
         let frontmost = self.frontmost.take();
-        let Some(slot) = self.slot.take() else {
+        let (Some(slot), Some(trace)) = (self.slot.take(), self.trace.take()) else {
             return ReleaseOutcome::NoRecording;
         };
+        let mut trace = lock_trace(&trace).clone();
         let rec = match take_on_release(&slot) {
             Taken::Ready(rec) => rec,
-            Taken::StartAborted => return ReleaseOutcome::StartAborted,
+            Taken::StartAborted => {
+                trace.released_at = Some(released_at);
+                trace.result = DictationResult::Discarded("abgebrochen");
+                (self.report)(trace);
+                return ReleaseOutcome::StartAborted;
+            }
+            // Fehlgeschlagener Start ist schon gemeldet.
             Taken::Gone => return ReleaseOutcome::NoRecording,
         };
         if std::mem::take(&mut self.live) {
-            rec.finish_live();
+            rec.finish_live(released_at);
             return ReleaseOutcome::LiveEnded;
         }
-        match rec.stop() {
+        let captured = rec.stop();
+        trace.apply_capture(released_at, &captured);
+        match captured.to_mono_16k() {
             Ok(pcm) => {
                 let ms = audio::duration_ms(&pcm);
                 if ms < audio::MIN_UTTERANCE_MS {
+                    trace.result = DictationResult::Discarded("zu kurz");
+                    (self.report)(trace);
                     ReleaseOutcome::TooShort { ms }
                 } else {
-                    ReleaseOutcome::Ready { pcm, frontmost, ms }
+                    ReleaseOutcome::Ready {
+                        pcm,
+                        frontmost,
+                        ms,
+                        captured,
+                        trace: Box::new(trace),
+                    }
                 }
             }
-            Err(e) => ReleaseOutcome::StopFailed(e),
+            Err(e) => {
+                trace.result = DictationResult::Error(e.to_string());
+                (self.report)(trace);
+                ReleaseOutcome::StopFailed(e)
+            }
         }
     }
 }
@@ -698,6 +1068,7 @@ mod tests {
             Processed::Text {
                 text,
                 cleanup_fell_back,
+                ..
             } => (text, cleanup_fell_back),
             other => panic!("erwartet Text, bekam {other:?}"),
         }
@@ -796,7 +1167,7 @@ mod tests {
 
         let result = process_utterance(&[], &cfg, &mut t, None, false);
 
-        assert!(matches!(result, Processed::Empty));
+        assert!(matches!(result, Processed::Empty { .. }));
     }
 
     #[test]
@@ -883,6 +1254,10 @@ mod tests {
     // Ticket-0038). Getestet wird deshalb nur, was ohne Hardware entscheidbar
     // ist: das Setup-Gate selbst und der Leerlauf-Fall von `release()`.
 
+    fn mic_factory() -> SourceFactory {
+        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone())))
+    }
+
     // ---- asynchroner Mikrofon-Start (MicSlot) ----
 
     struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
@@ -937,18 +1312,310 @@ mod tests {
     #[test]
     fn press_blocked_by_setup_gate_never_touches_audio() {
         let models = ModelsState::new(ModelState::Missing, ModelState::Missing);
-        let mut session = PttSession::new();
+        let mut session = PttSession::new(mic_factory(), Arc::new(|_| {}));
 
-        let outcome = session.press(&Config::default(), &models, |_| {});
+        let outcome = session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &models,
+            |_| {},
+        );
 
         assert!(matches!(outcome, PressOutcome::Blocked(_)));
     }
 
     #[test]
     fn release_without_a_press_reports_no_recording() {
-        let mut session = PttSession::new();
+        let mut session = PttSession::new(mic_factory(), Arc::new(|_| {}));
 
-        assert!(matches!(session.release(), ReleaseOutcome::NoRecording));
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+    }
+
+    // ---- PttSession mit WAV-Quelle: Diktat-Nummer, Messpunkte, vorzeitige Enden ----
+
+    type Reports = Arc<Mutex<Vec<DictationTrace>>>;
+
+    fn collecting_report() -> (TraceReport, Reports) {
+        let reports: Reports = Arc::default();
+        let sink = Arc::clone(&reports);
+        (Arc::new(move |t| sink.lock().unwrap().push(t)), reports)
+    }
+
+    fn stt_ready() -> ModelsState {
+        ModelsState::new(ModelState::Ready, ModelState::Missing)
+    }
+
+    fn wav_opts(block_frames: usize, start_delay_ms: u64) -> audio::WavOptions {
+        audio::WavOptions {
+            format: audio::AudioFormat {
+                channels: 1,
+                sample_rate: 16_000,
+            },
+            block_frames,
+            start_delay: std::time::Duration::from_millis(start_delay_ms),
+            pace: audio::Pace::Immediate,
+            epoch: audio::HostInstant::from_nanos(1),
+        }
+    }
+
+    /// Factory über einer WAV-Quelle; die `SourceDone`-Signale kommen über den Kanal heraus.
+    fn wav_factory(
+        samples: Vec<f32>,
+        done: std::sync::mpsc::Sender<audio::SourceDone>,
+    ) -> SourceFactory {
+        let done = Mutex::new(done);
+        Box::new(move |_| {
+            let (source, signal) =
+                audio::WavSource::from_samples(samples.clone(), wav_opts(160, 0));
+            let _ = done.lock().unwrap().send(signal);
+            Box::new(source)
+        })
+    }
+
+    struct FailingSource;
+    impl audio::AudioSource for FailingSource {
+        fn open(self: Box<Self>, _: audio::OnBlock) -> crate::error::Result<audio::Opened> {
+            Err(TalkerError::Audio("kein Mikrofon verfügbar".into()))
+        }
+    }
+
+    /// Ein Diktat vom Tastendruck bis zur Quelle-fertig; liefert das Release-Ergebnis.
+    fn dictate_once(
+        session: &mut PttSession,
+        done: &std::sync::mpsc::Receiver<audio::SourceDone>,
+    ) -> ReleaseOutcome {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let outcome = session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            move |ready| {
+                let _ = ready_tx.send(matches!(ready, MicReady::Recording { .. }));
+            },
+        );
+        assert!(matches!(outcome, PressOutcome::Starting));
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        let signal = done
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(signal.wait(std::time::Duration::from_secs(5)));
+        session.release(audio::HostInstant::now())
+    }
+
+    /// REQ-DIAG-012: Nr. zählt ab 1 fortlaufend, Kaltstart nur bei Nr. 1.
+    #[test]
+    fn dictation_numbers_count_from_one_and_only_the_first_is_a_cold_start() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // 100 ms Audio → „zu kurz" → die Session meldet selbst.
+        let mut session = PttSession::new(wav_factory(vec![0.1; 1_600], done_tx), report);
+        for _ in 0..2 {
+            assert!(matches!(
+                dictate_once(&mut session, &done_rx),
+                ReleaseOutcome::TooShort { .. }
+            ));
+        }
+        let reports = reports.lock().unwrap();
+        let nrs: Vec<_> = reports.iter().map(|t| (t.nr, t.cold_start)).collect();
+        assert_eq!(nrs, [(1, true), (2, false)]);
+        assert!(
+            reports
+                .iter()
+                .all(|t| t.result == DictationResult::Discarded("zu kurz"))
+        );
+    }
+
+    /// Messpunkte bis zum Loslassen: Mikro bereit, Blöcke, Signal, Gerät, Dauer.
+    #[test]
+    fn early_end_trace_carries_start_marks_device_and_recorded_duration() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut session = PttSession::new(wav_factory(vec![0.1; 1_600], done_tx), report);
+        let pressed_at = audio::HostInstant::now();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        session.press(pressed_at, &Config::default(), &stt_ready(), move |_| {
+            let _ = ready_tx.send(());
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            done_rx
+                .recv()
+                .unwrap()
+                .wait(std::time::Duration::from_secs(5))
+        );
+        session.release(audio::HostInstant::now());
+        let t = reports.lock().unwrap()[0].clone();
+        assert!(t.mic_ready_at.unwrap() >= pressed_at);
+        assert!(t.first_block_at.is_some() && t.first_signal_at.is_some());
+        assert!(t.released_at.unwrap() >= t.mic_ready_at.unwrap());
+        assert_eq!(t.recorded, Some(std::time::Duration::from_millis(100)));
+        assert!(t.device.unwrap().device.starts_with("WAV: "));
+    }
+
+    /// REQ-DICT-002: Setup-Gate offen → genau eine Messzeile „gesperrt", Nr. verbraucht.
+    #[test]
+    fn blocked_press_reports_one_trace_and_consumes_the_number() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut session = PttSession::new(wav_factory(vec![0.1; 1_600], done_tx), report);
+        let missing = ModelsState::new(ModelState::Missing, ModelState::Missing);
+        let outcome = session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &missing,
+            |_| {},
+        );
+        assert!(matches!(outcome, PressOutcome::Blocked(_)));
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+        assert!(matches!(
+            dictate_once(&mut session, &done_rx),
+            ReleaseOutcome::Ready { .. } | ReleaseOutcome::TooShort { .. }
+        ));
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports[0].nr, 1);
+        assert_eq!(reports[0].result, DictationResult::Blocked);
+        assert_eq!(reports[1].nr, 2);
+        assert_eq!(reports.len(), 2, "Gesperrt + zu kurz, sonst nichts");
+    }
+
+    /// REQ-DICT-006: Mikrofon-Start scheitert → Fehler wie bisher + `Ergebnis: Fehler`; kein Doppel.
+    #[test]
+    fn mic_start_failure_reports_an_error_trace_once() {
+        let (report, reports) = collecting_report();
+        let mut session = PttSession::new(Box::new(|_| Box::new(FailingSource)), report);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            move |ready| {
+                let _ = ready_tx.send(matches!(ready, MicReady::Failed(_)));
+            },
+        );
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(&reports[0].result, DictationResult::Error(e) if e.contains("kein Mikrofon"))
+        );
+        assert!(reports[0].mic_ready_at.is_none());
+    }
+
+    /// Release vor Mikrofon-Start → „verworfen (abgebrochen)"; die spät fertige Aufnahme meldet nichts.
+    #[test]
+    fn release_before_mic_start_reports_aborted_and_the_late_start_stays_silent() {
+        struct SlowSource {
+            gate: std::sync::mpsc::Receiver<()>,
+            dropped: std::sync::mpsc::Sender<()>,
+        }
+        struct DropSignal(std::sync::mpsc::Sender<()>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        impl audio::AudioSource for SlowSource {
+            fn open(self: Box<Self>, _: audio::OnBlock) -> crate::error::Result<audio::Opened> {
+                let _ = self.gate.recv();
+                Ok(audio::Opened {
+                    info: audio::SourceInfo {
+                        format: audio::AudioFormat {
+                            channels: 1,
+                            sample_rate: 16_000,
+                        },
+                        device: "langsam".into(),
+                    },
+                    stop: Box::new(DropSignal(self.dropped)),
+                })
+            }
+        }
+        let (report, reports) = collecting_report();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let source = Mutex::new(Some(SlowSource {
+            gate: gate_rx,
+            dropped: dropped_tx,
+        }));
+        let mut session = PttSession::new(
+            Box::new(move |_| Box::new(source.lock().unwrap().take().unwrap())),
+            report,
+        );
+        session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            |_| {},
+        );
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::StartAborted
+        ));
+        // Doppeltes Loslassen: nichts mehr da, keine zweite Zeile.
+        assert!(matches!(
+            session.release(audio::HostInstant::now()),
+            ReleaseOutcome::NoRecording
+        ));
+        gate_tx.send(()).unwrap();
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "die späte Aufnahme meldet nichts");
+        assert_eq!(reports[0].result, DictationResult::Discarded("abgebrochen"));
+        assert!(reports[0].released_at.is_some());
+    }
+
+    /// Release ohne vorherige Taste oder doppelt: keine Messzeile.
+    #[test]
+    fn release_without_press_reports_nothing() {
+        let (report, reports) = collecting_report();
+        let mut session = PttSession::new(mic_factory(), report);
+        session.release(audio::HostInstant::now());
+        session.release(audio::HostInstant::now());
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    /// Ausreichend lange Aufnahme → `Ready` mit Trace, noch keine Messzeile (kommt vom Worker).
+    #[test]
+    fn long_enough_recording_hands_a_trace_to_the_worker_without_reporting() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut session = PttSession::new(wav_factory(vec![0.1; 16_000], done_tx), report);
+        match dictate_once(&mut session, &done_rx) {
+            ReleaseOutcome::Ready {
+                trace,
+                captured,
+                ms,
+                ..
+            } => {
+                assert_eq!(ms, 1_000);
+                assert_eq!(captured.raw.len(), 16_000);
+                assert_eq!(trace.nr, 1);
+                assert!(trace.released_at.is_some() && trace.recorded.is_some());
+            }
+            other => panic!("Ready erwartet, bekam {other:?}"),
+        }
+        assert!(reports.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1595,7 +2262,7 @@ mod tests {
         );
         assert!(matches!(
             w.handle(&[], None, &raw_cfg),
-            Outcome::Rejected("Nichts erkannt")
+            Outcome::NothingRecognized
         ));
 
         // STT-Fehler → „Spracherkennung fehlgeschlagen".
@@ -1689,5 +2356,1321 @@ mod tests {
             user_content,
             "Nutzer-Clipboard nach der Injection restauriert"
         );
+    }
+
+    // ---- process_job: Messpunkte, Ergebnis, Verhalten unverändert (T13) ----
+
+    use crate::diagnostics::DictationTrace;
+
+    fn job_info() -> audio::SourceInfo {
+        audio::SourceInfo {
+            format: audio::AudioFormat {
+                channels: 1,
+                sample_rate: 16_000,
+            },
+            device: "Test-Mikro".into(),
+        }
+    }
+
+    fn base_trace(cfg: &Config) -> Box<DictationTrace> {
+        Box::new(DictationTrace::new(
+            1,
+            audio::HostInstant::from_nanos(1_000),
+            cfg.insert_mode,
+            cfg.cleanup_mode,
+        ))
+    }
+
+    fn utterance_job(cfg: &Config) -> SttJob {
+        SttJob::Utterance {
+            pcm: vec![0.1; 16_000],
+            frontmost: None,
+            captured: audio::Captured {
+                raw: vec![0.1; 16_000],
+                info: job_info(),
+                marks: audio::StartMarks::default(),
+            },
+            trace: base_trace(cfg),
+        }
+    }
+
+    /// Live-Auftrag: `blocks` volle Chunks, dann `End` mit Loslass-Zeitpunkt 9 000 ns.
+    fn live_job(cfg: &Config, blocks: usize) -> SttJob {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..blocks {
+            tx.send(audio::Feed::Block(audio::Block {
+                samples: vec![0.0; crate::audio::CHUNK_16K_SAMPLES],
+                at: audio::HostInstant::from_nanos(2_000 + i as u64),
+            }))
+            .unwrap();
+        }
+        tx.send(audio::Feed::End(Box::new(audio::Ended {
+            released_at: audio::HostInstant::from_nanos(9_000),
+            captured: audio::Captured {
+                raw: vec![0.0; blocks * crate::audio::CHUNK_16K_SAMPLES],
+                info: job_info(),
+                marks: audio::StartMarks::default(),
+            },
+        })))
+        .unwrap();
+        SttJob::Live {
+            feed: LiveFeed {
+                trace: base_trace(cfg),
+                frontmost: None,
+                blocks: rx,
+                format: (1, 16_000),
+            },
+        }
+    }
+
+    type Injected = Rc<RefCell<Vec<String>>>;
+
+    fn recording_inject(
+        injected: &Injected,
+    ) -> impl FnMut(&str) -> crate::error::Result<()> + use<> {
+        let injected = Rc::clone(injected);
+        move |text: &str| {
+            injected.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    fn streaming_worker(
+        cfg: &Config,
+        rest: &'static str,
+        updates: &'static [(&'static str, bool)],
+    ) -> DictationWorker<FakeStreaming, ScriptedCleaner> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        live_worker(cfg, move || FakeStreaming::new(updates, rest), &log)
+    }
+
+    /// REQ-DIAG-012: Utterance-Pfad füllt Text-/STT-/Cleanup-/Einfüge-Messpunkte.
+    #[test]
+    fn utterance_job_fills_the_measurement_points() {
+        let cfg = Config::default();
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(hint, None);
+        assert_eq!(injected.borrow().as_slice(), ["[hallo]"]);
+        assert_eq!(trace.result, DictationResult::Inserted);
+        assert!(trace.text_at.is_some());
+        assert!(trace.stt.is_some() && trace.cleanup.is_some() && trace.injected.is_some());
+        assert_eq!(trace.nr, 1);
+        assert!(trace.model_loads.is_empty());
+    }
+
+    /// Modus Roh → kein Cleanup-Zeitwert (`—`).
+    #[test]
+    fn raw_mode_job_has_no_cleanup_time() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(injected.borrow().as_slice(), ["hallo"]);
+        assert!(trace.stt.is_some());
+        assert_eq!(trace.cleanup, None);
+        assert_eq!(trace.result, DictationResult::Inserted);
+    }
+
+    /// AK-13: leerer STT-Text → verworfen (nichts erkannt), nichts eingefügt.
+    #[test]
+    fn empty_transcript_job_is_discarded_as_nothing_recognized() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "", &[]);
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(hint, Some("Nichts erkannt"));
+        assert!(injected.borrow().is_empty());
+        assert_eq!(trace.result, DictationResult::Discarded("nichts erkannt"));
+        assert_eq!(trace.text_at, None);
+        assert_eq!(trace.injected, None);
+    }
+
+    /// AK-13: STT-Fehler → Ergebnis Fehler, keine Zeitwerte, nichts eingefügt.
+    #[test]
+    fn stt_error_job_is_reported_as_error() {
+        struct FailingStt;
+        impl Transcriber for FailingStt {
+            fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+        }
+        impl StreamingTranscriber for FailingStt {
+            fn begin(&mut self) {}
+            fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+            fn finish(&mut self) -> crate::error::Result<String> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+        }
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_: &Path| Ok(FailingStt)),
+            Box::new(|| (None::<ScriptedCleaner>, false)),
+        );
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(hint, Some("Spracherkennung fehlgeschlagen"));
+        assert!(injected.borrow().is_empty());
+        assert!(matches!(trace.result, DictationResult::Error(_)));
+        assert_eq!(
+            (trace.stt, trace.cleanup, trace.text_at),
+            (None, None, None)
+        );
+    }
+
+    /// CR-15/AK-13: scheitert ein Live-Chunk, aber `finish` klappt, bleibt die Messzeile `—`.
+    #[test]
+    fn live_feed_error_keeps_timing_empty_even_if_finish_succeeds() {
+        struct FeedAlwaysFails;
+        impl Transcriber for FeedAlwaysFails {
+            fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl StreamingTranscriber for FeedAlwaysFails {
+            fn begin(&mut self) {}
+            fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+            fn finish(&mut self) -> crate::error::Result<String> {
+                Ok("Rest.".into())
+            }
+        }
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_: &Path| Ok(FeedAlwaysFails)),
+            Box::new(|| (None::<ScriptedCleaner>, false)),
+        );
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 1),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert!(matches!(trace.result, DictationResult::Error(_)));
+        assert_eq!((trace.stt, trace.cleanup), (None, None));
+    }
+
+    /// Verhalten unverändert: Cleanup-Fehler → Rohtext eingefügt, Ergebnis `eingefügt`, Hinweis bleibt.
+    #[test]
+    fn cleanup_error_job_still_injects_the_raw_text() {
+        struct FailingCleaner;
+        impl LlmCleaner for FailingCleaner {
+            fn clean(&mut self, _: &str) -> crate::error::Result<String> {
+                Err(TalkerError::Cleanup("Timeout".into()))
+            }
+        }
+        let cfg = Config::default();
+        let mut w = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_: &Path| Ok(FakeStreaming::new(&[], "hallo"))),
+            Box::new(|| (Some(FailingCleaner), false)),
+        );
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(hint, Some("Cleanup übersprungen — Rohtext eingefügt"));
+        assert_eq!(injected.borrow().as_slice(), ["hallo"]);
+        assert_eq!(trace.result, DictationResult::Inserted);
+    }
+
+    /// Einfügen schlägt fehl → Hinweis wie bisher, Ergebnis Fehler.
+    #[test]
+    fn injection_error_is_reported_with_the_old_hint() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let mut failing = |_: &str| Err(TalkerError::Keystroke("kein Zugriff".into()));
+        let (hint, trace) = process_job(&mut w, utterance_job(&cfg), &cfg, &mut failing, None);
+        assert_eq!(hint, Some("Einfügen fehlgeschlagen"));
+        assert!(matches!(&trace.result, DictationResult::Error(e) if e.contains("kein Zugriff")));
+    }
+
+    /// AK-13/CR-11: `—` bei STT/Cleanup nur, wenn die STT fehlschlug; ein Einfüge-Fehler
+    /// ändert nichts an den gemessenen Zeiten.
+    #[test]
+    fn injection_error_keeps_the_measured_stt_and_cleanup_times() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Casual);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let mut failing = |_: &str| Err(TalkerError::Keystroke("kein Zugriff".into()));
+        let (_, trace) = process_job(&mut w, utterance_job(&cfg), &cfg, &mut failing, None);
+        assert!(matches!(trace.result, DictationResult::Error(_)));
+        assert!(trace.stt.is_some() && trace.cleanup.is_some());
+    }
+
+    /// AK-11: Live mit 3 Segmenten → Segmentzahl, erstes Segment, Loslass-Daten aus `End`.
+    #[test]
+    fn live_job_counts_segments_and_takes_release_data_from_end() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(
+            &cfg,
+            "Dritter.",
+            &[
+                ("a", false),
+                ("Erster.", true),
+                ("b", false),
+                ("Zweiter.", true),
+            ],
+        );
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 4),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(hint, None);
+        assert_eq!(
+            injected.borrow().as_slice(),
+            ["Erster.", " Zweiter.", " Dritter."]
+        );
+        assert_eq!(trace.segments, Some(3));
+        assert!(trace.first_segment_at.is_some());
+        assert!(trace.first_segment_at <= trace.text_at);
+        assert_eq!(
+            trace.released_at,
+            Some(audio::HostInstant::from_nanos(9_000))
+        );
+        assert_eq!(
+            trace.recorded,
+            Some(std::time::Duration::from_millis(2_240))
+        );
+        assert!(trace.device.is_some() && trace.stt.is_some());
+        assert_eq!(trace.result, DictationResult::Inserted);
+    }
+
+    /// Live ohne Segment → 0 Segmente, kein erstes Segment, verworfen (nichts erkannt).
+    #[test]
+    fn live_job_without_segments_reports_zero() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "", &[]);
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 2),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(
+            hint, None,
+            "Live ohne Text meldet dem Indicator weiter nichts"
+        );
+        assert!(injected.borrow().is_empty());
+        assert_eq!(trace.segments, Some(0));
+        assert_eq!(trace.first_segment_at, None);
+        assert_eq!(trace.result, DictationResult::Discarded("nichts erkannt"));
+    }
+
+    /// Live ohne `End` (Kanal einfach zu): Loslass-Punkte bleiben leer, kein Panic.
+    #[test]
+    fn live_job_without_end_keeps_release_points_empty() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "Rest.", &[]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let job = SttJob::Live {
+            feed: LiveFeed {
+                trace: base_trace(&cfg),
+                frontmost: None,
+                blocks: rx,
+                format: (1, 16_000),
+            },
+        };
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(&mut w, job, &cfg, &mut recording_inject(&injected), None);
+        assert_eq!(trace.released_at, None);
+        assert_eq!(trace.recorded, None);
+    }
+
+    /// REQ-DIAG-016: Ladezeit nur bei Laden während der Dictation; `take` leert.
+    #[test]
+    fn model_loads_are_only_recorded_during_a_dictation_and_drain() {
+        let raw_cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let loads = Rc::new(RefCell::new(0usize));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = DictationWorker::new(
+            &raw_cfg,
+            models_with_gemma(ModelState::Ready),
+            fake_stt_loader(),
+            counted_cleaner_loader(&loads, &log),
+        );
+        assert!(
+            w.take_model_loads().is_empty(),
+            "Laden in new() zählt nicht"
+        );
+        // STT-Pfad ändert sich → Neuladen während der Dictation.
+        let moved = Config {
+            stt_model_dir: PathBuf::from("/anderes/modell"),
+            ..raw_cfg.clone()
+        };
+        w.handle(&[0.0; 1600], None, &moved);
+        let first = w.take_model_loads();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, ModelId::Stt);
+        assert!(w.take_model_loads().is_empty());
+        // Wechsel auf einen LLM-Modus → Cleaner wird erst jetzt geladen.
+        let business = Config {
+            cleanup_mode: CleanupMode::Business,
+            ..moved
+        };
+        w.handle(&[0.0; 1600], None, &business);
+        let second = w.take_model_loads();
+        assert_eq!(
+            second.iter().map(|l| l.0).collect::<Vec<_>>(),
+            [ModelId::Gemma]
+        );
+        // Nächste Dictation ohne Laden: leer.
+        w.handle(&[0.0; 1600], None, &business);
+        assert!(w.take_model_loads().is_empty());
+    }
+
+    /// Modell-Laden landet in der Trace des Auftrags.
+    #[test]
+    fn job_trace_lists_models_loaded_during_the_dictation() {
+        let raw_cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&raw_cfg, "hallo", &[]);
+        let business = Config {
+            cleanup_mode: CleanupMode::Business,
+            ..raw_cfg
+        };
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&business),
+            &business,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(trace.model_loads.len(), 1);
+        assert_eq!(trace.model_loads[0].0, ModelId::Gemma);
+    }
+
+    /// AK-14 „darf nicht passieren": kein Transcript-Text in irgendeiner Logzeile, auch nicht auf Debug.
+    #[test]
+    fn no_log_line_contains_the_transcript_even_on_debug() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Business);
+        let mut live = streaming_worker(&cfg, "geheimrest", &[("x", false), ("geheimsatz", true)]);
+        let batch_cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Business);
+        let mut batch = streaming_worker(&batch_cfg, "geheimbatch", &[]);
+        let injected: Injected = Rc::default();
+        let (_, lines) = crate::logging::capture(|| {
+            process_job(
+                &mut live,
+                live_job(&cfg, 2),
+                &cfg,
+                &mut recording_inject(&injected),
+                None,
+            );
+            process_job(
+                &mut batch,
+                utterance_job(&batch_cfg),
+                &batch_cfg,
+                &mut recording_inject(&injected),
+                None,
+            );
+        });
+        assert!(!lines.is_empty(), "auf Debug entstehen Detailzeilen");
+        assert!(injected.borrow().iter().any(|t| t.contains("geheim")));
+        assert!(
+            lines.iter().all(|(_, l)| !l.contains("geheim")),
+            "Transcript im Log: {lines:?}"
+        );
+    }
+
+    /// `FeedBlocks`: Samples bis `End`, das `End` bleibt abholbar.
+    #[test]
+    fn feed_blocks_stop_at_end_and_keep_it() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let block = |v: f32| {
+            audio::Feed::Block(audio::Block {
+                samples: vec![v],
+                at: audio::HostInstant::from_nanos(1),
+            })
+        };
+        tx.send(block(1.0)).unwrap();
+        tx.send(block(2.0)).unwrap();
+        tx.send(audio::Feed::End(Box::new(audio::Ended {
+            released_at: audio::HostInstant::from_nanos(5),
+            captured: audio::Captured {
+                raw: vec![1.0, 2.0],
+                info: job_info(),
+                marks: audio::StartMarks::default(),
+            },
+        })))
+        .unwrap();
+        tx.send(block(3.0)).unwrap();
+        let mut blocks = FeedBlocks::new(rx);
+        assert_eq!((&mut blocks).collect::<Vec<_>>(), [vec![1.0], vec![2.0]]);
+        let ended = blocks.take_ended().unwrap();
+        assert_eq!(ended.released_at, audio::HostInstant::from_nanos(5));
+        assert!(blocks.take_ended().is_none());
+    }
+
+    /// REQ-DIAG-009/-012: auf `info` genau eine Zeile (die Messzeile) für eine Live-Dictation
+    /// mit 3 Segmenten; auf `debug` kommen Chunk- und Segment-Zeilen dazu.
+    #[test]
+    fn live_dictation_with_three_segments_logs_exactly_one_line_on_info() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(
+            &cfg,
+            "Dritter.",
+            &[
+                ("a", false),
+                ("Erster.", true),
+                ("b", false),
+                ("Zweiter.", true),
+            ],
+        );
+        let report = crate::diagnostics::log_report();
+        let injected: Injected = Rc::default();
+        let (_, lines) = crate::logging::capture(|| {
+            let (_, trace) = process_job(
+                &mut w,
+                live_job(&cfg, 4),
+                &cfg,
+                &mut recording_inject(&injected),
+                None,
+            );
+            report(trace);
+        });
+        assert_eq!(injected.borrow().len(), 3);
+        let on_info: Vec<_> = lines
+            .iter()
+            .filter(|(l, _)| *l <= log::Level::Info)
+            .collect();
+        assert_eq!(on_info.len(), 1, "auf info: {on_info:?}");
+        assert!(on_info[0].1.starts_with("talker::messung: Diktat #1: "));
+        assert!(on_info[0].1.contains("Segmente 3"));
+        let detail: Vec<_> = lines
+            .iter()
+            .filter(|(l, _)| *l == log::Level::Debug)
+            .collect();
+        assert!(detail.iter().any(|(_, l)| l.contains("Live-Chunk")));
+        assert!(detail.iter().any(|(_, l)| l.contains("Live-Segment")));
+    }
+
+    // ---- Debug-Mitschnitt in process_job (T15) ----
+
+    struct DebugDir(PathBuf);
+    impl DebugDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("talker-job-debug-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn files(&self) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&self.0)
+                .map(|d| {
+                    d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        }
+    }
+    impl Drop for DebugDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn debug_capture(dir: &Path) -> DebugCapture {
+        // Nie über die Umgebung: parallele Tests würden sich stören.
+        DebugCapture::from_var(dir.to_str()).unwrap()
+    }
+
+    /// REQ-DIAG-019/-022: Mitschnitt wird NACH dem Einfügen geschrieben; mic.wav = Rohaufnahme,
+    /// model.wav = Tap-Inhalt; Dateien tragen die Diktat-Nummer.
+    #[test]
+    fn debug_wavs_are_written_after_injection_with_the_dictation_number() {
+        let dir = DebugDir::new("order");
+        let capture = debug_capture(&dir.0);
+        let tap = ModelTap::default();
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let watched = dir.0.clone();
+        let tap_in_worker = tap.clone();
+        let seen_before_inject = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&seen_before_inject);
+        let mut inject = move |_: &str| {
+            *seen.borrow_mut() = Some(std::fs::read_dir(&watched).unwrap().count());
+            // Der Transcriber füllt den Tap während der Verarbeitung.
+            tap_in_worker.push(&[0.5; 100]);
+            Ok(())
+        };
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut inject,
+            Some((&capture, &tap)),
+        );
+        assert_eq!(
+            *seen_before_inject.borrow(),
+            Some(0),
+            "inject vor dem Schreiben"
+        );
+        assert_eq!(dir.files(), ["1-mic.wav", "1-model.wav"]);
+        assert_eq!(trace.nr, 1);
+        let mic = hound::WavReader::open(dir.0.join("1-mic.wav")).unwrap();
+        assert_eq!(mic.len(), 16_000);
+        let model = hound::WavReader::open(dir.0.join("1-model.wav")).unwrap();
+        assert_eq!(model.len(), 100);
+        assert!(tap.take().is_empty(), "der Tap wurde abgeholt");
+    }
+
+    /// Live: mic.wav stammt aus `End.captured`.
+    #[test]
+    fn live_job_writes_the_debug_wavs_from_the_end_capture() {
+        let dir = DebugDir::new("live");
+        let capture = debug_capture(&dir.0);
+        let tap = ModelTap::default();
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "Rest.", &[]);
+        let injected: Injected = Rc::default();
+        process_job(
+            &mut w,
+            live_job(&cfg, 2),
+            &cfg,
+            &mut recording_inject(&injected),
+            Some((&capture, &tap)),
+        );
+        assert_eq!(dir.files(), ["1-mic.wav", "1-model.wav"]);
+        let mic = hound::WavReader::open(dir.0.join("1-mic.wav")).unwrap();
+        assert_eq!(mic.len() as usize, 2 * crate::audio::CHUNK_16K_SAMPLES);
+    }
+
+    /// REQ-DIAG-021: nicht beschreibbares Verzeichnis → Warnung, Text wurde normal eingefügt.
+    #[test]
+    fn unwritable_debug_dir_does_not_affect_the_inserted_text() {
+        let dir = DebugDir::new("blocked");
+        let blocker = dir.0.join("datei");
+        std::fs::write(&blocker, "x").unwrap();
+        let capture = debug_capture(&blocker.join("unter"));
+        let tap = ModelTap::default();
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        let ((hint, trace), lines) = crate::logging::capture(|| {
+            process_job(
+                &mut w,
+                utterance_job(&cfg),
+                &cfg,
+                &mut recording_inject(&injected),
+                Some((&capture, &tap)),
+            )
+        });
+        assert_eq!(hint, None);
+        assert_eq!(injected.borrow().as_slice(), ["hallo"]);
+        assert_eq!(trace.result, DictationResult::Inserted);
+        assert!(lines.iter().any(|(l, _)| *l == log::Level::Warn));
+    }
+
+    /// REQ-DIAG-022/REQ-DICT-003: ohne Debug (None) wird nichts auf die Platte geschrieben.
+    #[test]
+    fn without_debug_nothing_is_written() {
+        let dir = DebugDir::new("none");
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert!(dir.files().is_empty());
+    }
+
+    /// AK-16: im Audio-Modul gibt es keine Datei-I/O (kein Schreiben im Callback-Pfad).
+    #[test]
+    fn audio_module_has_no_file_writing() {
+        let source = include_str!("audio.rs");
+        let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        for forbidden in ["WavWriter", "std::fs", "File::create", "OpenOptions"] {
+            assert!(!production.contains(forbidden), "{forbidden} in audio.rs");
+        }
+    }
+
+    // ---- Ende zu Ende ohne Mikrofon und ohne Modell (T16, AK-21) ----
+
+    use crate::audio::AudioSource as _;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration as StdDuration;
+
+    /// STT-Fake, das den Modell-Eingang der Batch-Utterance festhält.
+    struct RecordingStt {
+        received: Rc<RefCell<Vec<f32>>>,
+        reply: &'static str,
+        fail: bool,
+        updates: std::collections::VecDeque<crate::stt::StreamUpdate>,
+        /// Künstliche Dauer je `feed` (Live-Messung).
+        feed_delay: StdDuration,
+    }
+
+    impl RecordingStt {
+        fn new(received: &Rc<RefCell<Vec<f32>>>, reply: &'static str) -> Self {
+            Self {
+                received: Rc::clone(received),
+                reply,
+                fail: false,
+                updates: Default::default(),
+                feed_delay: StdDuration::ZERO,
+            }
+        }
+    }
+
+    impl Transcriber for RecordingStt {
+        fn transcribe(&mut self, pcm: &[f32]) -> crate::error::Result<String> {
+            if self.fail {
+                return Err(TalkerError::Stt("kaputt".into()));
+            }
+            *self.received.borrow_mut() = pcm.to_vec();
+            Ok(self.reply.to_string())
+        }
+    }
+
+    impl StreamingTranscriber for RecordingStt {
+        fn begin(&mut self) {}
+        fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+            std::thread::sleep(self.feed_delay);
+            Ok(self
+                .updates
+                .pop_front()
+                .unwrap_or(crate::stt::StreamUpdate {
+                    text: String::new(),
+                    endpoint: false,
+                }))
+        }
+        fn finish(&mut self) -> crate::error::Result<String> {
+            Ok(self.reply.to_string())
+        }
+    }
+
+    fn e2e_worker(
+        cfg: &Config,
+        make: impl Fn() -> RecordingStt + 'static,
+    ) -> DictationWorker<RecordingStt, ScriptedCleaner> {
+        let loads = Rc::new(RefCell::new(0usize));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        DictationWorker::new(
+            cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(move |_: &Path| Ok(make())),
+            counted_cleaner_loader(&loads, &log),
+        )
+    }
+
+    fn opts(channels: u16, rate: u32, delay_ms: u64) -> audio::WavOptions {
+        audio::WavOptions {
+            format: audio::AudioFormat {
+                channels,
+                sample_rate: rate,
+            },
+            block_frames: 480,
+            start_delay: StdDuration::from_millis(delay_ms),
+            pace: audio::Pace::Immediate,
+            epoch: audio::HostInstant::from_nanos(1),
+        }
+    }
+
+    fn wav_factory_with(
+        samples: Vec<f32>,
+        options: audio::WavOptions,
+        done: std::sync::mpsc::Sender<audio::SourceDone>,
+    ) -> SourceFactory {
+        let done = Mutex::new(done);
+        Box::new(move |_| {
+            let (source, signal) = audio::WavSource::from_samples(samples.clone(), options);
+            let _ = done.lock().unwrap().send(signal);
+            Box::new(source)
+        })
+    }
+
+    fn ramp_16k(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| 0.01 + (i % 1_000) as f32 / 10_000.0)
+            .collect()
+    }
+
+    /// Ein Diktat vom Tastendruck bis zur fertigen Messzeile. `None`, wenn die Session selbst
+    /// geendet hat (gesperrt, Mikrofon-Fehler, zu kurz, abgebrochen) — die Zeile steht dann in den Reports.
+    fn dictate_e2e(
+        session: &mut PttSession,
+        cfg: &Config,
+        models: &ModelsState,
+        worker: &mut DictationWorker<RecordingStt, ScriptedCleaner>,
+        done: &Receiver<audio::SourceDone>,
+        injected: &Injected,
+        debug: Option<(&DebugCapture, &ModelTap)>,
+    ) -> Option<DictationTrace> {
+        let (ready_tx, ready_rx) = channel();
+        let outcome = session.press(audio::HostInstant::now(), cfg, models, move |ready| {
+            let _ = ready_tx.send(ready);
+        });
+        if matches!(outcome, PressOutcome::Blocked(_)) {
+            return None;
+        }
+        let live = match ready_rx.recv_timeout(StdDuration::from_secs(5)).unwrap() {
+            MicReady::Recording { live, .. } => live,
+            MicReady::Failed(_) => return None,
+        };
+        // Ein Hilfsthread im echten Ablauf; hier genügt das Warten auf das Quellen-Ende.
+        let signal = done.recv_timeout(StdDuration::from_secs(5)).unwrap();
+        assert!(signal.wait(StdDuration::from_secs(10)));
+        let mut inject = recording_inject(injected);
+        match session.release(audio::HostInstant::now()) {
+            ReleaseOutcome::Ready {
+                pcm,
+                frontmost,
+                captured,
+                trace,
+                ..
+            } => Some(
+                process_job(
+                    worker,
+                    SttJob::Utterance {
+                        pcm,
+                        frontmost,
+                        captured,
+                        trace,
+                    },
+                    cfg,
+                    &mut inject,
+                    debug,
+                )
+                .1,
+            ),
+            ReleaseOutcome::LiveEnded => Some(
+                process_job(
+                    worker,
+                    SttJob::Live {
+                        feed: live.expect("Live-Aufnahme hat einen Feed"),
+                    },
+                    cfg,
+                    &mut inject,
+                    debug,
+                )
+                .1,
+            ),
+            _ => None,
+        }
+    }
+
+    /// AK-11/CR-3: im Live-Modus zählt STT nur ab dem Loslassen (`Feed::End`) — die Chunks
+    /// während des Sprechens stehen nicht in der Klammer hinter „Loslassen→Text“.
+    #[test]
+    fn live_stt_time_counts_only_after_the_release() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = e2e_worker(&cfg, || RecordingStt {
+            feed_delay: StdDuration::from_millis(60),
+            ..RecordingStt::new(&Rc::default(), "Rest.")
+        });
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 3),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        let stt = trace.stt.expect("STT nach dem Loslassen gemessen");
+        assert!(
+            stt < StdDuration::from_millis(60),
+            "3 Chunks à 60 ms vor dem Loslassen dürfen nicht zählen: {stt:?}"
+        );
+        assert_eq!(injected.borrow().as_slice(), ["Rest."]);
+    }
+
+    /// AK-9/-12/-21: Batch-Diktat Ende zu Ende → vollständige Messzeile; #1 Kaltstart, #2 nicht.
+    #[test]
+    fn e2e_batch_dictation_gives_a_complete_measurement_line_and_cold_start_only_first() {
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000 * 2), opts(2, 48_000, 100), done_tx),
+            report,
+        );
+        let cfg = Config::default();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo welt")
+        });
+        let injected: Injected = Rc::default();
+        let models = stt_ready();
+        let first = dictate_e2e(
+            &mut session,
+            &cfg,
+            &models,
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        let second = dictate_e2e(
+            &mut session,
+            &cfg,
+            &models,
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            injected.borrow().as_slice(),
+            ["[hallo welt]", "[hallo welt]"]
+        );
+        let line = first.to_string();
+        assert!(!line.contains('—'), "alle Felder gefüllt: {line}");
+        assert!(line.starts_with("Diktat #1: Taste→Mikro bereit "));
+        assert!(
+            line.contains("Gerät: WAV: Samples (48 kHz, 2 Kanäle)"),
+            "{line}"
+        );
+        assert!(line.contains("Einfügen: Am Ende") && line.contains("Ergebnis: eingefügt"));
+        assert!(line.contains("Kaltstart: ja"));
+        assert!(
+            second.to_string().contains("Diktat #2:")
+                && second.to_string().contains("Kaltstart: nein")
+        );
+        assert!(
+            reports.lock().unwrap().is_empty(),
+            "Worker meldet, nicht die Session"
+        );
+        assert_eq!(first.recorded, Some(StdDuration::from_secs(2)));
+    }
+
+    /// AK-20/-21: Startverzögerung 0/100/300 ms × Formate → kein Sample geht bis zum Modell verloren.
+    #[test]
+    fn e2e_no_sample_is_lost_for_any_start_delay_and_format() {
+        let input = ramp_16k(16_000);
+        for delay_ms in [0, 100, 300] {
+            for (channels, rate) in [(1u16, 16_000u32), (2, 44_100), (1, 48_000)] {
+                let (report, _) = collecting_report();
+                let (done_tx, done_rx) = channel();
+                let mut session = PttSession::new(
+                    wav_factory_with(input.clone(), opts(channels, rate, delay_ms), done_tx),
+                    report,
+                );
+                let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+                let received = Rc::new(RefCell::new(Vec::new()));
+                let mut worker = e2e_worker(&cfg, {
+                    let received = Rc::clone(&received);
+                    move || RecordingStt::new(&received, "hallo")
+                });
+                let injected: Injected = Rc::default();
+                dictate_e2e(
+                    &mut session,
+                    &cfg,
+                    &stt_ready(),
+                    &mut worker,
+                    &done_rx,
+                    &injected,
+                    None,
+                )
+                .unwrap();
+                let got = received.borrow();
+                if rate == 16_000 {
+                    assert_eq!(*got, input, "{delay_ms} ms, {channels} Kanäle, {rate} Hz");
+                } else {
+                    assert!(
+                        got.len().abs_diff(input.len()) <= 2_048,
+                        "{delay_ms} ms, {channels} Kanäle, {rate} Hz: {} statt {}",
+                        got.len(),
+                        input.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// AK-13: nur Null-Blöcke → erstes Signal `—`, Zeile trotzdem vollständig.
+    #[test]
+    fn e2e_only_zero_blocks_leave_first_signal_empty() {
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(vec![0.0; 16_000], opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo")
+        });
+        let injected: Injected = Rc::default();
+        let trace = dictate_e2e(
+            &mut session,
+            &cfg,
+            &stt_ready(),
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        let line = trace.to_string();
+        assert!(line.contains("→erster Block ") && !line.contains("→erster Block —"));
+        assert!(line.contains("→erstes Signal —"), "{line}");
+        assert!(line.contains("Ergebnis: eingefügt"));
+    }
+
+    /// AK-13: zu kurz / gesperrt / Mikrofon-Fehler enden in der Session mit eigener Zeile.
+    #[test]
+    fn e2e_early_endings_report_their_own_line_and_never_reach_the_worker() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo")
+        });
+        let injected: Injected = Rc::default();
+
+        // zu kurz
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(1_600), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        assert!(
+            dictate_e2e(
+                &mut session,
+                &cfg,
+                &stt_ready(),
+                &mut worker,
+                &done_rx,
+                &injected,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            reports.lock().unwrap()[0]
+                .to_string()
+                .ends_with("Ergebnis: verworfen (zu kurz)")
+        );
+
+        // gesperrt
+        let (report, reports) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let closed = ModelsState::new(ModelState::Missing, ModelState::Missing);
+        assert!(
+            dictate_e2e(
+                &mut session,
+                &cfg,
+                &closed,
+                &mut worker,
+                &done_rx,
+                &injected,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            reports.lock().unwrap()[0]
+                .to_string()
+                .ends_with("Ergebnis: gesperrt")
+        );
+
+        // Mikrofon-Start scheitert
+        let (report, reports) = collecting_report();
+        let (_unused_tx, done_rx) = channel();
+        let mut session = PttSession::new(Box::new(|_| Box::new(FailingSource)), report);
+        assert!(
+            dictate_e2e(
+                &mut session,
+                &cfg,
+                &stt_ready(),
+                &mut worker,
+                &done_rx,
+                &injected,
+                None
+            )
+            .is_none()
+        );
+        let line = reports.lock().unwrap()[0].to_string();
+        assert!(
+            line.contains("Taste→Mikro bereit —")
+                && line.contains("Ergebnis: Fehler (Audio-Aufnahme fehlgeschlagen: kein Mikrofon")
+        );
+        assert!(injected.borrow().is_empty(), "nichts erreicht den Worker");
+    }
+
+    /// AK-13: STT-Fehler → Ergebnis Fehler, Zeile vollständig, nichts eingefügt.
+    #[test]
+    fn e2e_stt_error_gives_an_error_line_without_insertion() {
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || {
+                let mut stt = RecordingStt::new(&received, "hallo");
+                stt.fail = true;
+                stt
+            }
+        });
+        let injected: Injected = Rc::default();
+        let trace = dictate_e2e(
+            &mut session,
+            &cfg,
+            &stt_ready(),
+            &mut worker,
+            &done_rx,
+            &injected,
+            None,
+        )
+        .unwrap();
+        assert!(injected.borrow().is_empty());
+        assert!(
+            trace
+                .to_string()
+                .ends_with("Ergebnis: Fehler (Spracherkennung fehlgeschlagen)")
+        );
+    }
+
+    /// AK-11/AK-7: Live-Diktat mit 3 Segmenten Ende zu Ende; auf `info` genau eine Zeile.
+    #[test]
+    fn e2e_live_dictation_with_three_segments_logs_one_info_line() {
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session = PttSession::new(
+            wav_factory_with(ramp_16k(16_000 * 3), opts(1, 16_000, 0), done_tx),
+            report,
+        );
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || {
+                let mut stt = RecordingStt::new(&received, "Dritter.");
+                stt.updates = [
+                    ("a", false),
+                    ("Erster.", true),
+                    ("b", false),
+                    ("Zweiter.", true),
+                ]
+                .iter()
+                .map(|(text, endpoint)| crate::stt::StreamUpdate {
+                    text: (*text).to_string(),
+                    endpoint: *endpoint,
+                })
+                .collect();
+                stt
+            }
+        });
+        let injected: Injected = Rc::default();
+        let models = stt_ready();
+        let log_report = crate::diagnostics::log_report();
+        let (trace, lines) = crate::logging::capture(|| {
+            let trace = dictate_e2e(
+                &mut session,
+                &cfg,
+                &models,
+                &mut worker,
+                &done_rx,
+                &injected,
+                None,
+            )
+            .unwrap();
+            log_report(trace.clone());
+            trace
+        });
+        assert_eq!(
+            injected.borrow().as_slice(),
+            ["Erster.", " Zweiter.", " Dritter."]
+        );
+        assert_eq!(trace.segments, Some(3));
+        let line = trace.to_string();
+        assert!(
+            line.contains("→erstes Segment ") && line.contains("Segmente 3"),
+            "{line}"
+        );
+        let on_info: Vec<_> = lines
+            .iter()
+            .filter(|(l, _)| *l <= log::Level::Info)
+            .collect();
+        assert_eq!(on_info.len(), 1, "{on_info:?}");
+    }
+
+    /// AK-15/-21: Debug-Mitschnitt Ende zu Ende; mic.wav = die gelieferten Blöcke (2 Kanäle, 44,1 kHz).
+    #[test]
+    fn e2e_debug_capture_mic_wav_matches_the_delivered_blocks() {
+        let dir = DebugDir::new("e2e");
+        let capture = debug_capture(&dir.0);
+        let tap = ModelTap::default();
+        let input = ramp_16k(16_000);
+        // Erwartete Blöcke: dieselbe Quelle separat vollständig einsammeln.
+        let (reference, reference_done) =
+            audio::WavSource::from_samples(input.clone(), opts(2, 44_100, 0));
+        let delivered = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let sink = Arc::clone(&delivered);
+        let _guard = Box::new(reference)
+            .open(Box::new(move |data, _| {
+                sink.lock().unwrap().extend_from_slice(data)
+            }))
+            .unwrap();
+        assert!(reference_done.wait(StdDuration::from_secs(10)));
+
+        let (report, _) = collecting_report();
+        let (done_tx, done_rx) = channel();
+        let mut session =
+            PttSession::new(wav_factory_with(input, opts(2, 44_100, 0), done_tx), report);
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let mut worker = e2e_worker(&cfg, {
+            let received = Rc::clone(&received);
+            move || RecordingStt::new(&received, "hallo")
+        });
+        let injected: Injected = Rc::default();
+        let trace = dictate_e2e(
+            &mut session,
+            &cfg,
+            &stt_ready(),
+            &mut worker,
+            &done_rx,
+            &injected,
+            Some((&capture, &tap)),
+        )
+        .unwrap();
+        let path = dir.0.join(format!("{}-mic.wav", trace.nr));
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(
+            (reader.spec().channels, reader.spec().sample_rate),
+            (2, 44_100)
+        );
+        let written: Vec<f32> = reader.samples::<f32>().map(Result::unwrap).collect();
+        let expected = delivered.lock().unwrap();
+        assert_eq!(
+            written.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(dir.0.join(format!("{}-model.wav", trace.nr)).is_file());
+    }
+
+    /// AK-8 (Pipeline-Seite): blockierendes Log-Backend → Ergebnis unverändert, kein Hängen.
+    #[test]
+    fn e2e_blocking_log_backend_does_not_stall_or_change_the_dictation() {
+        struct StuckSink(std::sync::mpsc::Receiver<()>);
+        impl crate::logging::LogSink for StuckSink {
+            fn write_line(&mut self, _: &str) -> std::io::Result<()> {
+                let _ = self.0.recv();
+                Ok(())
+            }
+        }
+        let (finished_tx, finished_rx) = channel();
+        std::thread::spawn(move || {
+            let (_keep_blocked, gate) = channel();
+            let logger = Arc::new(crate::logging::Logger::spawn(Box::new(StuckSink(gate)), 2));
+            // Puffer überfluten, damit der Kanal voll ist.
+            for i in 0..50 {
+                log::Log::log(
+                    &*logger,
+                    &log::Record::builder()
+                        .level(log::Level::Error)
+                        .target("talker::x")
+                        .args(format_args!("flut {i}"))
+                        .build(),
+                );
+            }
+            let sink_logger = Arc::clone(&logger);
+            let report: TraceReport = Arc::new(move |t| {
+                log::Log::log(
+                    &*sink_logger,
+                    &log::Record::builder()
+                        .level(log::Level::Info)
+                        .target("talker::messung")
+                        .args(format_args!("{t}"))
+                        .build(),
+                );
+            });
+            let (done_tx, done_rx) = channel();
+            let mut session = PttSession::new(
+                wav_factory_with(ramp_16k(16_000), opts(1, 16_000, 0), done_tx),
+                Arc::clone(&report),
+            );
+            let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+            let received = Rc::new(RefCell::new(Vec::new()));
+            let mut worker = e2e_worker(&cfg, {
+                let received = Rc::clone(&received);
+                move || RecordingStt::new(&received, "hallo")
+            });
+            let injected: Injected = Rc::default();
+            let trace = dictate_e2e(
+                &mut session,
+                &cfg,
+                &stt_ready(),
+                &mut worker,
+                &done_rx,
+                &injected,
+                None,
+            )
+            .unwrap();
+            report(trace.clone());
+            let _ = finished_tx.send((trace.result, injected.borrow().clone()));
+        });
+        let (result, injected) = finished_rx
+            .recv_timeout(StdDuration::from_secs(10))
+            .expect("Dictation hängt am blockierenden Log-Backend");
+        assert_eq!(result, DictationResult::Inserted);
+        assert_eq!(injected, ["hallo"]);
     }
 }

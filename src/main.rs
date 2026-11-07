@@ -9,10 +9,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use talker::diagnostics::{DictationResult, TraceReport};
 use talker::indicator::Indicator;
 use talker::{
-    cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline, stt,
-    tray, ui,
+    audio, cleanup, clipboard, config, hotkey, injection, models, overlay, permissions, pipeline,
+    stt, tray, ui,
 };
 
 /// Lädt das Cleanup-Modell; das zweite Element meldet den Fehlschlag
@@ -21,24 +22,17 @@ fn try_load_cleaner() -> (Option<cleanup::GemmaCleaner>, bool) {
     let t = Instant::now();
     match cleanup::GemmaCleaner::new(&cleanup::GemmaCleaner::default_model_path()) {
         Ok(c) => {
-            eprintln!(
-                "talker: Cleanup-Modell geladen in {:.1}s.",
+            log::info!(
+                "Cleanup-Modell geladen in {:.1}s.",
                 t.elapsed().as_secs_f32()
             );
             (Some(c), false)
         }
         Err(e) => {
-            eprintln!("talker: Cleanup nicht verfügbar — {e}");
+            log::warn!("Cleanup nicht verfügbar — {e}");
             (None, true)
         }
     }
-}
-
-/// Auftrag an den STT-Worker: eine fertige Utterance (Am Ende) oder ein
-/// Live-Strom (Satzweise/Wortgruppenweise), der bis zum Ende der Aufnahme läuft.
-enum SttJob {
-    Utterance(Vec<f32>, Option<String>),
-    Live(pipeline::LiveFeed),
 }
 
 /// STT + Cleanup + Injection laufen abseits des Main-Threads: der Dictation
@@ -49,7 +43,8 @@ fn spawn_stt_worker(
     indicator: Arc<Mutex<Indicator>>,
     egui_ctx: eframe::egui::Context,
     models_state: Arc<models::ModelsState>,
-) -> mpsc::Sender<SttJob> {
+    trace_report: TraceReport,
+) -> mpsc::Sender<pipeline::SttJob> {
     // Ergebnis der Pipeline ans Overlay melden (+ Repaint anstoßen).
     let report = move |f: &dyn Fn(&mut Indicator)| {
         if let Ok(mut ind) = indicator.lock() {
@@ -57,88 +52,59 @@ fn spawn_stt_worker(
         }
         egui_ctx.request_repaint();
     };
-    let (tx, rx) = mpsc::channel::<SttJob>();
+    let (tx, rx) = mpsc::channel::<pipeline::SttJob>();
     std::thread::spawn(move || {
         let snapshot = |cfg: &Arc<RwLock<config::Config>>| cfg.read().map(|c| c.clone()).ok();
 
         let Some(cfg) = snapshot(&config) else { return };
+        // Debug-Mitschnitt nur mit TALKER_DEBUG_WAV_DIR; der Tap nur dann (REQ-DIAG-022).
+        let debug = talker::diagnostics::DebugCapture::from_env();
+        let tap = debug.as_ref().map(|_| stt::ModelTap::default());
         let mut worker = pipeline::DictationWorker::new(
             &cfg,
             models_state,
             Box::new({
                 let config = Arc::clone(&config);
+                let tap = tap.clone();
                 move |dir: &std::path::Path| {
                     let pause = config
                         .read()
                         .map_or(config::DEFAULT_ENDPOINT_SILENCE_MS, |c| {
                             c.endpoint_silence_ms
                         });
-                    stt::NemotronTranscriber::with_endpoint_silence(dir, pause)
+                    stt::NemotronTranscriber::with_endpoint_silence(dir, pause).map(
+                        |t| match &tap {
+                            Some(tap) => t.with_model_tap(tap.clone()),
+                            None => t,
+                        },
+                    )
                 }
             }),
             Box::new(try_load_cleaner),
         );
         report(&|ind| ind.ready(Instant::now()));
 
-        // Fügt ein Ergebnis ein; Rückgabe: Hinweis für den Indicator, `None` = alles gut.
-        let deliver = |outcome: pipeline::Outcome| -> Option<&'static str> {
-            let t0 = Instant::now();
-            let result = match outcome {
-                pipeline::Outcome::Inject {
-                    text,
-                    cleanup_fell_back,
-                } => match injection::inject(
-                    &clipboard::NsPasteboard,
-                    &injection::CgKeySender,
-                    &text,
-                ) {
-                    // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
-                    Ok(()) if cleanup_fell_back => Some("Cleanup übersprungen — Rohtext eingefügt"),
-                    Ok(()) => None,
-                    Err(e) => {
-                        eprintln!("talker: Injection fehlgeschlagen: {e}");
-                        Some("Einfügen fehlgeschlagen")
-                    }
-                },
-                pipeline::Outcome::Rejected(hint) => Some(hint),
-            };
-            eprintln!(
-                "talker: Einfügen abgeschlossen nach {} ms ({})",
-                t0.elapsed().as_millis(),
-                result.unwrap_or("ok")
-            );
-            result
-        };
+        let mut inject =
+            |text: &str| injection::inject(&clipboard::NsPasteboard, &injection::CgKeySender, text);
 
         for job in rx {
             let Some(cfg) = snapshot(&config) else {
                 // Poisoned Config-Lock: nicht still verwerfen (CLAUDE.md).
-                eprintln!("talker: Config-Lock poisoned — Utterance verworfen.");
+                log::error!("Config-Lock poisoned — Utterance verworfen.");
+                let mut trace = job.into_trace();
+                trace.result = DictationResult::Error("Config-Lock poisoned".into());
+                trace_report(trace);
                 report(&|ind| ind.fail(Instant::now(), "Interner Fehler (Config)"));
                 continue;
             };
-            let hint = match job {
-                SttJob::Utterance(pcm, frontmost) => {
-                    deliver(worker.handle(&pcm, frontmost.as_deref(), &cfg))
-                }
-                SttJob::Live(feed) => {
-                    // Der Indicator zeigt erst nach dem Loslassen Ergebnis oder
-                    // Fehler: den ersten Hinweis merken, am Ende melden.
-                    let mut first_hint = None;
-                    pipeline::run_live(
-                        &mut worker,
-                        feed.blocks,
-                        feed.format,
-                        feed.frontmost.as_deref(),
-                        &cfg,
-                        &mut |outcome| {
-                            let hint = deliver(outcome);
-                            first_hint = first_hint.or(hint);
-                        },
-                    );
-                    first_hint
-                }
-            };
+            let (hint, trace) = pipeline::process_job(
+                &mut worker,
+                job,
+                &cfg,
+                &mut inject,
+                debug.as_ref().zip(tap.as_ref()),
+            );
+            trace_report(trace);
             match hint {
                 Some(hint) => report(&|ind| ind.fail(Instant::now(), hint)),
                 None => report(&|ind| ind.finish_ok(Instant::now())),
@@ -155,21 +121,24 @@ fn relaunch() {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            eprintln!("talker: Relaunch nicht möglich (current_exe): {e}");
+            log::error!("Relaunch nicht möglich (current_exe): {e}");
             return;
         }
     };
     match std::process::Command::new(&exe).spawn() {
         Ok(_) => {
-            eprintln!("talker: Accessibility erteilt — Neustart für den Event-Tap.");
+            log::info!("Accessibility erteilt — Neustart für den Event-Tap.");
             std::process::exit(0);
         }
-        Err(e) => eprintln!("talker: Relaunch fehlgeschlagen: {e}"),
+        Err(e) => log::error!("Relaunch fehlgeschlagen: {e}"),
     }
 }
 
 fn main() -> ExitCode {
-    let config = Arc::new(RwLock::new(config::Config::load()));
+    talker::logging::init(talker::logging::default_log_dir().as_deref());
+    let loaded = config::Config::load();
+    talker::logging::apply_config_level(loaded.log_level);
+    let config = Arc::new(RwLock::new(loaded));
 
     // Modell-Setup (Ticket-0028/0029): Zustand per Präsenz-Check (der volle
     // Checksum-Check läuft im Hintergrund nach), unfertige Downloads bei
@@ -253,16 +222,17 @@ fn main() -> ExitCode {
 
             if !accessibility {
                 tray.set_permission_warning();
-                eprintln!(
-                    "talker: Accessibility-Permission fehlt — Onboarding im Settings-Fenster."
-                );
+                log::warn!("Accessibility-Permission fehlt — Onboarding im Settings-Fenster.");
             }
 
+            // Eine Messzeile je Dictation, auf `info` (ADR-0011/-0012).
+            let trace_report: TraceReport = talker::diagnostics::log_report();
             let stt_tx = spawn_stt_worker(
                 Arc::clone(&config),
                 Arc::clone(&indicator),
                 egui_ctx.clone(),
                 Arc::clone(&models_state),
+                Arc::clone(&trace_report),
             );
 
             // Tap-Installation als wiederholbare Factory: scheitert sie (z.B.
@@ -282,17 +252,22 @@ fn main() -> ExitCode {
                     let ctx_release = egui_ctx.clone();
                     let stt_tx = stt_tx.clone();
                     let stt_press = stt_tx.clone();
+                    let trace_ready = Arc::clone(&trace_report);
+                    let trace_release = Arc::clone(&trace_report);
                     let models_press = Arc::clone(&models_state);
                     // Eine PttSession pro (erfolgreich) installiertem Tap — ersetzt
                     // die früheren thread_local!-Zellen (Ticket-0038). Ein Retry
                     // dieser Factory (permissions::should_relaunch_for_tap) findet
                     // nie eine laufende Aufnahme vor, weil der alte Tap dafür schon
                     // aktiv gewesen sein müsste.
-                    let session_press = Arc::new(Mutex::new(pipeline::PttSession::new()));
+                    let session_press = Arc::new(Mutex::new(pipeline::PttSession::new(
+                        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone()))),
+                        Arc::clone(&trace_report),
+                    )));
                     let session_release = Arc::clone(&session_press);
                     hotkey::install(
                         Arc::clone(&config),
-                        move || {
+                        move |pressed_at| {
                             let cfg = mic_config.read().map(|c| c.clone()).unwrap_or_default();
                             // Balken sofort zeigen; der Start-Thread schaltet auf
                             // Wellen um, sobald das Mikrofon wirklich läuft.
@@ -300,15 +275,25 @@ fn main() -> ExitCode {
                                 ind.starting(Instant::now());
                             }
                             ctx_press.request_repaint();
-                            let (ind_ready, ctx_ready, stt_ready) =
-                                (Arc::clone(&ind_press), ctx_press.clone(), stt_press.clone());
+                            let (ind_ready, ctx_ready, stt_ready, trace_ready) = (
+                                Arc::clone(&ind_press),
+                                ctx_press.clone(),
+                                stt_press.clone(),
+                                Arc::clone(&trace_ready),
+                            );
                             let on_ready = move |ready: pipeline::MicReady| {
                                 match ready {
                                     pipeline::MicReady::Recording { level, mode, live } => {
                                         if let Some(feed) = live
-                                            && stt_ready.send(SttJob::Live(feed)).is_err()
+                                            && let Err(mpsc::SendError(job)) =
+                                                stt_ready.send(pipeline::SttJob::Live { feed })
                                         {
-                                            eprintln!("talker: STT-Worker nicht verfügbar.");
+                                            log::error!("STT-Worker nicht verfügbar.");
+                                            let mut trace = job.into_trace();
+                                            trace.result = DictationResult::Error(
+                                                "STT-Worker nicht verfügbar".into(),
+                                            );
+                                            trace_ready(trace);
                                         }
                                         // Der Indicator besitzt den Aufnahme-Status
                                         // (inkl. aufgelöstem Modus); das Tray leitet
@@ -318,7 +303,7 @@ fn main() -> ExitCode {
                                         }
                                     }
                                     pipeline::MicReady::Failed(e) => {
-                                        eprintln!("talker: {e}");
+                                        log::warn!("{e}");
                                         if let Ok(mut ind) = ind_ready.lock() {
                                             ind.fail(Instant::now(), "Mikrofon nicht verfügbar");
                                         }
@@ -328,22 +313,22 @@ fn main() -> ExitCode {
                             };
                             let outcome = session_press
                                 .lock()
-                                .map(|mut s| s.press(&cfg, &models_press, on_ready))
+                                .map(|mut s| s.press(pressed_at, &cfg, &models_press, on_ready))
                                 .unwrap_or(pipeline::PressOutcome::Blocked(
                                     "Interner Fehler (Session)".into(),
                                 ));
                             if let pipeline::PressOutcome::Blocked(hint) = outcome {
-                                eprintln!("talker: PTT gesperrt — {hint}");
+                                log::debug!("PTT gesperrt — {hint}");
                                 if let Ok(mut ind) = ind_press.lock() {
                                     ind.fail(Instant::now(), hint);
                                 }
                                 ctx_press.request_repaint();
                             }
                         },
-                        move || {
+                        move |released_at| {
                             let outcome = session_release
                                 .lock()
-                                .map(|mut s| s.release())
+                                .map(|mut s| s.release(released_at))
                                 .unwrap_or(pipeline::ReleaseOutcome::NoRecording);
                             let update = |f: &dyn Fn(&mut Indicator)| {
                                 if let Ok(mut ind) = ind_release.lock() {
@@ -354,25 +339,42 @@ fn main() -> ExitCode {
                             match outcome {
                                 pipeline::ReleaseOutcome::NoRecording => {}
                                 pipeline::ReleaseOutcome::StartAborted => {
-                                    eprintln!("talker: Taste vor dem Mikrofon-Start losgelassen.");
+                                    log::debug!("Taste vor dem Mikrofon-Start losgelassen.");
                                     update(&|ind| ind.cancel());
                                 }
                                 pipeline::ReleaseOutcome::LiveEnded => {
                                     update(&|ind| ind.transcribing(Instant::now()));
                                 }
                                 pipeline::ReleaseOutcome::TooShort { ms } => {
-                                    eprintln!("talker: Utterance zu kurz ({ms} ms) — verworfen.");
+                                    log::debug!("Utterance zu kurz ({ms} ms) — verworfen.");
                                     update(&|ind| ind.cancel());
                                 }
-                                pipeline::ReleaseOutcome::Ready { pcm, frontmost, ms } => {
-                                    eprintln!(
-                                        "talker: Utterance aufgenommen: {ms} ms, {} Samples @16 kHz.",
+                                pipeline::ReleaseOutcome::Ready {
+                                    pcm,
+                                    frontmost,
+                                    ms,
+                                    captured,
+                                    trace,
+                                } => {
+                                    log::debug!(
+                                        "Utterance aufgenommen: {ms} ms, {} Samples @16 kHz.",
                                         pcm.len()
                                     );
-                                    if stt_tx.send(SttJob::Utterance(pcm, frontmost)).is_err() {
-                                        eprintln!(
-                                            "talker: STT-Worker nicht verfügbar — Utterance verworfen."
+                                    let job = pipeline::SttJob::Utterance {
+                                        pcm,
+                                        frontmost,
+                                        captured,
+                                        trace,
+                                    };
+                                    if let Err(mpsc::SendError(job)) = stt_tx.send(job) {
+                                        log::error!(
+                                            "STT-Worker nicht verfügbar — Utterance verworfen."
                                         );
+                                        let mut trace = job.into_trace();
+                                        trace.result = DictationResult::Error(
+                                            "STT-Worker nicht verfügbar".into(),
+                                        );
+                                        trace_release(trace);
                                         update(&|ind| {
                                             ind.fail(Instant::now(), "STT nicht verfügbar")
                                         });
@@ -381,7 +383,7 @@ fn main() -> ExitCode {
                                     }
                                 }
                                 pipeline::ReleaseOutcome::StopFailed(e) => {
-                                    eprintln!("talker: {e}");
+                                    log::error!("{e}");
                                     update(&|ind| {
                                         ind.fail(Instant::now(), "Aufnahme fehlgeschlagen")
                                     });
@@ -396,11 +398,11 @@ fn main() -> ExitCode {
                 Ok(tap) => {
                     // Tap muss so lange leben wie die App.
                     std::mem::forget(tap);
-                    eprintln!("talker: bereit — PTT-Taste halten = diktieren.");
+                    log::info!("bereit — PTT-Taste halten = diktieren.");
                 }
                 Err(e) => {
                     tray::with_instance(|t| t.set_permission_warning());
-                    eprintln!("talker: {e} — versuche alle 3 s erneut.");
+                    log::warn!("{e} — versuche alle 3 s erneut.");
                     use objc2_foundation::NSTimer;
                     // Soundness wie beim Overlay-Timer: geplant + gefeuert nur
                     // auf dem Main-RunLoop, der Block verlässt den Thread nie.
@@ -409,7 +411,7 @@ fn main() -> ExitCode {
                         if let Ok(tap) = install_tap() {
                             std::mem::forget(tap);
                             tray::with_instance(|t| t.clear_permission_warning());
-                            eprintln!("talker: Event-Tap nachträglich installiert — bereit.");
+                            log::info!("Event-Tap nachträglich installiert — bereit.");
                             unsafe { timer.as_ref().invalidate() };
                         } else if permissions::should_relaunch_for_tap(
                             accessibility,
@@ -445,7 +447,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("talker: UI-Start fehlgeschlagen: {e}");
+            log::error!("UI-Start fehlgeschlagen: {e}");
             ExitCode::FAILURE
         }
     }

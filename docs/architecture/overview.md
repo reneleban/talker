@@ -18,6 +18,7 @@ flowchart TB
   subgraph orchestration["Orchestrierung"]
     pipeline["pipeline<br/>DictationWorker · PttSession · resolve_mode"]
     indicator["indicator<br/>Phase-Zustandsmaschine"]
+    diagnostics["diagnostics<br/>DictationTrace · Messzeile · DebugCapture"]
   end
 
   subgraph presentation["Präsentation"]
@@ -27,7 +28,7 @@ flowchart TB
   end
 
   subgraph engines["Engines / IO"]
-    audio["audio<br/>Mikrofon-Capture"]
+    audio["audio<br/>AudioSource (Mic/WAV) · Recording · HostInstant"]
     stt["stt<br/>Transcriber-Trait"]
     cleanup["cleanup<br/>LlmCleaner-Trait"]
     injection["injection<br/>Text-Einfügen"]
@@ -42,13 +43,15 @@ flowchart TB
     config["config<br/>Config, CleanupMode-Nutzung"]
     vocab_match["vocab_match<br/>Kölner Phonetik"]
     error["error<br/>TalkerError"]
+    logging["logging<br/>log-Backend · Rotation · Detailgrad"]
   end
 
-  main --> pipeline & ui & tray & overlay & hotkey & permissions & models
+  main --> pipeline & ui & tray & overlay & hotkey & permissions & models & logging
 
-  pipeline --> cleanup & config & injection & models & stt & audio & vocab_match & error
+  pipeline --> cleanup & config & injection & models & stt & audio & vocab_match & error & diagnostics
+  diagnostics --> audio & config & cleanup
   indicator --> audio & cleanup
-  ui --> config & indicator & login_item & models & permissions & audio & hotkey & injection
+  ui --> config & indicator & login_item & models & permissions & audio & hotkey & injection & logging
   tray --> cleanup & indicator & error
   overlay --> config & indicator
 
@@ -61,6 +64,7 @@ flowchart TB
   hotkey --> config & error
   login_item --> error
   config --> cleanup & error
+  logging --> config
 
   classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
   class pipeline deep
@@ -70,7 +74,11 @@ flowchart TB
 `DictationWorker` (STT+Cleanup-Lifecycle) und `PttSession` (Press/Release)
 bündeln die Domänenlogik hinter einem kleinen Interface; `main.rs` bleibt
 Verdrahtung. `error` und `config` sind das Fundament — von fast jedem Modul
-direkt oder indirekt referenziert.
+direkt oder indirekt referenziert. `logging` ist das `log`-Backend (ADR-0011):
+alle Module loggen über die `log`-Makros, ohne `logging` zu kennen; nur
+`main.rs` (Init) und `ui` (Detailgrad, „Log im Finder zeigen") hängen direkt
+davon ab. `audio` kapselt die Herkunft der Blöcke hinter `AudioSource`
+(Mikrofon oder WAV, ADR-0012).
 
 ## Laufzeitsicht — eine Utterance (CONTEXT.md)
 
@@ -92,16 +100,16 @@ sequenceDiagram
     participant TargetApp as Ziel-App
 
     User->>Hotkey: PTT-Taste drücken
-    Hotkey->>Session: press()
-    Session->>Session: Setup-Gate prüfen (Modell ready?)
+    Hotkey->>Session: press(HostInstant::now())
+    Session->>Session: Diktat-Nr. vergeben, Setup-Gate prüfen (Modell ready?)
     Session->>Session: Frontmost-App erfassen (Kontext-Awareness)
-    Session->>Audio: start(mic_device)
+    Session->>Audio: start(MicSource) — Callback stempelt Blöcke (HostInstant)
     Session->>Indicator: start_recording(mode)
     Note over User,Audio: Nutzer spricht — Pegel live im Overlay
 
     User->>Hotkey: PTT-Taste loslassen
     Hotkey->>Session: release()
-    Session->>Audio: stop() → PCM
+    Session->>Audio: stop() → Captured (Rohpuffer, erster Block/Signal)
     Session->>Session: Mindestlänge prüfen (MIN_UTTERANCE_MS)
     Session->>Worker: (pcm, frontmost) über Channel
     Worker->>STT: transcribe(pcm) → Raw Transcript
@@ -114,11 +122,18 @@ sequenceDiagram
     Injection->>Injection: Clipboard sichern → schreiben → Cmd+V → wiederherstellen
     Injection->>TargetApp: Text erscheint im Fokus
     Worker->>Indicator: finish_ok() / fail(hint)
+    Worker->>Worker: Messzeile loggen (info), ggf. Debug-WAVs schreiben
 ```
 
 Tray und Overlay lesen `Indicator` unabhängig auf zwei Uhren (60-fps-Timer
 bzw. egui-Repaint) — kein Teil dieses Sequenzflusses, siehe Code-Kommentare
 in `tray.rs`/`overlay.rs` für die Idempotenz-Details.
+
+Jede Dictation endet mit genau einer Messzeile (REQ-DIAG-012). Endet sie
+vorzeitig (gesperrt, Mikrofon-Fehler, abgebrochen, zu kurz), loggt
+`PttSession` die Zeile, sonst der Worker. Logzeilen gehen über einen
+begrenzten Kanal an den Writer-Thread `talker-log`; kein Aufrufer wartet auf
+Datei-I/O (ADR-0011).
 
 ## Kontextsicht — talker gegenüber macOS und der Außenwelt
 
@@ -135,7 +150,7 @@ flowchart LR
     EventTap["CGEventTap<br/>(Accessibility-Permission)"]
     Pasteboard["NSPasteboard<br/>(Clipboard)"]
     StatusItem["NSStatusItem<br/>(Menüleiste)"]
-    FS["Lokales Dateisystem<br/>(config.toml, Modelle)"]
+    FS["Lokales Dateisystem<br/>(config.toml, Modelle,<br/>~/Library/Logs/talker/,<br/>opt-in TALKER_DEBUG_WAV_DIR)"]
     ModelHosts["GitHub / Hugging Face<br/>(Modell-Download, einmalig, mit Consent)"]
 
     User -- "PTT halten + sprechen" --> EventTap

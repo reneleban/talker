@@ -550,7 +550,7 @@ pub fn spawn_background_download(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         if let Err(e) = run_download(&state, id, &spec, fetcher.as_ref(), consent) {
-            eprintln!("talker: Modell-Download ({id:?}) fehlgeschlagen — {e}");
+            log::error!("Modell-Download ({id:?}) fehlgeschlagen — {e}");
         }
     })
 }
@@ -604,7 +604,7 @@ pub fn spawn_integrity_check(
             let status = check(&spec_for(id, &models_root));
             // Nur zurückstufen, wenn zwischenzeitlich nichts anderes lief.
             if status != ModelStatus::Ready && state.get(id) == ModelState::Ready {
-                eprintln!("talker: Modell {id:?} besteht den Checksum-Check nicht — {status:?}.");
+                log::error!("Modell {id:?} besteht den Checksum-Check nicht — {status:?}.");
                 state.set(id, ModelState::Corrupt);
             }
         }

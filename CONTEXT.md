@@ -17,3 +17,6 @@ Dieses Dokument ist **nur ein Glossar** — keine Implementierungsdetails, keine
 - **Injection** — das Einfügen des fertigen Textes in die aktuell fokussierte Ziel-App.
 - **Target App** — die App, die zum Zeitpunkt der Injection den Fokus hat und den Text empfängt.
 - **Batch-Modell** — Verhalten in v1: Text wird komplett erst nach dem Loslassen eingefügt (nicht live während des Sprechens). Live-Streaming ist ein späteres Feature.
+- **Messzeile** — eine Logzeile pro Dictation mit den Zeitpunkten vom Tastendruck bis zur Injection, Gerät und Ergebnis; enthält nie Transcript-Text.
+- **Debug-Mitschnitt** — opt-in per Umgebungsvariable `TALKER_DEBUG_WAV_DIR`: je Dictation eine WAV des Mikrofon-Rohsignals (`-mic`) und eine des Modell-Eingangs (`-model`), um Verluste dem Mikrofon oder dem Modell zuzuordnen.
+- **Audioquelle** — austauschbare Herkunft der Audio-Blöcke einer Utterance: Mikrofon (cpal) in der App, WAV-Datei in Tests und Messreihen.

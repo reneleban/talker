@@ -1,8 +1,10 @@
 # talker — Entwickler-Kommandos. `make help` zeigt alles.
 
 APP_DEST ?= $(HOME)/Applications
+N ?= 10
+LATENCY_OUT ?=
 
-.PHONY: help verify build test clippy bundle install cert stress run
+.PHONY: help verify build test clippy bundle install cert stress run latency-eval
 
 help: ## Diese Übersicht
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -42,6 +44,9 @@ stt-eval: ## STT-Qualitäts-Testreihe (EVAL-0002); Fixtures: scripts/gen_stt_fix
 
 pipeline-ab: ## Pipeline-Vergleich A/B/C (EVAL-0003): Nemotron vs +Gemma vs Gemma-Audio
 	cargo run --release --example pipeline_ab
+
+latency-eval: ## Latenz-Messreihe (Ticket 0038): N=10 Läufe/Fall (N=3 = Schnelllauf), LATENCY_OUT=<datei>; ohne Gemma nur Roh
+	N="$(N)" LATENCY_OUT="$(LATENCY_OUT)" cargo run --release --example latency_eval
 
 run: ## App aus dem Quellbaum starten
 	cargo run --release

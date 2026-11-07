@@ -99,8 +99,8 @@ pub fn request_microphone() {
         return;
     };
     let handler = block2::RcBlock::new(|granted: objc2::runtime::Bool| {
-        eprintln!(
-            "talker: Mikrofon-Permission {}.",
+        log::info!(
+            "Mikrofon-Permission {}.",
             if granted.as_bool() {
                 "erteilt"
             } else {
