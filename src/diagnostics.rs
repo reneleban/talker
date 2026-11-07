@@ -85,10 +85,7 @@ impl DebugCapture {
             .mode(0o700)
             .create(&self.dir);
         if let Err(e) = created {
-            log::warn!(
-                "Debug-Mitschnitt: {} nicht anlegbar ({e})",
-                self.dir.display()
-            );
+            log::warn!("Debug-Mitschnitt: {:?} nicht anlegbar ({e})", self.dir);
             return;
         }
         let float_spec = |channels: u16, sample_rate: u32| hound::WavSpec {
@@ -127,10 +124,7 @@ fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
         writer.finalize()
     })();
     if let Err(e) = result {
-        log::warn!(
-            "Debug-Mitschnitt: {} nicht schreibbar ({e})",
-            path.display()
-        );
+        log::warn!("Debug-Mitschnitt: {:?} nicht schreibbar ({e})", path);
     }
 }
 
@@ -734,6 +728,24 @@ mod tests {
                 .iter()
                 .any(|(l, text)| *l == log::Level::Warn && text.contains("Debug-Mitschnitt"))
         );
+    }
+
+    /// CR-19: Pfade aus der Umgebung stehen escaped im Log (kein Zeilenumbruch-Einschleusen).
+    #[test]
+    fn warnings_escape_env_path() {
+        let t = TestDir::new();
+        let blocker = t.0.join("datei");
+        std::fs::write(&blocker, "x").unwrap();
+        let evil = format!("{}/a\nb", blocker.display());
+        let capture = DebugCapture::from_var(Some(&evil)).unwrap();
+        let (_, lines) = crate::logging::capture(|| {
+            capture.write(5, &captured(vec![0.5], 1, 16_000), &[0.5]);
+        });
+        let warn = lines
+            .iter()
+            .find(|(_, text)| text.contains("nicht anlegbar"))
+            .unwrap();
+        assert!(!warn.1.contains('\n'));
     }
 
     /// Eine unbeschreibbare Datei (Verzeichnis statt Datei) → Warnung je Datei, kein Panic.
