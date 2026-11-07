@@ -5,9 +5,11 @@
 //! schreibt die Tabelle zusätzlich in eine Datei). Braucht das Nemotron-Modell; ohne Gemma laufen
 //! nur die Roh-Fälle, die Natürlich-Fälle stehen unter „Übersprungen“.
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
@@ -485,13 +487,34 @@ fn load_models(cfg: &EvalConfig) -> Result<Models, String> {
     })
 }
 
-/// Loader für den Worker: der Roh-Lauf verwirft den Cleaner, der nächste Natürlich-Lauf lädt neu.
-fn cleaner_loader<C: 'static>(
-    preloaded: Option<C>,
-    mut reload: impl FnMut() -> Option<C> + 'static,
-) -> CleanerLoader<C> {
-    let mut slot = preloaded;
-    Box::new(move || (slot.take().or_else(&mut reload), false))
+/// Geteiltes Handle auf die einmal geladene Cleaner-Instanz (REQ-DIAG-034): Der Worker verwirft
+/// beim Roh-Fall nur sein Handle, die Instanz bleibt für die Natürlich-Fälle erhalten.
+struct SharedCleaner<C>(Rc<RefCell<C>>);
+
+impl<C> Clone for SharedCleaner<C> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<C: LlmCleaner> LlmCleaner for SharedCleaner<C> {
+    fn clean(&mut self, raw: &str) -> talker::error::Result<String> {
+        self.0.borrow_mut().clean(raw)
+    }
+    fn set_mode(&mut self, mode: CleanupMode) {
+        self.0.borrow_mut().set_mode(mode);
+    }
+    fn set_vocab(&mut self, vocab: &[String]) {
+        self.0.borrow_mut().set_vocab(vocab);
+    }
+}
+
+/// Loader für den Worker: reicht Handles auf die beim Start geladene Instanz aus und lädt nie nach.
+fn shared_cleaner_loader<C: LlmCleaner + 'static>(
+    cleaner: Option<C>,
+) -> CleanerLoader<SharedCleaner<C>> {
+    let shared = cleaner.map(|c| SharedCleaner(Rc::new(RefCell::new(c))));
+    Box::new(move || (shared.clone(), false))
 }
 
 fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
@@ -535,7 +558,6 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
         },
         ..Config::default()
     };
-    let gemma_path = cfg.gemma_path.clone();
     let mut stt_slot = Some(stt);
     let mut worker = DictationWorker::new(
         &preload,
@@ -552,11 +574,7 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
                 .take()
                 .ok_or_else(|| TalkerError::Stt("Nemotron nur einmal geladen".into()))
         }),
-        cleaner_loader(cleaner, move || {
-            load_cleaner(&gemma_path)
-                .map_err(|e| eprintln!("latency-eval: {e}"))
-                .ok()
-        }),
+        shared_cleaner_loader(cleaner),
     );
     let mut progress = |label: &str| eprintln!("… {label}");
     let (combos, run_skipped) = measure(
@@ -609,7 +627,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use talker::stt::StreamUpdate;
 
@@ -903,9 +923,9 @@ mod tests {
         fake_worker_with(Box::new(|| (Some(BracketCleaner), false)))
     }
 
-    fn fake_worker_with(
-        load_cleaner: CleanerLoader<BracketCleaner>,
-    ) -> DictationWorker<EvalStt, BracketCleaner> {
+    fn fake_worker_with<C: LlmCleaner>(
+        load_cleaner: CleanerLoader<C>,
+    ) -> DictationWorker<EvalStt, C> {
         let cfg = Config::default();
         DictationWorker::new(
             &cfg,
@@ -964,15 +984,14 @@ mod tests {
         assert!(cleaned.cleanup.is_some());
     }
 
-    /// AK-22 (PERF-5): Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh den Cleaner verworfen hat.
+    /// AK-22 (PERF-5), REQ-DIAG-034 AK-2: Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh
+    /// das Cleaner-Handle verworfen hat.
     #[test]
     fn casual_cases_get_cleanup_after_raw_dropped_the_cleaner() {
         let fx = TempFixtures::new("natuerlich");
         fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
         let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
-        let mut worker = fake_worker_with(cleaner_loader(Some(BracketCleaner), || {
-            Some(BracketCleaner)
-        }));
+        let mut worker = fake_worker_with(shared_cleaner_loader(Some(BracketCleaner)));
         let (combos, skipped) = measure(
             &mut worker,
             &[fixture],
@@ -989,6 +1008,163 @@ mod tests {
                 combo.insert.label()
             );
         }
+    }
+
+    /// Zählt Instanzen eines Fake-Cleaners (REQ-DIAG-034: Gemma höchstens einmal, nie zwei zugleich).
+    #[derive(Default)]
+    struct Census {
+        constructed: Cell<u32>,
+        alive: Cell<u32>,
+        max_alive: Cell<u32>,
+        last_mode: Cell<Option<CleanupMode>>,
+    }
+
+    struct CountedCleaner(Rc<Census>);
+
+    impl CountedCleaner {
+        fn new(census: &Rc<Census>) -> Self {
+            census.constructed.set(census.constructed.get() + 1);
+            census.alive.set(census.alive.get() + 1);
+            census
+                .max_alive
+                .set(census.max_alive.get().max(census.alive.get()));
+            Self(Rc::clone(census))
+        }
+    }
+
+    impl Drop for CountedCleaner {
+        fn drop(&mut self) {
+            self.0.alive.set(self.0.alive.get() - 1);
+        }
+    }
+
+    impl LlmCleaner for CountedCleaner {
+        fn clean(&mut self, raw: &str) -> talker::error::Result<String> {
+            Ok(format!("{raw}!"))
+        }
+        fn set_mode(&mut self, mode: CleanupMode) {
+            self.0.last_mode.set(Some(mode));
+        }
+    }
+
+    /// Misst `fixtures` × beide Modi mit einem einmal erzeugten Cleaner; liefert Kombinationen und Zählung.
+    fn measure_with_one_cleaner(
+        fixtures: usize,
+        runs: usize,
+    ) -> (Vec<Combo>, Rc<Census>, TempFixtures) {
+        let fx = TempFixtures::new(&format!("einmal-{fixtures}-{runs}"));
+        let loaded: Vec<Fixture> = (0..fixtures)
+            .map(|i| {
+                let name = format!("clip{i}");
+                fx.wav(&name, &[1_000; 9_600], Some("hallo welt"));
+                load_fixture(&fx.0.join(format!("{name}.wav"))).unwrap()
+            })
+            .collect();
+        let census = Rc::new(Census::default());
+        let mut worker =
+            fake_worker_with(shared_cleaner_loader(Some(CountedCleaner::new(&census))));
+        let (combos, skipped) = measure(
+            &mut worker,
+            &loaded,
+            runs,
+            &cleanup_modes(true),
+            &mut |_: &str| {},
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        (combos, census, fx)
+    }
+
+    /// REQ-DIAG-034 AK-1/AK-2/AK-3 inkl. Grenzfälle (N=1, eine Fixture): nie zwei Instanzen zugleich,
+    /// jeder Natürlich-Fall mit Cleanup; `constructed` ist nur Nebenbedingung.
+    #[test]
+    fn cleaner_is_never_duplicated_across_fixtures_runs_and_modes() {
+        for (fixtures, runs) in [(2, 2), (2, 1), (1, 2)] {
+            let (combos, census, _fx) = measure_with_one_cleaner(fixtures, runs);
+            let ctx = format!("{fixtures} Fixtures × {runs} Läufe");
+            assert_eq!(census.max_alive.get(), 1, "nie zwei Instanzen: {ctx}");
+            assert_eq!(census.constructed.get(), 1, "kein Nachladen: {ctx}");
+            assert_eq!(combos.len(), 4, "{ctx}");
+            for combo in combos.iter().filter(|c| c.cleanup == CleanupMode::Casual) {
+                assert_eq!(
+                    combo.stats.cleanup.len(),
+                    fixtures * runs,
+                    "{ctx}: {}",
+                    combo.insert.label()
+                );
+            }
+            assert_eq!(
+                census.last_mode.get(),
+                Some(CleanupMode::Casual),
+                "set_mode kommt am geteilten Cleaner an: {ctx}"
+            );
+        }
+    }
+
+    /// REQ-DIAG-034 AK-3: Die Instanz überlebt die Roh-Fälle (kein Drop mitten in der Reihe) und wird
+    /// mit dem Worker freigegeben (kein Leck des Handles).
+    #[test]
+    fn cleaner_instance_survives_raw_cases_and_is_freed_with_the_worker() {
+        let fx = TempFixtures::new("lebensdauer");
+        fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        let census = Rc::new(Census::default());
+        let mut worker =
+            fake_worker_with(shared_cleaner_loader(Some(CountedCleaner::new(&census))));
+        measure(
+            &mut worker,
+            &[fixture],
+            2,
+            &cleanup_modes(true),
+            &mut |_: &str| {},
+        );
+        assert_eq!(
+            census.alive.get(),
+            1,
+            "Roh-Fall darf die Instanz nicht zerstören"
+        );
+        drop(worker);
+        assert_eq!(
+            census.alive.get(),
+            0,
+            "Instanz wird mit dem Worker freigegeben"
+        );
+        assert_eq!(census.constructed.get(), 1);
+    }
+
+    /// REQ-DIAG-034 Grenzfall nur Roh (Absicherung nach T1, kein Rot-Grün-Zyklus).
+    #[test]
+    fn raw_only_series_has_no_casual_case_and_no_cleaner() {
+        let fx = TempFixtures::new("nur-roh");
+        fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        let mut worker = fake_worker_with(shared_cleaner_loader(None::<BracketCleaner>));
+        let (combos, skipped) = measure(
+            &mut worker,
+            &[fixture],
+            2,
+            &cleanup_modes(false),
+            &mut |_: &str| {},
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(combos.len(), 2);
+        assert!(combos.iter().all(|c| c.cleanup == CleanupMode::Raw));
+    }
+
+    /// REQ-DIAG-028: Ohne Gemma liefert der Loader nichts und meldet keinen Fehlschlag-Cache.
+    #[test]
+    fn loader_without_gemma_yields_none_every_time() {
+        let mut loader = shared_cleaner_loader(None::<BracketCleaner>);
+        assert!(matches!(loader(), (None, false)));
+        assert!(matches!(loader(), (None, false)));
+    }
+
+    /// REQ-DIAG-028: Der Übersprungen-Grund nennt den Pfad genau einmal.
+    #[test]
+    fn missing_gemma_reason_names_the_path_exactly_once() {
+        let reason = load_cleaner(Path::new("/nicht/vorhanden/gemma.gguf"))
+            .err()
+            .expect("Gemma fehlt");
+        assert_eq!(reason.matches("/nicht/vorhanden/gemma.gguf").count(), 1);
     }
 
     /// Gesamtlauf mit Fakes: 4 Fälle, Aufwärmlauf verworfen, defekte Quelle übersprungen, WER gebildet.
