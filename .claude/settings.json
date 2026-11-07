@@ -22,7 +22,12 @@
       "Bash(git push -u origin chore/*)",
       "Bash(gh pr create --draft *)",
       "Bash(gh pr view*)",
-      "Bash(sh .claude/skills/spawn-worker/spawn.sh *)"
+      "Bash(sh .claude/skills/spawn-worker/spawn.sh *)",
+      "Bash(sh scripts/team/say.sh *)",
+      "Bash(herdr agent list)",
+      "Bash(herdr agent get *)",
+      "Bash(herdr agent read *)",
+      "Bash(herdr agent wait *)"
     ],
     "deny": [
       "Bash(git push * main*)",
@@ -30,7 +35,17 @@
       "Bash(git push -f*)",
       "Bash(*--no-verify*)",
       "Bash(gh pr merge*)",
-      "Bash(gh pr ready*)"
+      "Bash(gh pr ready*)",
+      "Bash(herdr pane *)",
+      "Bash(herdr tab *)",
+      "Bash(herdr workspace *)",
+      "Bash(herdr session *)",
+      "Bash(herdr server *)",
+      "Bash(herdr agent start*)",
+      "Bash(herdr agent prompt*)",
+      "Bash(herdr agent send-keys*)",
+      "Bash(herdr agent rename*)",
+      "Bash(herdr agent attach*)"
     ]
   }
 }
