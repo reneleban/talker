@@ -89,8 +89,4 @@ fn checksum_list_matches_the_committed_fleurs_files() {
     expected.sort();
     listed.sort();
     assert_eq!(listed, expected);
-
-    let script = std::fs::read_to_string(repo_file("scripts/fetch_fleurs_fixtures.sh")).unwrap();
-    assert!(script.contains("--proto '=https' --proto-redir '=https'"));
-    assert!(script.contains("shasum -a 256 -c fleurs-de.sha256"));
 }

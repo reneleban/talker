@@ -72,8 +72,8 @@ impl DebugCapture {
             dir: PathBuf::from(v),
         })?;
         log::warn!(
-            "Debug-Mitschnitt aktiv: {} — Audio wird gespeichert",
-            capture.dir.display()
+            "Debug-Mitschnitt aktiv: {:?} — Audio wird gespeichert",
+            capture.dir
         );
         Some(capture)
     }
@@ -113,7 +113,7 @@ impl DebugCapture {
 
 /// Legt die Datei nur neu an (0600, kein Symlink-Folgen); eine vorhandene wird nie überschrieben.
 fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
-    let result = (|| -> Result<(), WriteError> {
+    let result = (|| -> Result<(), hound::Error> {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -124,7 +124,7 @@ fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
         for &sample in samples {
             writer.write_sample(sample)?;
         }
-        Ok(writer.finalize()?)
+        writer.finalize()
     })();
     if let Err(e) = result {
         log::warn!(
@@ -132,14 +132,6 @@ fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
             path.display()
         );
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum WriteError {
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-    #[error("{0}")]
-    Wav(#[from] hound::Error),
 }
 
 const MISSING: &str = "—";
@@ -833,6 +825,19 @@ mod tests {
             .collect();
         assert_eq!(warns.len(), 1);
         assert!(warns[0].1.contains("/tmp/talker-x"));
+    }
+
+    /// SEC-7: ein Zeilenumbruch im Verzeichniswert fälscht keine zweite Logzeile.
+    #[test]
+    fn newline_in_the_directory_value_stays_on_one_log_line() {
+        let (_, lines) = crate::logging::capture(|| {
+            DebugCapture::from_var(Some("/tmp/x\n2026-01-01 ERROR fake"));
+        });
+        let warn = lines
+            .iter()
+            .find(|(_, text)| text.contains("Debug-Mitschnitt aktiv"))
+            .unwrap();
+        assert!(!warn.1.contains('\n'));
     }
 
     /// 0 Kanäle (unbrauchbare Quelle) → kein Panic im Mitschnitt.

@@ -69,6 +69,8 @@ pub struct DictationWorker<T: Transcriber, C: LlmCleaner> {
 pub struct JobTiming {
     pub stt: Option<Duration>,
     pub cleanup: Option<Duration>,
+    /// Die STT ist (auch nur einmal) gescheitert: Zeiten gelten nicht.
+    pub stt_failed: bool,
 }
 
 fn add_time(total: &mut Option<Duration>, d: Duration) {
@@ -110,6 +112,14 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
             (worker.cleaner, worker.cleaner_failed) = (worker.load_cleaner)();
         }
         worker
+    }
+
+    /// Verwirft die Zeiten, behält aber einen STT-Fehler.
+    fn reset_timing(&mut self) {
+        self.timing = JobTiming {
+            stt_failed: self.timing.stt_failed,
+            ..JobTiming::default()
+        };
     }
 
     /// Zeit in STT/Cleanup seit dem letzten Aufruf; setzt sie zurück.
@@ -238,6 +248,7 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
                 Outcome::NothingRecognized
             }
             Processed::SttFailed(e) => {
+                self.timing.stt_failed = true;
                 log::error!("STT fehlgeschlagen: {e}");
                 Outcome::Rejected("Spracherkennung fehlgeschlagen")
             }
@@ -332,7 +343,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         let update = match fed {
             Ok(update) => update,
             Err(e) => {
-                self.timing = JobTiming::default();
+                self.timing.stt_failed = true;
                 log::error!("Live-STT fehlgeschlagen: {e}");
                 return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
             }
@@ -360,7 +371,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         let rest = match finished {
             Ok(rest) => rest,
             Err(e) => {
-                self.timing = JobTiming::default();
+                self.timing.stt_failed = true;
                 log::error!("Live-STT fehlgeschlagen: {e}");
                 self.live = None;
                 return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
@@ -463,7 +474,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
     }
     // Der Block-Strom endet mit `Feed::End`: ab hier läuft nur noch der Rest nach dem
     // Loslassen. Die Zeit der Chunks davor gehört nicht in „Loslassen→Text (STT · Cleanup)“.
-    let _ = worker.take_timing();
+    worker.reset_timing();
     match assembler.flush() {
         Ok(rest) if !rest.is_empty() => {
             worker.live_chunk(&rest).into_iter().for_each(&mut *emit);
@@ -689,8 +700,8 @@ where
         None if delivery.inserted => DictationResult::Inserted,
         None => DictationResult::Discarded(NOTHING_RECOGNIZED_REASON),
     };
-    trace.stt = timing.stt;
-    trace.cleanup = timing.cleanup;
+    trace.stt = timing.stt.filter(|_| !timing.stt_failed);
+    trace.cleanup = timing.cleanup.filter(|_| !timing.stt_failed);
     trace.text_at = delivery.text_at;
     trace.injected = delivery.injected;
     trace.model_loads = worker.take_model_loads();
@@ -2534,6 +2545,43 @@ mod tests {
             (trace.stt, trace.cleanup, trace.text_at),
             (None, None, None)
         );
+    }
+
+    /// CR-15/AK-13: scheitert ein Live-Chunk, aber `finish` klappt, bleibt die Messzeile `—`.
+    #[test]
+    fn live_feed_error_keeps_timing_empty_even_if_finish_succeeds() {
+        struct FeedFailsOnce;
+        impl Transcriber for FeedFailsOnce {
+            fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl StreamingTranscriber for FeedFailsOnce {
+            fn begin(&mut self) {}
+            fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+            fn finish(&mut self) -> crate::error::Result<String> {
+                Ok("Rest.".into())
+            }
+        }
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_: &Path| Ok(FeedFailsOnce)),
+            Box::new(|| (None::<ScriptedCleaner>, false)),
+        );
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 1),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert!(matches!(trace.result, DictationResult::Error(_)));
+        assert_eq!((trace.stt, trace.cleanup), (None, None));
     }
 
     /// Verhalten unverändert: Cleanup-Fehler → Rohtext eingefügt, Ergebnis `eingefügt`, Hinweis bleibt.
