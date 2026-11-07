@@ -833,10 +833,8 @@ mod tests {
     }
 
     /// REQ-DIAG-010: kein `eprintln!` in `src/` außer dem stderr-Fallback in `logging.rs`.
-    /// Die Allowlist schrumpft mit T13/T14 auf null.
     #[test]
     fn no_eprintln_outside_the_stderr_fallback() {
-        const ALLOWLIST: [&str; 2] = ["pipeline.rs", "main.rs"];
         let mut files = Vec::new();
         rust_files(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
@@ -847,7 +845,7 @@ mod tests {
             .iter()
             .filter(|f| {
                 let name = f.file_name().unwrap().to_string_lossy();
-                name != "logging.rs" && !ALLOWLIST.contains(&name.as_ref())
+                name != "logging.rs"
             })
             .filter(|f| std::fs::read_to_string(f).unwrap().contains("eprintln!"))
             .collect();

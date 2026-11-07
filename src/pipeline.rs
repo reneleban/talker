@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cleanup::{self, CleanupMode, LlmCleaner};
 use crate::config::{Config, InsertMode};
@@ -17,6 +17,11 @@ use crate::injection;
 use crate::models::{ModelId, ModelsState};
 use crate::stt::{PhraseCommitter, StreamingTranscriber, Transcriber};
 use crate::{audio, vocab_match};
+
+/// Hinweis, wenn kein Text erkannt wurde.
+const NOTHING_RECOGNIZED: &str = "Nichts erkannt";
+/// Wie die Messzeile „kein Text" nennt.
+const NOTHING_RECOGNIZED_REASON: &str = "nichts erkannt";
 
 /// Ergebnis von [`DictationWorker::handle`] für eine Utterance.
 #[derive(Debug)]
@@ -50,6 +55,59 @@ pub struct DictationWorker<T: Transcriber, C: LlmCleaner> {
     models: Arc<ModelsState>,
     load_transcriber: TranscriberLoader<T>,
     load_cleaner: CleanerLoader<C>,
+    /// Zeit in STT und Cleanup seit dem letzten `take_timing` (Messzeile).
+    timing: JobTiming,
+    /// Modelle, die während einer Dictation geladen wurden (nicht die in `new`).
+    model_loads: Vec<(ModelId, Duration)>,
+}
+
+/// In STT und Cleanup verbrachte Zeit einer Dictation; `None` = nicht gelaufen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JobTiming {
+    pub stt: Option<Duration>,
+    pub cleanup: Option<Duration>,
+}
+
+fn add_time(total: &mut Option<Duration>, d: Duration) {
+    *total = Some(total.unwrap_or_default() + d);
+}
+
+/// Misst die Zeit in `transcribe` (Batch-Pfad) in einen Summanden.
+struct TimedTranscriber<'a> {
+    inner: &'a mut dyn Transcriber,
+    elapsed: &'a mut Option<Duration>,
+}
+
+impl Transcriber for TimedTranscriber<'_> {
+    fn transcribe(&mut self, pcm_16k_mono: &[f32]) -> crate::error::Result<String> {
+        let t0 = Instant::now();
+        let result = self.inner.transcribe(pcm_16k_mono);
+        add_time(self.elapsed, t0.elapsed());
+        result
+    }
+}
+
+/// Misst die Zeit in `clean` in einen Summanden.
+struct TimedCleaner<'a> {
+    inner: &'a mut dyn LlmCleaner,
+    elapsed: &'a mut Option<Duration>,
+}
+
+impl LlmCleaner for TimedCleaner<'_> {
+    fn clean(&mut self, raw: &str) -> crate::error::Result<String> {
+        let t0 = Instant::now();
+        let result = self.inner.clean(raw);
+        add_time(self.elapsed, t0.elapsed());
+        result
+    }
+
+    fn set_mode(&mut self, mode: CleanupMode) {
+        self.inner.set_mode(mode);
+    }
+
+    fn set_vocab(&mut self, vocab: &[String]) {
+        self.inner.set_vocab(vocab);
+    }
 }
 
 impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
@@ -72,22 +130,50 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
             models,
             load_transcriber,
             load_cleaner,
+            timing: JobTiming::default(),
+            model_loads: Vec::new(),
         };
         let t0 = Instant::now();
         match (worker.load_transcriber)(&worker.stt_dir) {
             Ok(t) => {
                 worker.transcriber = Some(t);
-                eprintln!(
-                    "talker: STT-Modell geladen in {:.1}s.",
-                    t0.elapsed().as_secs_f32()
-                );
+                log::info!("STT-Modell geladen in {:.1}s.", t0.elapsed().as_secs_f32());
             }
-            Err(e) => eprintln!("talker: STT nicht verfügbar — {e}"),
+            Err(e) => log::warn!("STT nicht verfügbar — {e}"),
         }
         if worker.llm_was_available && config_wants_llm(cfg) {
             (worker.cleaner, worker.cleaner_failed) = (worker.load_cleaner)();
         }
         worker
+    }
+
+    /// Zeit in STT/Cleanup seit dem letzten Aufruf; setzt sie zurück.
+    pub fn take_timing(&mut self) -> JobTiming {
+        std::mem::take(&mut self.timing)
+    }
+
+    /// Modell-Ladevorgänge seit dem letzten Aufruf (nur solche während einer Dictation).
+    pub fn take_model_loads(&mut self) -> Vec<(ModelId, Duration)> {
+        std::mem::take(&mut self.model_loads)
+    }
+
+    /// STT-Engine für `dir` laden und die Ladezeit für die Messzeile merken.
+    fn load_stt_timed(&mut self, dir: &Path) -> crate::error::Result<T> {
+        let t0 = Instant::now();
+        let loaded = (self.load_transcriber)(dir);
+        if loaded.is_ok() {
+            self.model_loads.push((ModelId::Stt, t0.elapsed()));
+        }
+        loaded
+    }
+
+    /// Cleanup-LLM laden und die Ladezeit für die Messzeile merken.
+    fn load_cleaner_timed(&mut self) {
+        let t0 = Instant::now();
+        (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+        if self.cleaner.is_some() {
+            self.model_loads.push((ModelId::Gemma, t0.elapsed()));
+        }
     }
 
     /// Live-Aktivierung (Ticket-0029): wird gemma nachträglich ready,
@@ -108,8 +194,8 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
         // Kontext-Awareness (Ticket-0026): Modus für DIESE Utterance auflösen.
         let resolved = resolve_mode(cfg, frontmost);
         if resolved != cfg.cleanup_mode {
-            eprintln!(
-                "talker: Kontext-Regel aktiv ({}) → Modus {}.",
+            log::debug!(
+                "Kontext-Regel aktiv ({}) → Modus {}.",
                 frontmost.unwrap_or("?"),
                 resolved.label()
             );
@@ -117,22 +203,22 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
 
         // STT-Pfad geändert → Modell neu laden (alter bleibt bei Fehler aktiv).
         if cfg.stt_model_dir != self.stt_dir || self.transcriber.is_none() {
-            match (self.load_transcriber)(&cfg.stt_model_dir) {
+            match self.load_stt_timed(&cfg.stt_model_dir) {
                 Ok(t) => {
                     self.transcriber = Some(t);
                     self.stt_dir = cfg.stt_model_dir.clone();
-                    eprintln!("talker: STT-Modell neu geladen: {}", self.stt_dir.display());
+                    log::info!("STT-Modell neu geladen: {}", self.stt_dir.display());
                 }
-                Err(e) => eprintln!("talker: STT-Neuladen fehlgeschlagen — {e}"),
+                Err(e) => log::warn!("STT-Neuladen fehlgeschlagen — {e}"),
             }
         }
         if self.transcriber.is_none() {
-            eprintln!("talker: kein STT-Modell — Utterance verworfen.");
+            log::warn!("kein STT-Modell — Utterance verworfen.");
             return Outcome::Rejected("Kein STT-Modell");
         }
 
         if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
-            (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+            self.load_cleaner_timed();
         }
         // Entladen/Fehler-Reset folgt dem GESAMT-Bedarf der Config, nicht
         // der einzelnen Utterance — sonst würde jede Raw-geregelte App das
@@ -164,7 +250,29 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
                 c.set_vocab(&cfg.vocabulary);
                 c as &mut dyn LlmCleaner
             });
-        match process_utterance(pcm, &cfg, transcriber, cleaner_ref, self.cleaner_failed) {
+        let mut timing = JobTiming::default();
+        let mut timed_stt = TimedTranscriber {
+            inner: transcriber,
+            elapsed: &mut timing.stt,
+        };
+        let mut timed_cleaner = cleaner_ref.map(|inner| TimedCleaner {
+            inner,
+            elapsed: &mut timing.cleanup,
+        });
+        let processed = process_utterance(
+            pcm,
+            &cfg,
+            &mut timed_stt,
+            timed_cleaner.as_mut().map(|c| c as &mut dyn LlmCleaner),
+            self.cleaner_failed,
+        );
+        if let Some(t) = timing.stt {
+            add_time(&mut self.timing.stt, t);
+        }
+        if let Some(t) = timing.cleanup {
+            add_time(&mut self.timing.cleanup, t);
+        }
+        match processed {
             Processed::Text {
                 text,
                 cleanup_fell_back,
@@ -173,11 +281,11 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
                 cleanup_fell_back,
             },
             Processed::Empty => {
-                eprintln!("talker: leerer Transcript — nichts einzufügen.");
-                Outcome::Rejected("Nichts erkannt")
+                log::debug!("leerer Transcript — nichts einzufügen.");
+                Outcome::Rejected(NOTHING_RECOGNIZED)
             }
             Processed::SttFailed(e) => {
-                eprintln!("talker: STT fehlgeschlagen: {e}");
+                log::error!("STT fehlgeschlagen: {e}");
                 Outcome::Rejected("Spracherkennung fehlgeschlagen")
             }
         }
@@ -229,12 +337,12 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         self.refresh_llm_availability();
         let resolved = cfg.insert_mode.resolve(resolve_mode(cfg, frontmost));
         if cfg.stt_model_dir != self.stt_dir || self.transcriber.is_none() {
-            match (self.load_transcriber)(&cfg.stt_model_dir) {
+            match self.load_stt_timed(&cfg.stt_model_dir) {
                 Ok(t) => {
                     self.transcriber = Some(t);
                     self.stt_dir = cfg.stt_model_dir.clone();
                 }
-                Err(e) => eprintln!("talker: STT-Neuladen fehlgeschlagen — {e}"),
+                Err(e) => log::warn!("STT-Neuladen fehlgeschlagen — {e}"),
             }
         }
         let Some(transcriber) = self.transcriber.as_mut() else {
@@ -242,7 +350,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         };
         transcriber.begin();
         if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
-            (self.cleaner, self.cleaner_failed) = (self.load_cleaner)();
+            self.load_cleaner_timed();
         }
         self.live = Some(LiveSession {
             insert_mode: cfg.insert_mode,
@@ -262,10 +370,13 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         else {
             return Vec::new();
         };
-        let update = match transcriber.feed(pcm) {
+        let t0 = Instant::now();
+        let fed = transcriber.feed(pcm);
+        add_time(&mut self.timing.stt, t0.elapsed());
+        let update = match fed {
             Ok(update) => update,
             Err(e) => {
-                eprintln!("talker: Live-STT fehlgeschlagen: {e}");
+                log::error!("Live-STT fehlgeschlagen: {e}");
                 return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
             }
         };
@@ -286,10 +397,13 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         else {
             return Vec::new();
         };
-        let rest = match transcriber.finish() {
+        let t0 = Instant::now();
+        let finished = transcriber.finish();
+        add_time(&mut self.timing.stt, t0.elapsed());
+        let rest = match finished {
             Ok(rest) => rest,
             Err(e) => {
-                eprintln!("talker: Live-STT fehlgeschlagen: {e}");
+                log::error!("Live-STT fehlgeschlagen: {e}");
                 self.live = None;
                 return vec![Outcome::Rejected("Spracherkennung fehlgeschlagen")];
             }
@@ -323,9 +437,21 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
                 c.set_vocab(&live.cfg.vocabulary);
                 c as &mut dyn LlmCleaner
             });
-        let (text, cleanup_fell_back) =
-            postprocess(raw.to_string(), &live.cfg, cleaner, self.cleaner_failed);
-        eprintln!("talker: Live-Segment: {text}");
+        let mut cleanup_time = None;
+        let mut timed_cleaner = cleaner.map(|inner| TimedCleaner {
+            inner,
+            elapsed: &mut cleanup_time,
+        });
+        let (text, cleanup_fell_back) = postprocess(
+            raw.to_string(),
+            &live.cfg,
+            timed_cleaner.as_mut().map(|c| c as &mut dyn LlmCleaner),
+            self.cleaner_failed,
+        );
+        if let Some(t) = cleanup_time {
+            add_time(&mut self.timing.cleanup, t);
+        }
+        log::debug!("Live-Segment: {} Zeichen", text.chars().count());
         let text = if live.emitted_any {
             format!(" {text}")
         } else {
@@ -356,7 +482,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
     let mut assembler = match audio::ChunkAssembler::new(channels, sample_rate) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("talker: Live-Audio unbrauchbar: {e}");
+            log::error!("Live-Audio unbrauchbar: {e}");
             emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
             return;
         }
@@ -366,7 +492,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
         match audio::to_mono_16k(&raw, channels, sample_rate) {
             Ok(pcm) => emit(worker.handle(&pcm, frontmost, cfg)),
             Err(e) => {
-                eprintln!("talker: Fallback-Aufnahme unbrauchbar: {e}");
+                log::error!("Fallback-Aufnahme unbrauchbar: {e}");
                 emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
             }
         }
@@ -380,7 +506,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
                 }
             }
             Err(e) => {
-                eprintln!("talker: Live-Audio fehlgeschlagen: {e}");
+                log::error!("Live-Audio fehlgeschlagen: {e}");
                 emit(Outcome::Rejected("Aufnahme fehlgeschlagen"));
             }
         }
@@ -390,7 +516,7 @@ pub fn run_live<T: Transcriber + StreamingTranscriber, C: LlmCleaner>(
             worker.live_chunk(&rest).into_iter().for_each(&mut *emit);
         }
         Ok(_) => {}
-        Err(e) => eprintln!("talker: Live-Audio-Rest verworfen: {e}"),
+        Err(e) => log::warn!("Live-Audio-Rest verworfen: {e}"),
     }
     worker.live_end().into_iter().for_each(&mut *emit);
 }
@@ -414,8 +540,9 @@ fn postprocess(
         Some(c) => {
             let t2 = Instant::now();
             let (cleaned, fell_back) = cleanup::clean_with_fallback(c, &raw);
-            eprintln!(
-                "talker: Cleaned Transcript (Cleanup {} ms): {cleaned}",
+            log::debug!(
+                "Cleaned Transcript: {} Zeichen (Cleanup {} ms)",
+                cleaned.chars().count(),
                 t2.elapsed().as_millis()
             );
             (cleaned, fell_back)
@@ -445,8 +572,9 @@ fn process_utterance(
         Ok(text) => text,
         Err(e) => return Processed::SttFailed(e),
     };
-    eprintln!(
-        "talker: Raw Transcript ({audio_ms} ms Audio, STT {} ms): {raw}",
+    log::debug!(
+        "Raw Transcript: {} Zeichen ({audio_ms} ms Audio, STT {} ms)",
+        raw.chars().count(),
         t1.elapsed().as_millis()
     );
     let (text, cleanup_fell_back) = postprocess(raw, cfg, cleaner, cleaner_failed);
@@ -471,6 +599,135 @@ pub fn resolve_mode(cfg: &Config, frontmost_bundle_id: Option<&str>) -> CleanupM
                 .map(|(_, mode)| *mode)
         })
         .unwrap_or(cfg.cleanup_mode)
+}
+
+/// Sammelt, was beim Einfügen der Ergebnisse eines Auftrags passiert.
+#[derive(Default)]
+struct Delivery {
+    /// Erster Hinweis für den Indicator.
+    hint: Option<&'static str>,
+    inserted: bool,
+    /// Erstes Ende ohne Erfolg (Fehler/verworfen); gewinnt gegen `inserted`.
+    ended: Option<DictationResult>,
+    /// Zeitpunkt des zuletzt fertigen Texts (vor dem Einfügen).
+    text_at: Option<audio::HostInstant>,
+    /// Dauer des zuletzt eingefügten Texts.
+    injected: Option<Duration>,
+    segments: u32,
+    first_segment_at: Option<audio::HostInstant>,
+}
+
+/// Ablehnungsgrund des Workers → Ergebnis der Messzeile.
+fn rejection_result(hint: &'static str) -> DictationResult {
+    if hint == NOTHING_RECOGNIZED {
+        DictationResult::Discarded(NOTHING_RECOGNIZED_REASON)
+    } else {
+        DictationResult::Error(hint.to_string())
+    }
+}
+
+/// Fügt ein Ergebnis ein und hält fest, was passiert ist.
+fn deliver(
+    outcome: Outcome,
+    inject: &mut dyn FnMut(&str) -> crate::error::Result<()>,
+    delivery: &mut Delivery,
+) {
+    let t0 = Instant::now();
+    let hint = match outcome {
+        Outcome::Inject {
+            text,
+            cleanup_fell_back,
+        } => {
+            let ready_at = audio::HostInstant::now();
+            delivery.text_at = Some(ready_at);
+            delivery.segments += 1;
+            delivery.first_segment_at.get_or_insert(ready_at);
+            match inject(&text) {
+                Ok(()) => {
+                    delivery.inserted = true;
+                    delivery.injected = Some(t0.elapsed());
+                    // Sichtbar statt still (Ticket-0009): Text ist drin, aber roh.
+                    cleanup_fell_back.then_some("Cleanup übersprungen — Rohtext eingefügt")
+                }
+                Err(e) => {
+                    log::error!("Injection fehlgeschlagen: {e}");
+                    delivery.ended.get_or_insert(DictationResult::Error(format!(
+                        "Einfügen fehlgeschlagen: {e}"
+                    )));
+                    Some("Einfügen fehlgeschlagen")
+                }
+            }
+        }
+        Outcome::Rejected(hint) => {
+            delivery.ended.get_or_insert(rejection_result(hint));
+            Some(hint)
+        }
+    };
+    log::debug!(
+        "Einfügen abgeschlossen nach {} ms ({})",
+        t0.elapsed().as_millis(),
+        hint.unwrap_or("ok")
+    );
+    delivery.hint = delivery.hint.or(hint);
+}
+
+/// Verarbeitet einen Auftrag vollständig: STT → Cleanup → Einfügen über `inject`.
+/// Liefert den ersten Hinweis für den Indicator und die fertige Messzeile.
+/// Bricht nie hart ab: jeder Fehlerpfad wird zu Hinweis + Ergebnis in der Trace.
+pub fn process_job<T, C>(
+    worker: &mut DictationWorker<T, C>,
+    job: SttJob,
+    cfg: &Config,
+    inject: &mut dyn FnMut(&str) -> crate::error::Result<()>,
+) -> (Option<&'static str>, DictationTrace)
+where
+    T: Transcriber + StreamingTranscriber,
+    C: LlmCleaner,
+{
+    let mut delivery = Delivery::default();
+    let mut trace = match job {
+        SttJob::Utterance {
+            pcm,
+            frontmost,
+            trace,
+            ..
+        } => {
+            let outcome = worker.handle(&pcm, frontmost.as_deref(), cfg);
+            deliver(outcome, inject, &mut delivery);
+            *trace
+        }
+        SttJob::Live { feed } => {
+            let mut trace = *feed.trace;
+            let mut blocks = FeedBlocks::new(feed.blocks);
+            run_live(
+                worker,
+                &mut blocks,
+                feed.format,
+                feed.frontmost.as_deref(),
+                cfg,
+                &mut |outcome| deliver(outcome, inject, &mut delivery),
+            );
+            if let Some(ended) = blocks.take_ended() {
+                trace.apply_capture(ended.released_at, &ended.captured);
+            }
+            trace.segments = Some(delivery.segments);
+            trace.first_segment_at = delivery.first_segment_at;
+            trace
+        }
+    };
+    let timing = worker.take_timing();
+    trace.result = match delivery.ended {
+        Some(ended) => ended,
+        None if delivery.inserted => DictationResult::Inserted,
+        None => DictationResult::Discarded(NOTHING_RECOGNIZED_REASON),
+    };
+    let failed = matches!(trace.result, DictationResult::Error(_));
+    trace.stt = timing.stt.filter(|_| !failed);
+    trace.cleanup = timing.cleanup.filter(|_| !failed);
+    trace.text_at = delivery.text_at;
+    trace.injected = delivery.injected;
+    trace.model_loads = worker.take_model_loads();
+    (delivery.hint, trace)
 }
 
 /// Zustand einer laufenden PTT-Utterance zwischen Tastendruck und Loslassen —
@@ -581,14 +838,61 @@ pub struct LiveFeed {
     pub format: (u16, u32),
 }
 
-/// Rohsamples der Blöcke eines Live-Kanals, bis `Feed::End` oder das Kanal-Ende kommt.
-pub fn feed_samples(
-    blocks: std::sync::mpsc::Receiver<audio::Feed>,
-) -> impl Iterator<Item = Vec<f32>> {
-    blocks.into_iter().map_while(|feed| match feed {
-        audio::Feed::Block(block) => Some(block.samples),
-        audio::Feed::End(_) => None,
-    })
+/// Rohsamples der Blöcke eines Live-Kanals, bis `Feed::End` oder das Kanal-Ende kommt;
+/// das `End` bleibt für die Messzeile erhalten.
+pub struct FeedBlocks {
+    rx: std::sync::mpsc::Receiver<audio::Feed>,
+    ended: Option<Box<audio::Ended>>,
+}
+
+impl FeedBlocks {
+    pub fn new(rx: std::sync::mpsc::Receiver<audio::Feed>) -> Self {
+        Self { rx, ended: None }
+    }
+
+    /// Das Ende der Aufnahme (Loslass-Zeitpunkt + Rohaufnahme), falls es kam.
+    pub fn take_ended(&mut self) -> Option<Box<audio::Ended>> {
+        self.ended.take()
+    }
+}
+
+impl Iterator for FeedBlocks {
+    type Item = Vec<f32>;
+
+    fn next(&mut self) -> Option<Vec<f32>> {
+        match self.rx.recv() {
+            Ok(audio::Feed::Block(block)) => Some(block.samples),
+            Ok(audio::Feed::End(ended)) => {
+                self.ended = Some(ended);
+                None
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+/// Auftrag an den STT-Worker: eine fertige Utterance (Am Ende) oder ein
+/// Live-Strom (Satzweise/Wortgruppenweise), der bis zum Ende der Aufnahme läuft.
+pub enum SttJob {
+    Utterance {
+        pcm: Vec<f32>,
+        frontmost: Option<String>,
+        captured: audio::Captured,
+        trace: Box<DictationTrace>,
+    },
+    Live {
+        feed: LiveFeed,
+    },
+}
+
+impl SttJob {
+    /// Die Messpunkte des Auftrags — z. B. um ihn mit Fehler zu melden, ohne ihn zu verarbeiten.
+    pub fn into_trace(self) -> DictationTrace {
+        match self {
+            SttJob::Utterance { trace, .. } => *trace,
+            SttJob::Live { feed } => *feed.trace,
+        }
+    }
 }
 
 /// Ergebnis von [`PttSession::release`].
@@ -2067,5 +2371,434 @@ mod tests {
             user_content,
             "Nutzer-Clipboard nach der Injection restauriert"
         );
+    }
+
+    // ---- process_job: Messpunkte, Ergebnis, Verhalten unverändert (T13) ----
+
+    use crate::diagnostics::DictationTrace;
+
+    fn job_info() -> audio::SourceInfo {
+        audio::SourceInfo {
+            format: audio::AudioFormat {
+                channels: 1,
+                sample_rate: 16_000,
+            },
+            device: "Test-Mikro".into(),
+        }
+    }
+
+    fn base_trace(cfg: &Config) -> Box<DictationTrace> {
+        Box::new(DictationTrace::new(
+            1,
+            audio::HostInstant::from_nanos(1_000),
+            cfg.insert_mode,
+            cfg.cleanup_mode,
+        ))
+    }
+
+    fn utterance_job(cfg: &Config) -> SttJob {
+        SttJob::Utterance {
+            pcm: vec![0.1; 16_000],
+            frontmost: None,
+            captured: audio::Captured {
+                raw: vec![0.1; 16_000],
+                info: job_info(),
+                marks: audio::StartMarks::default(),
+            },
+            trace: base_trace(cfg),
+        }
+    }
+
+    /// Live-Auftrag: `blocks` volle Chunks, dann `End` mit Loslass-Zeitpunkt 9 000 ns.
+    fn live_job(cfg: &Config, blocks: usize) -> SttJob {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..blocks {
+            tx.send(audio::Feed::Block(audio::Block {
+                samples: vec![0.0; crate::audio::CHUNK_16K_SAMPLES],
+                at: audio::HostInstant::from_nanos(2_000 + i as u64),
+            }))
+            .unwrap();
+        }
+        tx.send(audio::Feed::End(Box::new(audio::Ended {
+            released_at: audio::HostInstant::from_nanos(9_000),
+            captured: audio::Captured {
+                raw: vec![0.0; blocks * crate::audio::CHUNK_16K_SAMPLES],
+                info: job_info(),
+                marks: audio::StartMarks::default(),
+            },
+        })))
+        .unwrap();
+        SttJob::Live {
+            feed: LiveFeed {
+                trace: base_trace(cfg),
+                frontmost: None,
+                blocks: rx,
+                format: (1, 16_000),
+            },
+        }
+    }
+
+    type Injected = Rc<RefCell<Vec<String>>>;
+
+    fn recording_inject(
+        injected: &Injected,
+    ) -> impl FnMut(&str) -> crate::error::Result<()> + use<> {
+        let injected = Rc::clone(injected);
+        move |text: &str| {
+            injected.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    fn streaming_worker(
+        cfg: &Config,
+        rest: &'static str,
+        updates: &'static [(&'static str, bool)],
+    ) -> DictationWorker<FakeStreaming, ScriptedCleaner> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        live_worker(cfg, move || FakeStreaming::new(updates, rest), &log)
+    }
+
+    /// REQ-DIAG-012: Utterance-Pfad füllt Text-/STT-/Cleanup-/Einfüge-Messpunkte.
+    #[test]
+    fn utterance_job_fills_the_measurement_points() {
+        let cfg = Config::default();
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(hint, None);
+        assert_eq!(injected.borrow().as_slice(), ["[hallo]"]);
+        assert_eq!(trace.result, DictationResult::Inserted);
+        assert!(trace.text_at.is_some());
+        assert!(trace.stt.is_some() && trace.cleanup.is_some() && trace.injected.is_some());
+        assert_eq!(trace.nr, 1);
+        assert!(trace.model_loads.is_empty());
+    }
+
+    /// Modus Roh → kein Cleanup-Zeitwert (`—`).
+    #[test]
+    fn raw_mode_job_has_no_cleanup_time() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(injected.borrow().as_slice(), ["hallo"]);
+        assert!(trace.stt.is_some());
+        assert_eq!(trace.cleanup, None);
+        assert_eq!(trace.result, DictationResult::Inserted);
+    }
+
+    /// AK-13: leerer STT-Text → verworfen (nichts erkannt), nichts eingefügt.
+    #[test]
+    fn empty_transcript_job_is_discarded_as_nothing_recognized() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "", &[]);
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(hint, Some("Nichts erkannt"));
+        assert!(injected.borrow().is_empty());
+        assert_eq!(trace.result, DictationResult::Discarded("nichts erkannt"));
+        assert_eq!(trace.text_at, None);
+        assert_eq!(trace.injected, None);
+    }
+
+    /// AK-13: STT-Fehler → Ergebnis Fehler, keine Zeitwerte, nichts eingefügt.
+    #[test]
+    fn stt_error_job_is_reported_as_error() {
+        struct FailingStt;
+        impl Transcriber for FailingStt {
+            fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+        }
+        impl StreamingTranscriber for FailingStt {
+            fn begin(&mut self) {}
+            fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+            fn finish(&mut self) -> crate::error::Result<String> {
+                Err(TalkerError::Stt("kaputt".into()))
+            }
+        }
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_: &Path| Ok(FailingStt)),
+            Box::new(|| (None::<ScriptedCleaner>, false)),
+        );
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(hint, Some("Spracherkennung fehlgeschlagen"));
+        assert!(injected.borrow().is_empty());
+        assert!(matches!(trace.result, DictationResult::Error(_)));
+        assert_eq!(
+            (trace.stt, trace.cleanup, trace.text_at),
+            (None, None, None)
+        );
+    }
+
+    /// Verhalten unverändert: Cleanup-Fehler → Rohtext eingefügt, Ergebnis `eingefügt`, Hinweis bleibt.
+    #[test]
+    fn cleanup_error_job_still_injects_the_raw_text() {
+        struct FailingCleaner;
+        impl LlmCleaner for FailingCleaner {
+            fn clean(&mut self, _: &str) -> crate::error::Result<String> {
+                Err(TalkerError::Cleanup("Timeout".into()))
+            }
+        }
+        let cfg = Config::default();
+        let mut w = DictationWorker::new(
+            &cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(|_: &Path| Ok(FakeStreaming::new(&[], "hallo"))),
+            Box::new(|| (Some(FailingCleaner), false)),
+        );
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(hint, Some("Cleanup übersprungen — Rohtext eingefügt"));
+        assert_eq!(injected.borrow().as_slice(), ["hallo"]);
+        assert_eq!(trace.result, DictationResult::Inserted);
+    }
+
+    /// Einfügen schlägt fehl → Hinweis wie bisher, Ergebnis Fehler.
+    #[test]
+    fn injection_error_is_reported_with_the_old_hint() {
+        let cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "hallo", &[]);
+        let mut failing = |_: &str| Err(TalkerError::Keystroke("kein Zugriff".into()));
+        let (hint, trace) = process_job(&mut w, utterance_job(&cfg), &cfg, &mut failing);
+        assert_eq!(hint, Some("Einfügen fehlgeschlagen"));
+        assert!(matches!(&trace.result, DictationResult::Error(e) if e.contains("kein Zugriff")));
+    }
+
+    /// AK-11: Live mit 3 Segmenten → Segmentzahl, erstes Segment, Loslass-Daten aus `End`.
+    #[test]
+    fn live_job_counts_segments_and_takes_release_data_from_end() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(
+            &cfg,
+            "Dritter.",
+            &[
+                ("a", false),
+                ("Erster.", true),
+                ("b", false),
+                ("Zweiter.", true),
+            ],
+        );
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 4),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(hint, None);
+        assert_eq!(
+            injected.borrow().as_slice(),
+            ["Erster.", " Zweiter.", " Dritter."]
+        );
+        assert_eq!(trace.segments, Some(3));
+        assert!(trace.first_segment_at.is_some());
+        assert!(trace.first_segment_at <= trace.text_at);
+        assert_eq!(
+            trace.released_at,
+            Some(audio::HostInstant::from_nanos(9_000))
+        );
+        assert_eq!(
+            trace.recorded,
+            Some(std::time::Duration::from_millis(2_240))
+        );
+        assert!(trace.device.is_some() && trace.stt.is_some());
+        assert_eq!(trace.result, DictationResult::Inserted);
+    }
+
+    /// Live ohne Segment → 0 Segmente, kein erstes Segment, verworfen (nichts erkannt).
+    #[test]
+    fn live_job_without_segments_reports_zero() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "", &[]);
+        let injected: Injected = Rc::default();
+        let (hint, trace) = process_job(
+            &mut w,
+            live_job(&cfg, 2),
+            &cfg,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(
+            hint, None,
+            "Live ohne Text meldet dem Indicator weiter nichts"
+        );
+        assert!(injected.borrow().is_empty());
+        assert_eq!(trace.segments, Some(0));
+        assert_eq!(trace.first_segment_at, None);
+        assert_eq!(trace.result, DictationResult::Discarded("nichts erkannt"));
+    }
+
+    /// Live ohne `End` (Kanal einfach zu): Loslass-Punkte bleiben leer, kein Panic.
+    #[test]
+    fn live_job_without_end_keeps_release_points_empty() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let mut w = streaming_worker(&cfg, "Rest.", &[]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let job = SttJob::Live {
+            feed: LiveFeed {
+                trace: base_trace(&cfg),
+                frontmost: None,
+                blocks: rx,
+                format: (1, 16_000),
+            },
+        };
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(&mut w, job, &cfg, &mut recording_inject(&injected));
+        assert_eq!(trace.released_at, None);
+        assert_eq!(trace.recorded, None);
+    }
+
+    /// REQ-DIAG-016: Ladezeit nur bei Laden während der Dictation; `take` leert.
+    #[test]
+    fn model_loads_are_only_recorded_during_a_dictation_and_drain() {
+        let raw_cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let loads = Rc::new(RefCell::new(0usize));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = DictationWorker::new(
+            &raw_cfg,
+            models_with_gemma(ModelState::Ready),
+            fake_stt_loader(),
+            counted_cleaner_loader(&loads, &log),
+        );
+        assert!(
+            w.take_model_loads().is_empty(),
+            "Laden in new() zählt nicht"
+        );
+        // STT-Pfad ändert sich → Neuladen während der Dictation.
+        let moved = Config {
+            stt_model_dir: PathBuf::from("/anderes/modell"),
+            ..raw_cfg.clone()
+        };
+        w.handle(&[0.0; 1600], None, &moved);
+        let first = w.take_model_loads();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, ModelId::Stt);
+        assert!(w.take_model_loads().is_empty());
+        // Wechsel auf einen LLM-Modus → Cleaner wird erst jetzt geladen.
+        let business = Config {
+            cleanup_mode: CleanupMode::Business,
+            ..moved
+        };
+        w.handle(&[0.0; 1600], None, &business);
+        let second = w.take_model_loads();
+        assert_eq!(
+            second.iter().map(|l| l.0).collect::<Vec<_>>(),
+            [ModelId::Gemma]
+        );
+        // Nächste Dictation ohne Laden: leer.
+        w.handle(&[0.0; 1600], None, &business);
+        assert!(w.take_model_loads().is_empty());
+    }
+
+    /// Modell-Laden landet in der Trace des Auftrags.
+    #[test]
+    fn job_trace_lists_models_loaded_during_the_dictation() {
+        let raw_cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Raw);
+        let mut w = streaming_worker(&raw_cfg, "hallo", &[]);
+        let business = Config {
+            cleanup_mode: CleanupMode::Business,
+            ..raw_cfg
+        };
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&business),
+            &business,
+            &mut recording_inject(&injected),
+        );
+        assert_eq!(trace.model_loads.len(), 1);
+        assert_eq!(trace.model_loads[0].0, ModelId::Gemma);
+    }
+
+    /// AK-14 „darf nicht passieren": kein Transcript-Text in irgendeiner Logzeile, auch nicht auf Debug.
+    #[test]
+    fn no_log_line_contains_the_transcript_even_on_debug() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Business);
+        let mut live = streaming_worker(&cfg, "geheimrest", &[("x", false), ("geheimsatz", true)]);
+        let batch_cfg = live_cfg(InsertMode::AtEnd, CleanupMode::Business);
+        let mut batch = streaming_worker(&batch_cfg, "geheimbatch", &[]);
+        let injected: Injected = Rc::default();
+        let (_, lines) = crate::logging::capture(|| {
+            process_job(
+                &mut live,
+                live_job(&cfg, 2),
+                &cfg,
+                &mut recording_inject(&injected),
+            );
+            process_job(
+                &mut batch,
+                utterance_job(&batch_cfg),
+                &batch_cfg,
+                &mut recording_inject(&injected),
+            );
+        });
+        assert!(!lines.is_empty(), "auf Debug entstehen Detailzeilen");
+        assert!(injected.borrow().iter().any(|t| t.contains("geheim")));
+        assert!(
+            lines.iter().all(|(_, l)| !l.contains("geheim")),
+            "Transcript im Log: {lines:?}"
+        );
+    }
+
+    /// `FeedBlocks`: Samples bis `End`, das `End` bleibt abholbar.
+    #[test]
+    fn feed_blocks_stop_at_end_and_keep_it() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let block = |v: f32| {
+            audio::Feed::Block(audio::Block {
+                samples: vec![v],
+                at: audio::HostInstant::from_nanos(1),
+            })
+        };
+        tx.send(block(1.0)).unwrap();
+        tx.send(block(2.0)).unwrap();
+        tx.send(audio::Feed::End(Box::new(audio::Ended {
+            released_at: audio::HostInstant::from_nanos(5),
+            captured: audio::Captured {
+                raw: vec![1.0, 2.0],
+                info: job_info(),
+                marks: audio::StartMarks::default(),
+            },
+        })))
+        .unwrap();
+        tx.send(block(3.0)).unwrap();
+        let mut blocks = FeedBlocks::new(rx);
+        assert_eq!((&mut blocks).collect::<Vec<_>>(), [vec![1.0], vec![2.0]]);
+        let ended = blocks.take_ended().unwrap();
+        assert_eq!(ended.released_at, audio::HostInstant::from_nanos(5));
+        assert!(blocks.take_ended().is_none());
     }
 }
