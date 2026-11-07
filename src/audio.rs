@@ -3,7 +3,7 @@
 //! Aufnahme via cpal (CoreAudio); Downmix + Resampling als pure, unit-getestete
 //! Funktionen. Kein Platten-I/O, kein Upload.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -183,13 +183,65 @@ pub struct Ended {
     pub captured: Captured,
 }
 
+/// Messpunkte des Aufnahme-Starts (REQ-DIAG-014): erster Block und erstes Signal
+/// (erster Block mit einem Sample ≠ 0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartMarks {
+    pub first_block: Option<HostInstant>,
+    pub first_signal: Option<HostInstant>,
+}
+
+/// Set-once-Zellen für den Audio-Callback: lockfrei, 0 = nicht gesetzt (gespeichert wird ns + 1).
+#[derive(Default)]
+struct MarkCells {
+    first_block: AtomicU64,
+    first_signal: AtomicU64,
+}
+
+impl MarkCells {
+    fn record(&self, block: &[f32], at: HostInstant) {
+        let value = at.as_nanos().saturating_add(1);
+        let _ = self
+            .first_block
+            .compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed);
+        if self.first_signal.load(Ordering::Relaxed) == 0 && block.iter().any(|&s| s != 0.0) {
+            let _ =
+                self.first_signal
+                    .compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> StartMarks {
+        let read = |cell: &AtomicU64| match cell.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(HostInstant::from_nanos(v - 1)),
+        };
+        StartMarks {
+            first_block: read(&self.first_block),
+            first_signal: read(&self.first_signal),
+        }
+    }
+}
+
 /// Rohe Aufnahme einer Utterance im Geräteformat.
 pub struct Captured {
     pub raw: Vec<f32>,
     pub info: SourceInfo,
+    pub marks: StartMarks,
 }
 
 impl Captured {
+    /// Aufgenommene Dauer aus der Sample-Zahl (volle Frames / Rate).
+    pub fn recorded(&self) -> Duration {
+        let channels = u128::from(self.info.format.channels);
+        let rate = u128::from(self.info.format.sample_rate);
+        if channels == 0 || rate == 0 {
+            return Duration::ZERO;
+        }
+        let frames = self.raw.len() as u128 / channels;
+        Duration::from_nanos(u64::try_from(frames * 1_000_000_000 / rate).unwrap_or(u64::MAX))
+    }
+
     /// Rohsamples → 16 kHz mono.
     pub fn to_mono_16k(&self) -> Result<Vec<f32>> {
         to_mono_16k(
@@ -221,6 +273,7 @@ pub struct Recording {
     buf: Arc<Mutex<Vec<f32>>>,
     info: SourceInfo,
     level: LevelHandle,
+    marks: Arc<MarkCells>,
     live: Option<Sender<Feed>>,
 }
 
@@ -327,11 +380,14 @@ impl AudioSource for MicSource {
 pub fn start(source: Box<dyn AudioSource>, live: Option<Sender<Feed>>) -> Result<Recording> {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let level = LevelHandle::default();
+    let marks = Arc::new(MarkCells::default());
     let on_block: OnBlock = {
         let buf = Arc::clone(&buf);
         let level = level.clone();
+        let marks = Arc::clone(&marks);
         let live = live.clone();
         Box::new(move |data, at| {
+            marks.record(data, at);
             level.set(rms(data));
             if let Ok(mut b) = buf.lock() {
                 b.extend_from_slice(data);
@@ -350,6 +406,7 @@ pub fn start(source: Box<dyn AudioSource>, live: Option<Sender<Feed>>) -> Result
         buf,
         info: opened.info,
         level,
+        marks,
         live,
     })
 }
@@ -372,6 +429,7 @@ impl Recording {
             Captured {
                 raw,
                 info: self.info,
+                marks: self.marks.snapshot(),
             },
             self.live,
         )
@@ -820,5 +878,97 @@ mod tests {
         assert_eq!(rec.stop().raw.len(), 8);
         assert!(matches!(rx.recv(), Ok(Feed::Block(_))));
         assert!(rx.recv().is_err(), "stop() sendet kein End");
+    }
+
+    fn marks_of(blocks: Vec<Vec<f32>>) -> StartMarks {
+        start(ScriptedSource::new(blocks, 1, 16_000), None)
+            .unwrap()
+            .stop()
+            .marks
+    }
+
+    /// REQ-DIAG-014: führende Null-Blöcke → erster Block < erstes Signal.
+    #[test]
+    fn leading_zero_blocks_put_first_block_before_first_signal() {
+        let marks = marks_of(vec![vec![0.0; 4], vec![0.0; 4], vec![0.0, 0.5], vec![0.9]]);
+        assert_eq!(marks.first_block, Some(HostInstant::from_nanos(1_000)));
+        assert_eq!(marks.first_signal, Some(HostInstant::from_nanos(3_000)));
+        assert!(marks.first_block < marks.first_signal);
+    }
+
+    #[test]
+    fn only_zero_blocks_have_no_first_signal() {
+        let marks = marks_of(vec![vec![0.0; 4], vec![0.0; 4]]);
+        assert_eq!(marks.first_block, Some(HostInstant::from_nanos(1_000)));
+        assert_eq!(marks.first_signal, None);
+    }
+
+    #[test]
+    fn no_block_means_no_marks() {
+        let marks = marks_of(vec![]);
+        assert_eq!(marks.first_block, None);
+        assert_eq!(marks.first_signal, None);
+    }
+
+    /// Ein einziges Sample ≠ 0 im ersten Block genügt.
+    #[test]
+    fn single_nonzero_sample_in_the_first_block_is_the_first_signal() {
+        let marks = marks_of(vec![vec![0.0, 0.0, 1e-9, 0.0]]);
+        assert_eq!(marks.first_signal, marks.first_block);
+        assert!(marks.first_signal.is_some());
+    }
+
+    /// Marks sind set-once: spätere Blöcke ändern nichts; Zeitstempel 0 ist ein gültiger Wert.
+    #[test]
+    fn marks_are_set_once_and_accept_a_zero_timestamp() {
+        struct ZeroStart;
+        impl AudioSource for ZeroStart {
+            fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+                on_block(&[0.5], HostInstant::from_nanos(0));
+                on_block(&[0.7], HostInstant::from_nanos(50));
+                Ok(Opened {
+                    info: SourceInfo {
+                        format: AudioFormat {
+                            channels: 1,
+                            sample_rate: 16_000,
+                        },
+                        device: "x".into(),
+                    },
+                    stop: Box::new(()),
+                })
+            }
+        }
+        let marks = start(Box::new(ZeroStart), None).unwrap().stop().marks;
+        assert_eq!(marks.first_block, Some(HostInstant::from_nanos(0)));
+        assert_eq!(marks.first_signal, Some(HostInstant::from_nanos(0)));
+    }
+
+    /// `recorded()` kommt aus der Sample-Zahl (Frames / Rate), nicht aus der Uhr.
+    #[test]
+    fn recorded_duration_comes_from_the_sample_count() {
+        let captured = |raw: usize, channels: u16, sample_rate: u32| Captured {
+            raw: vec![0.0; raw],
+            info: SourceInfo {
+                format: AudioFormat {
+                    channels,
+                    sample_rate,
+                },
+                device: String::new(),
+            },
+            marks: StartMarks::default(),
+        };
+        assert_eq!(
+            captured(96_000, 2, 48_000).recorded(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            captured(44_100, 1, 44_100).recorded(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(captured(0, 1, 48_000).recorded(), Duration::ZERO);
+        assert_eq!(captured(10, 0, 48_000).recorded(), Duration::ZERO);
+        assert_eq!(captured(10, 1, 0).recorded(), Duration::ZERO);
+        // Unvollständiges letztes Frame zählt nicht.
+        assert_eq!(captured(3, 2, 1).recorded(), Duration::from_secs(1));
     }
 }
