@@ -9,6 +9,7 @@
 #   th_begin           Guard + Wegwerf-Repo ($TH_REPO, $TH_WT) + Teardown-Trap
 #   th_server          Server headless starten, Arbeitsbereich + Shell-Pane ($TH_PANE)
 #   inpane '<cmd>'     Befehl in $TH_PANE ausführen → $INPANE_RC, $INPANE_OUT (stdout+stderr)
+#   th_trust <agent>   Vertrauensdialog beantworten (Agent wird idle)
 #   th_h <args…>       herdr gegen die Test-Session
 #   ok / fail / assert_* / th_summary
 set -u
@@ -111,6 +112,12 @@ th_server() {
   # feste, prompt-lose Shell: keine Überraschungen durch Nutzer-rc-Dateien
   th_h pane run "$TH_PANE" 'exec env PS1= /bin/sh' >/dev/null
   inpane 'true'
+}
+
+# Ordner-Vertrauensdialog eines frischen Wegwerf-Verzeichnisses beantworten (Vorauswahl ist „No, exit").
+th_trust() { # <agent>
+  th_h agent send-keys "$1" down enter >/dev/null
+  th_h agent wait "$1" --until idle --timeout 30000 >/dev/null
 }
 
 inpane() { # <befehl> — läuft in der Shell-Pane von $TS; Ausgabe über Datei, Exit-Code über Marker
