@@ -10,6 +10,7 @@
 #   th_server          Server headless starten, Arbeitsbereich + Shell-Pane ($TH_PANE)
 #   inpane '<cmd>'     Befehl in $TH_PANE ausführen → $INPANE_RC, $INPANE_OUT (stdout+stderr)
 #   th_agent <name> [trust]  Claude-Haiku-Agent in neuer Pane ($TH_AGENT_PANE)
+#   th_autotrust / th_autotrust_stop  Vertrauensdialoge im Hintergrund beantworten
 #   th_trust <agent>   Vertrauensdialog beantworten (Agent wird idle)
 #   th_h <args…>       herdr gegen die Test-Session
 #   ok / fail / assert_* / th_summary
@@ -53,6 +54,7 @@ th_summary() {
 }
 
 th_teardown() {
+  th_autotrust_stop
   if [ -n "$TH_TMP" ] && th_session_exists; then
     herdr session stop "$TS" >/dev/null 2>&1 || true
     herdr session delete "$TS" >/dev/null 2>&1 || true
@@ -136,6 +138,24 @@ th_agent() { # <name> [trust]
     sleep 0.2
   done
   [ "${2:-}" != trust ] || th_trust "$1"
+}
+
+# Hintergrundschleife: beantwortet den Vertrauensdialog aller blockierten Agenten (Wegwerf-Ordner sind
+# unvertraut). Läuft, bis th_autotrust_stop/th_teardown sie beendet.
+th_autotrust() {
+  (
+    while :; do
+      for n in $(th_h agent list 2>/dev/null | jq -r '.result.agents[] | select(.agent_status == "blocked" and .name != null) | .name'); do
+        th_h agent send-keys "$n" down enter >/dev/null 2>&1
+      done
+      sleep 1
+    done
+  ) &
+  TH_AUTOTRUST_PID=$!
+}
+th_autotrust_stop() {
+  [ -z "${TH_AUTOTRUST_PID:-}" ] || kill "$TH_AUTOTRUST_PID" 2>/dev/null || true
+  TH_AUTOTRUST_PID=""
 }
 
 inpane() { # <befehl> — läuft in der Shell-Pane von $TS; Ausgabe über Datei, Exit-Code über Marker

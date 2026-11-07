@@ -1,35 +1,34 @@
 #!/bin/sh
-# Startet eine Rollen-Session als Kachel im Ghostty-Fenster des Orchestrators (ADR-0010).
+# Startet eine Rollen-Session als herdr-Pane (ADR-0013).
 #   spawn.sh init <ticket> <feature-branch>
 #   spawn.sh <rolle> <ticket> <feature-branch>
-#   spawn.sh close <session-name>
+#   spawn.sh close <name>
+# Exit: 0 bereit · 1 Abbruch vor jeder Änderung · 2 Aufruf · 3 nach einer Änderung nicht bereit/herdr-Fehler.
+# SPAWN_READY_TIMEOUT_MS (Default 60000): Bereit-Frist (Test-Naht).
 set -eu
 
-die() { echo "spawn: $*" >&2; exit 1; }
+die() { echo "spawn: $*" >&2; exit "${2:-1}"; }
 
 MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 WT_ROOT="$(dirname "$MAIN")/talker-wt"
 INTEGRATION="$WT_ROOT/integration"
+READY_MS=${SPAWN_READY_TIMEOUT_MS:-60000}
 
 require_clean() {
   [ -z "$(git -C "$1" status --porcelain)" ] || die "$1 hat uncommittete Änderungen"
 }
 
-session_pid() {
-  pgrep -f "^claude --agent [a-z-]+ --name $1( |\$)" | head -n 1
-}
-
 if [ "${1:-}" = close ]; then
-  [ $# -eq 2 ] || die "Aufruf: spawn.sh close <session-name>"
-  PID=$(session_pid "$2") || true
-  [ -n "$PID" ] || die "keine laufende Session $2"
-  # SIGTERM beendet Claude sauber; die Kachel schließt sich mit dem Prozess.
-  kill -TERM "$PID"
+  [ $# -eq 2 ] || die "Aufruf: spawn.sh close <name>" 2
+  [ "$2" != orchestrator ] || die "orchestrator wird nicht über spawn.sh beendet"
+  PANE=$(herdr agent get "$2" 2>/dev/null | jq -r '.result.agent.pane_id // empty') || true
+  [ -n "$PANE" ] || die "keine laufende Session $2"
+  herdr pane close "$PANE" >/dev/null
   echo "$2 beendet"
   exit 0
 fi
 
-[ $# -eq 3 ] || die "Aufruf: spawn.sh init|<rolle> <ticket> <feature-branch> | spawn.sh close <session-name>"
+[ $# -eq 3 ] || die "Aufruf: spawn.sh init|<rolle> <ticket> <feature-branch> | spawn.sh close <name>" 2
 ROLE=$1; TICKET=$2; FEATURE=$3
 case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
 
@@ -47,7 +46,6 @@ if [ "$ROLE" = init ]; then
   exit 0
 fi
 
-[ -n "${CLAUDE_PID:-}" ] || die "CLAUDE_PID fehlt: spawn.sh muss aus der Orchestrator-Session laufen"
 [ -d "$INTEGRATION" ] || die "Integrations-Worktree fehlt, zuerst: spawn.sh init $TICKET $FEATURE"
 
 case $ROLE in
@@ -65,58 +63,39 @@ case $ROLE in
 esac
 
 NAME="$ROLE-$TICKET"
-[ -z "$(session_pid "$NAME")" ] || die "Session $NAME läuft bereits"
-# Geerbte CLAUDE*-Variablen entfernen: sonst gilt die neue Session als Kind der
-# startenden (kein eigener Posteingang, CLAUDE_EFFORT überschreibt das Frontmatter).
-# Kein Start-Prompt: Den schickt Claude in einer Kachel ohne Fokus nicht ab.
-# Der Auftrag kommt per SendMessage.
-CMD="/bin/zsh -lc 'unset -m \"CLAUDE*\"; exec claude --agent $ROLE --name $NAME --permission-mode auto --add-dir \"$MAIN\"'"
-# Erste Rolle rechts neben den Orchestrator, weitere unter die letzte
-# Rollen-Kachel; danach gleichmäßig verteilen.
-osascript - "$CLAUDE_PID" "$DIR" "$CMD" "$NAME" >/dev/null <<'OSA' || die "Ghostty-Kachel konnte nicht geöffnet werden"
-on run argv
-  set orchPid to (item 1 of argv) as integer
-  tell application "Ghostty"
-    set orch to missing value
-    set orchTab to missing value
-    repeat with w in windows
-      repeat with t in tabs of w
-        repeat with term in terminals of t
-          if (pid of term) is orchPid then
-            set orch to term
-            set orchTab to t
-          end if
-        end repeat
-      end repeat
-    end repeat
-    if orch is missing value then error "Orchestrator-Terminal nicht gefunden"
-    set anchor to orch
-    set dir to right
-    repeat with term in terminals of orchTab
-      if (id of term) is not (id of orch) then
-        set anchor to term
-        set dir to down
-      end if
-    end repeat
-    set cfg to new surface configuration
-    set initial working directory of cfg to item 2 of argv
-    set command of cfg to item 3 of argv
-    set wait after command of cfg to false
-    set newTerm to split anchor direction dir with configuration cfg
-    set name override of newTerm to item 4 of argv
-    perform action "equalize_splits" on orch
-  end tell
-end run
-OSA
 
-# Warten, bis die Session ihren Posteingang geöffnet hat (max. 60 s).
-i=0
-while [ $i -lt 60 ]; do
-  PID=$(session_pid "$NAME") || true
-  if [ -n "$PID" ] && { [ -S "/tmp/cc-socks/$PID.sock" ] || [ -S "/tmp/cc-socks-$(id -u)/$PID.sock" ]; }; then
-    echo "$NAME bereit in $DIR"
-    exit 0
+# Pane-ID immer aus der JSON-Antwort von herdr, nie geraten.
+new_pane() {
+  if [ "$ROLE" = product-owner ]; then
+    # Neben den Orchestrator: seine Pane ist die des Aufrufers.
+    herdr pane split "$HERDR_PANE_ID" --direction right --cwd "$DIR" --no-focus | jq -r '.result.pane.pane_id'
+  else
+    TAB=$(herdr tab list --workspace "$HERDR_WORKSPACE_ID" | jq -r --arg l "$TICKET" '[.result.tabs[] | select(.label == $l)] | .[0].tab_id // empty')
+    if [ -z "$TAB" ]; then
+      herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label "$TICKET" --cwd "$DIR" --no-focus | jq -r '.result.root_pane.pane_id'
+    fi
   fi
-  sleep 1; i=$((i + 1))
+}
+
+PANE=$(new_pane) || die "Pane konnte nicht angelegt werden (Worktree $DIR besteht bereits)" 3
+[ -n "$PANE" ] || die "keine Pane angelegt (Worktree $DIR besteht bereits)" 3
+
+# Eine frische Pane ist kurz „busy", bis ihre Shell den Prompt zeigt: agent_pane_busy wiederholen.
+START=$(date +%s)
+i=0
+while :; do
+  err=$(herdr agent start "$NAME" --kind claude --pane "$PANE" --timeout "$READY_MS" -- \
+    --agent "$ROLE" --name "$NAME" --permission-mode auto --add-dir "$MAIN" 2>&1 >/dev/null) && break
+  case $err in
+    *agent_pane_busy*) i=$((i + 1)); [ $i -le 75 ] || die "Pane $PANE wird nicht frei (Worktree $DIR und Pane bestehen)" 3; sleep 0.2 ;;
+    *agent_not_ready*)
+      REST=$((READY_MS - ($(date +%s) - START) * 1000))
+      [ $REST -gt 0 ] || REST=1
+      herdr agent wait "$NAME" --until idle --until done --timeout "$REST" >/dev/null 2>&1 \
+        || die "$NAME nach $((READY_MS / 1000)) s nicht bereit (Pane $PANE bleibt offen, Worktree $DIR besteht)" 3
+      break ;;
+    *) die "herdr agent start: $err (Pane $PANE und Worktree $DIR bestehen)" 3 ;;
+  esac
 done
-die "$NAME nach 60 s nicht erreichbar"
+
+echo "$NAME bereit in $DIR"
