@@ -155,4 +155,19 @@ has "AK-24 ADR-0010 verweist auf ADR-0013" docs/adr/adr-0010-agenten-team.md 'AD
 HITS=$(grep -rE "$FORBIDDEN" .claude scripts 2>/dev/null || true)
 assert_eq "AK-16 grep in .claude und scripts ist leer" "" "$HITS"
 
+# --- Out of Scope (darf nicht passieren) ---
+SCRIPTS=".claude/skills/spawn-worker/spawn.sh scripts/team/dev.sh scripts/team/say.sh .claude/hooks/say-only.sh"
+# shellcheck disable=SC2086
+assert_eq "OoS kein herdr worktree / herdr-core / hc in den Team-Skripten" "" \
+  "$(grep -nE 'herdr worktree|herdr-core|Herdr\.app|(^|[^a-z_-])hc( |$)' $SCRIPTS || true)"
+# shellcheck disable=SC2086
+assert_eq "OoS kein Ghostty-/AppleScript-Fallback in den Team-Skripten" "" "$(grep -niE 'ghostty|applescript|osascript' $SCRIPTS || true)"
+assert_eq "OoS team.env enthält nur TEAM_MAX_SESSIONS (kein TEAM_MERGE)" "TEAM_MAX_SESSIONS" \
+  "$(grep -E '^[A-Z_]+=' team.env | cut -d= -f1 | sort -u | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "OoS kein automatischer Merge nach main in den Team-Skripten" "" \
+  "$(grep -nE 'git (merge|push)|gh pr merge' $SCRIPTS || true)"
+assert_eq "OoS Regel 'Merge nach main nur nach OK des Menschen' bleibt in AGENTS.md" 1 \
+  "$(grep -c 'Merge nach `main` nur nach manuellem Review/OK des Menschen' AGENTS.md)"
+assert_eq "OoS kein gemeinsames CARGO_TARGET_DIR in den Team-Skripten" "" "$(grep -n 'CARGO_TARGET_DIR' $SCRIPTS || true)"
+
 th_summary
