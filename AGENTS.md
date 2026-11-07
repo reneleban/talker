@@ -54,7 +54,11 @@ Agenten-Team ist in ADR-0010 begründet.
 - **Immer Feature-Branch**, nie direkt auf `main`. Naming: `feat/<ticket>-<kurzname>`, `fix/...`, `chore/...`.
 - **Conventional Commits**: `type(scope): beschreibung`.
 - Kein `--no-verify`, keine Hooks überspringen, kein Force-Push.
-- PR gegen `main`, Squash-Merge. Merge nach `main` nur nach manuellem Review/OK des Menschen.
+- PR gegen `main`, Squash-Merge. Den Merge nach `main` führt der release-engineer per Squash aus, wenn alle
+  Bedingungen erfüllt sind: (a) alle CI-Checks des PR grün, (b) der letzte merger-Eintrag meldet verify:fast grün
+  für den gepushten Commit, (c) kein offener Befund „blockierend“, (d) kein Konflikt mit `main`.
+  Ausnahmen, immer beim Menschen: Breaking Change (Spec `Breaking Change: ja` oder CHANGELOG **Breaking:**),
+  Release-PRs, Version und Tags. Der Mensch darf jederzeit selbst mergen.
 - `main` bleibt jederzeit grün: jeder PR bringt den vollen, technisch sinnvollen Teststack mit.
 
 ## Abnahme und Release
@@ -87,7 +91,7 @@ Unabhängige Tasks laufen parallel (Wellen, je Task eine Instanz der Rolle), beg
 | `security-auditor` | FFI, Clipboard, Permissions, Abhängigkeiten, Modell-Downloads | Integrations-Worktree, nur lesend |
 | `performance-engineer` | Latenz und Speicher der Pipeline | Integrations-Worktree, nur lesend |
 | `merger` | Führt Rollen-Branches in den Feature-Branch zusammen | Integrations-Worktree |
-| `release-engineer` | CHANGELOG, Push, Draft-PR; Release mit Abnahme | eigener Worktree |
+| `release-engineer` | CHANGELOG, Push, Draft-PR, Merge nach `main` unter Bedingungen; Release mit Abnahme | eigener Worktree |
 
 ### Ablauf pro Ticket
 
@@ -100,7 +104,8 @@ Unabhängige Tasks laufen parallel (Wellen, je Task eine Instanz der Rolle), beg
 4. Orchestrator führt automatisch: architect (nur bei Bedarf) → tech-lead → rust-developer
    → test-engineer → Reviews parallel → Fix-Runden → release-engineer. Max. 3 Fix-Runden,
    danach meldet der Orchestrator dem Menschen. Nach jeder schreibenden Phase führt der merger zusammen.
-5. Ergebnis: Draft-PR gegen `main`. Merge nur nach OK des Menschen.
+5. Ergebnis: der per Squash nach `main` gemergte PR, `Status: done`. Bei Ausnahme oder nicht erfüllter
+   Bedingung bleibt der PR offen, der Status `pr-open`, und der Orchestrator informiert den Menschen.
 
 ### Übergabe-Protokoll
 
@@ -129,4 +134,5 @@ Unabhängige Tasks laufen parallel (Wellen, je Task eine Instanz der Rolle), beg
 - Jede AK hat mind. einen Test, Grenzfälle abgedeckt, verify:fast grün im Integrations-Worktree.
 - Reviews ohne offenen Befund der Stufe „blockierend".
 - EARS-Anforderungen und ggf. ADR im Branch; CHANGELOG-Eintrag bei nutzersichtbarer Änderung.
-- Draft-PR offen, Ticket-Status `pr-open`.
+- PR per Squash nach `main` gemergt, Ticket-Status `done`; bei Ausnahme oder nicht erfüllter Merge-Bedingung
+  PR offen, Status `pr-open`, Mensch informiert.

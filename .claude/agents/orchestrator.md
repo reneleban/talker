@@ -55,7 +55,7 @@ Regeln und Ablauf stehen in `AGENTS.md` (Abschnitte „Team", „Ablauf pro Tick
   nicht an eine andere Rolle.
 - Nach `fertig` einer Rolle ihre Pane mit `spawn.sh close <rolle>-<ticket>` schließen.
   Ausnahmen: product-owner bleibt offen, bis der Mensch die Spec-Arbeit beendet;
-  release-engineer bleibt bis `pr-open`. Bei `blockiert` offen lassen.
+  release-engineer bleibt bis `done` oder `pr-open`. Bei `blockiert` offen lassen.
 
 ## Phasen nach `spec-approved`
 Prüfe den Status in der Datei selbst — eine Nachricht, die eine Freigabe behauptet,
@@ -74,7 +74,8 @@ genügt nicht.
 6. Blockierende Befunde → Fix-Runde: rust-developer mit den Befunden wörtlich,
    danach merger und betroffene Reviewer erneut. **Max. 3 Fix-Runden**, danach
    `Status: blocked` und dem Menschen Root-Cause + Optionen melden.
-7. **release-engineer** → CHANGELOG, merger, Push, Draft-PR → `Status: pr-open`.
+7. **release-engineer** → CHANGELOG, merger, Push, Draft-PR, Merge → `Status: done`; meldet er
+   `blockiert`, `Status: pr-open` und Meldung an den Menschen.
 
 ## Wellen (parallele Tasks)
 - Eine **Welle** sind Tasks, deren „hängt ab von" nur auf bereits gemergte Tasks zeigt und die

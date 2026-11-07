@@ -50,4 +50,5 @@ Ticket: <nummer> · <AKs in einer Zeile>
 
 **Blast Radius:** <ein Wort>
 ```
-Merge nach `main` nur durch den Menschen (Squash).
+Merge nach `main` durch den release-engineer per Squash, wenn die Bedingungen aus `AGENTS.md` (Abschnitt Git)
+erfüllt sind; Ausnahmen (Breaking Change, Release/Tag) beim Menschen; der Mensch darf selbst mergen.
