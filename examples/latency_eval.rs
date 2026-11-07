@@ -1089,6 +1089,62 @@ mod tests {
         );
     }
 
+    /// REQ-DIAG-034 Grenzfall N=1 (Absicherung nach T1, kein Rot-Grün-Zyklus).
+    #[test]
+    fn single_run_per_case_still_constructs_the_cleaner_once() {
+        let (combos, census, _fx) = measure_with_one_cleaner(2, 1);
+        assert_eq!(census.constructed.get(), 1);
+        assert_eq!(census.max_alive.get(), 1);
+        for combo in combos.iter().filter(|c| c.cleanup == CleanupMode::Casual) {
+            assert_eq!(combo.stats.cleanup.len(), 2, "{}", combo.insert.label());
+        }
+    }
+
+    /// REQ-DIAG-034 Grenzfall eine Fixture (Absicherung nach T1, kein Rot-Grün-Zyklus).
+    #[test]
+    fn single_fixture_needs_no_load_after_the_start() {
+        let (combos, census, _fx) = measure_with_one_cleaner(1, 2);
+        assert_eq!(census.constructed.get(), 1);
+        assert_eq!(census.max_alive.get(), 1);
+        assert_eq!(combos.len(), 4);
+    }
+
+    /// REQ-DIAG-034 Grenzfall nur Roh (Absicherung nach T1, kein Rot-Grün-Zyklus).
+    #[test]
+    fn raw_only_series_has_no_casual_case_and_no_cleaner() {
+        let fx = TempFixtures::new("nur-roh");
+        fx.wav("clip", &[1_000; 9_600], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        let mut worker = fake_worker_with(shared_cleaner_loader(None::<BracketCleaner>));
+        let (combos, skipped) = measure(
+            &mut worker,
+            &[fixture],
+            2,
+            &cleanup_modes(false),
+            &mut |_: &str| {},
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(combos.len(), 2);
+        assert!(combos.iter().all(|c| c.cleanup == CleanupMode::Raw));
+    }
+
+    /// REQ-DIAG-028: Ohne Gemma liefert der Loader nichts und meldet keinen Fehlschlag-Cache.
+    #[test]
+    fn loader_without_gemma_yields_none_every_time() {
+        let mut loader = shared_cleaner_loader(None::<BracketCleaner>);
+        assert!(matches!(loader(), (None, false)));
+        assert!(matches!(loader(), (None, false)));
+    }
+
+    /// REQ-DIAG-028: Der Übersprungen-Grund nennt den Pfad genau einmal.
+    #[test]
+    fn missing_gemma_reason_names_the_path_exactly_once() {
+        let reason = load_cleaner(Path::new("/nicht/vorhanden/gemma.gguf"))
+            .err()
+            .expect("Gemma fehlt");
+        assert_eq!(reason.matches("/nicht/vorhanden/gemma.gguf").count(), 1);
+    }
+
     /// Gesamtlauf mit Fakes: 4 Fälle, Aufwärmlauf verworfen, defekte Quelle übersprungen, WER gebildet.
     #[test]
     fn measure_covers_all_four_cases_and_skips_unreadable_sources() {
