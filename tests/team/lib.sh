@@ -9,6 +9,7 @@
 #   th_begin           Guard + Wegwerf-Repo ($TH_REPO, $TH_WT) + Teardown-Trap
 #   th_server          Server headless starten, Arbeitsbereich + Shell-Pane ($TH_PANE)
 #   inpane '<cmd>'     Befehl in $TH_PANE ausführen → $INPANE_RC, $INPANE_OUT (stdout+stderr)
+#   th_agent <name> [trust]  Claude-Haiku-Agent in neuer Pane ($TH_AGENT_PANE)
 #   th_trust <agent>   Vertrauensdialog beantworten (Agent wird idle)
 #   th_h <args…>       herdr gegen die Test-Session
 #   ok / fail / assert_* / th_summary
@@ -118,6 +119,23 @@ th_server() {
 th_trust() { # <agent>
   th_h agent send-keys "$1" down enter >/dev/null
   th_h agent wait "$1" --until idle --timeout 30000 >/dev/null
+}
+
+# Neue Pane neben $TH_PANE und darin ein Claude-Haiku-Agent <name>. Mit `trust` wird der
+# Vertrauensdialog beantwortet (Agent idle), sonst bleibt er `blocked`. Claude merkt sich das Vertrauen je
+# Verzeichnis: ein weiterer Agent im selben Ordner bekommt den Dialog nicht mehr → $TH_AGENT_CWD (frischer Ordner).
+# Setzt $TH_AGENT_PANE.
+th_agent() { # <name> [trust]
+  TH_AGENT_PANE=$(th_h pane split "$TH_PANE" --direction right --cwd "${TH_AGENT_CWD:-$TH_REPO}" --no-focus | jq -r '.result.pane.pane_id')
+  i=0
+  while :; do
+    err=$(th_h agent start "$1" --kind claude --pane "$TH_AGENT_PANE" --timeout 60000 -- --model haiku --name "$1" 2>&1 >/dev/null) && break
+    case $err in *agent_not_ready*) break ;; *agent_pane_busy*) ;; *) echo "harness: agent start $1: $err" >&2; return 1 ;; esac
+    i=$((i + 1))
+    [ $i -le 75 ] || { echo "harness: Pane für $1 wird nicht frei" >&2; return 1; }
+    sleep 0.2
+  done
+  [ "${2:-}" != trust ] || th_trust "$1"
 }
 
 inpane() { # <befehl> — läuft in der Shell-Pane von $TS; Ausgabe über Datei, Exit-Code über Marker
