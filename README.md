@@ -164,7 +164,10 @@ Nicht erreichte Messpunkte stehen als `—`. Satzweise/Wortgruppenweise ergänze
 **Debug-Mitschnitt.** Nur mit gesetzter Umgebungsvariable `TALKER_DEBUG_WAV_DIR` schreibt talker
 je Diktat `<nr>-mic.wav` (rohe Mikrofon-Blöcke im Geräteformat) und `<nr>-model.wav` (exakt der
 Modell-Eingang, 16 kHz mono) in dieses Verzeichnis (32-bit Float; `<nr>` = Nummer der Messzeile).
-Das Verzeichnis wird angelegt, Dateien werden nie gelöscht. Ohne die Variable schreibt talker
+Das Verzeichnis wird (0700) angelegt, die Dateien sind nur für dich lesbar (0600). Dateien werden nie
+gelöscht oder überschrieben: Gibt es `<nr>-mic.wav` schon (die Nummer beginnt bei jedem App-Start
+wieder bei 1), warnt talker im Log und schreibt sie nicht — nimm ein leeres Verzeichnis je Sitzung.
+Bei aktivem Mitschnitt steht beim Start eine Warnung im Log. Ohne die Variable schreibt talker
 kein Audio auf die Platte. Beim Bundle über `open` starten:
 
 ```sh

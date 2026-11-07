@@ -3,6 +3,7 @@
 //! absichtlich kein Textfeld — Transcript-Text kann nie in die Zeile gelangen.
 
 use std::fmt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,14 +68,23 @@ impl DebugCapture {
 
     /// Leer oder nicht gesetzt → kein Mitschnitt.
     pub(crate) fn from_var(value: Option<&str>) -> Option<Self> {
-        value.filter(|v| !v.trim().is_empty()).map(|v| Self {
+        let capture = value.filter(|v| !v.trim().is_empty()).map(|v| Self {
             dir: PathBuf::from(v),
-        })
+        })?;
+        log::warn!(
+            "Debug-Mitschnitt aktiv: {} — Audio wird gespeichert",
+            capture.dir.display()
+        );
+        Some(capture)
     }
 
     /// Schreibt beide Dateien; Fehler werden zur Warnung, nie zum Panic oder Abbruch.
     pub fn write(&self, nr: u64, mic: &Captured, model: &[f32]) {
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+        let created = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir);
+        if let Err(e) = created {
             log::warn!(
                 "Debug-Mitschnitt: {} nicht anlegbar ({e})",
                 self.dir.display()
@@ -101,13 +111,20 @@ impl DebugCapture {
     }
 }
 
+/// Legt die Datei nur neu an (0600, kein Symlink-Folgen); eine vorhandene wird nie überschrieben.
 fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
-    let result = (|| -> Result<(), hound::Error> {
-        let mut writer = hound::WavWriter::create(path, spec)?;
+    let result = (|| -> Result<(), WriteError> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let mut writer = hound::WavWriter::new(std::io::BufWriter::new(file), spec)?;
         for &sample in samples {
             writer.write_sample(sample)?;
         }
-        writer.finalize()
+        Ok(writer.finalize()?)
     })();
     if let Err(e) = result {
         log::warn!(
@@ -115,6 +132,14 @@ fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
             path.display()
         );
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WriteError {
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Wav(#[from] hound::Error),
 }
 
 const MISSING: &str = "—";
@@ -733,6 +758,81 @@ mod tests {
         });
         assert!(lines.iter().any(|(l, _)| *l == log::Level::Warn));
         assert!(t.0.join("6-model.wav").is_file());
+    }
+
+    /// SEC-1/CR-2: eine vorhandene Mitschnitt-Datei wird nie überschrieben; Warnung, die andere
+    /// Datei entsteht trotzdem.
+    #[test]
+    fn existing_capture_file_is_not_overwritten() {
+        let t = TestDir::new();
+        std::fs::write(t.0.join("8-mic.wav"), "alt").unwrap();
+        let (_, lines) = crate::logging::capture(|| {
+            DebugCapture::from_var(t.0.to_str()).unwrap().write(
+                8,
+                &captured(vec![0.5], 1, 16_000),
+                &[0.5],
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(t.0.join("8-mic.wav")).unwrap(),
+            "alt"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(l, text)| *l == log::Level::Warn && text.contains("8-mic.wav"))
+        );
+        assert_eq!(read_wav(&t.0.join("8-model.wav")).1, vec![0.5]);
+    }
+
+    /// SEC-1: ein vorab angelegter Symlink wird nicht verfolgt, das Ziel bleibt unverändert.
+    #[test]
+    fn symlink_in_the_directory_is_not_followed() {
+        let t = TestDir::new();
+        let victim = t.0.join("opfer.txt");
+        std::fs::write(&victim, "wichtig").unwrap();
+        let dir = t.0.join("mitschnitt");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("9-mic.wav")).unwrap();
+        DebugCapture::from_var(dir.to_str()).unwrap().write(
+            9,
+            &captured(vec![0.5], 1, 16_000),
+            &[0.5],
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "wichtig");
+    }
+
+    /// SEC-1: Mitschnitt-Dateien nur für den Nutzer lesbar (0600), neues Verzeichnis 0700.
+    #[test]
+    fn capture_files_and_new_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TestDir::new();
+        let dir = t.0.join("a/b");
+        DebugCapture::from_var(dir.to_str()).unwrap().write(
+            10,
+            &captured(vec![0.5], 1, 16_000),
+            &[0.5],
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.join("10-mic.wav")), 0o600);
+        assert_eq!(mode(&dir.join("10-model.wav")), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&t.0.join("a")), 0o700);
+    }
+
+    /// SEC-4: ein aktiver Mitschnitt wird beim Start einmal als Warnung gemeldet.
+    #[test]
+    fn active_capture_is_announced_with_its_directory() {
+        let (_, lines) = crate::logging::capture(|| {
+            assert!(DebugCapture::from_var(Some("/tmp/talker-x")).is_some());
+            assert!(DebugCapture::from_var(None).is_none());
+        });
+        let warns: Vec<_> = lines
+            .iter()
+            .filter(|(l, text)| *l == log::Level::Warn && text.contains("Debug-Mitschnitt aktiv"))
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].1.contains("/tmp/talker-x"));
     }
 
     /// 0 Kanäle (unbrauchbare Quelle) → kein Panic im Mitschnitt.
