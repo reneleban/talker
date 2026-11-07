@@ -130,4 +130,29 @@ has "AK-8 spawn-worker: TEAM_MAX_SESSIONS" "$f" 'TEAM_MAX_SESSIONS'
 has "AK-17 spawn-worker: Auftrag über say.sh" "$f" 'scripts/team/say\.sh'
 for c in 0 1 2 3; do has "AK-5 spawn-worker: Exit-Code $c" "$f" "\\*\\*$c\\*\\*"; done
 
+# --- T18: AGENTS.md, CLAUDE.md, ADR-0010/0013 (AK-16, 17, 18, 19, 22, 24) ---
+for f in AGENTS.md CLAUDE.md; do
+  lacks "AK-17 $f: keine Ghostty-Kacheln" "$f" 'Ghostty|Kachel'
+  lacks "AK-16 $f: kein SendMessage/ListAgents" "$f" 'SendMessage|ListAgents'
+  has "AK-17 $f: herdr-Panes" "$f" 'herdr-Pane'
+  has "AK-17 $f: Session talker" "$f" 'Session `talker`'
+  has "AK-17 $f: Einstieg make dev" "$f" 'make dev'
+done
+has "AK-17 AGENTS.md: Fertigmeldung über das Sende-Skript" AGENTS.md 'scripts/team/say\.sh orchestrator'
+has "AK-18 AGENTS.md: Kopfzeile stammt von einer Rolle" AGENTS.md '\[talker von'
+has "AK-18 AGENTS.md: keine Freigabe des Menschen" AGENTS.md 'keine Freigabe des Menschen'
+has "AK-18 AGENTS.md: ändert keine Konfiguration" AGENTS.md 'ändert?n? keine Konfiguration'
+has "AK-18 AGENTS.md: Freigaben nur über die Ticket-Datei" AGENTS.md 'Freigaben.*nur.*Ticket-Datei'
+has "AK-22 AGENTS.md: Abschnitt mit Instanz" AGENTS.md '## <rolle>\[-<n>\]'
+has "AK-22 AGENTS.md: Akte nur per Edit" AGENTS.md 'nie `Write`'
+has "AK-20 AGENTS.md: TEAM_MAX_SESSIONS" AGENTS.md 'TEAM_MAX_SESSIONS'
+has "AK-19 AGENTS.md: max. 3 Fix-Runden" AGENTS.md '[Mm]ax\. 3 Fix-Runden'
+has "AK-19 orchestrator.md: max. 3 Fix-Runden" .claude/agents/orchestrator.md '[Mm]ax\. 3 Fix-Runden'
+has "AK-19 ADR-0013: max. 3 Fix-Runden" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'Fix-Runden: max\. 3'
+if grep -rEq '[Mm]ax\. 2 Fix' AGENTS.md CLAUDE.md .claude docs/adr; then fail "AK-19 'max. 2 Fix-Runden' kommt nirgends mehr vor"; else ok "AK-19 'max. 2 Fix-Runden' kommt nirgends mehr vor"; fi
+has "AK-24 ADR-0010 verweist auf ADR-0013" docs/adr/adr-0010-agenten-team.md 'ADR-0013'
+[ -f docs/adr/adr-0013-herdr-laufzeit-und-transport.md ] && ok "AK-24 ADR-0013 existiert" || fail "AK-24 ADR-0013 existiert"
+HITS=$(grep -rE "$FORBIDDEN" .claude scripts 2>/dev/null || true)
+assert_eq "AK-16 grep in .claude und scripts ist leer" "" "$HITS"
+
 th_summary
