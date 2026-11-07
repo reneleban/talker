@@ -53,7 +53,9 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
 - **REQ-DIAG-015**: WO ein Einfüge-Verhalten außer Am Ende aktiv ist, soll die
   Messzeile zusätzlich →erstes Segment und die Anzahl der Segmente enthalten,
   und Loslassen→Text sowie dessen Anteile STT und Cleanup sollen nur die
-  Verarbeitung des Rests nach dem Loslassen messen.
+  Verarbeitung des Rests nach dem Loslassen messen; die Anteile zählen ab dem
+  Ende des Audio-Stroms (`Feed::End`), sodass die Differenz zu Loslassen→Text
+  den Rückstand der Spracherkennung beim Loslassen zeigt.
 - **REQ-DIAG-016**: WENN während einer Dictation ein Modell geladen wurde, soll
   die Messzeile die Ladedauer je Modell enthalten.
 - **REQ-DIAG-017**: FALLS ein Messpunkt nicht eingetreten ist (kein Block, kein
