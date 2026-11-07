@@ -18,8 +18,23 @@ require_clean() {
   [ -z "$(git -C "$1" status --porcelain)" ] || die "$1 hat uncommittete Änderungen"
 }
 
+USAGE="Aufruf: spawn.sh init <ticket> <feature-branch> | [--instance] <rolle> <ticket> <feature-branch> | close <name>"
+need_herdr() {
+  [ "${HERDR_ENV:-}" = 1 ] || die "außerhalb von herdr (HERDR_ENV ist nicht 1), Einstieg: make dev"
+}
+
+INSTANCE=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --instance) INSTANCE=1; shift ;;
+    -*) die "unbekannte Option: $1. $USAGE" 2 ;;
+    *) break ;;
+  esac
+done
+
 if [ "${1:-}" = close ]; then
-  [ $# -eq 2 ] || die "Aufruf: spawn.sh close <name>" 2
+  [ $# -eq 2 ] || die "$USAGE" 2
+  need_herdr
   [ "$2" != orchestrator ] || die "orchestrator wird nicht über spawn.sh beendet"
   PANE=$(herdr agent get "$2" 2>/dev/null | jq -r '.result.agent.pane_id // empty') || true
   [ -n "$PANE" ] || die "keine laufende Session $2"
@@ -28,11 +43,11 @@ if [ "${1:-}" = close ]; then
   exit 0
 fi
 
-[ $# -eq 3 ] || die "Aufruf: spawn.sh init|<rolle> <ticket> <feature-branch> | spawn.sh close <name>" 2
+[ $# -eq 3 ] || die "$USAGE" 2
 ROLE=$1; TICKET=$2; FEATURE=$3
-case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
 
 if [ "$ROLE" = init ]; then
+  case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
   git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$FEATURE" >/dev/null \
     || git -C "$MAIN" branch "$FEATURE" main
   if [ -d "$INTEGRATION" ]; then
@@ -46,21 +61,25 @@ if [ "$ROLE" = init ]; then
   exit 0
 fi
 
-[ -d "$INTEGRATION" ] || die "Integrations-Worktree fehlt, zuerst: spawn.sh init $TICKET $FEATURE"
-
+# Prüfungen, alle vor jeder Änderung (kein Worktree, keine Pane)
+need_herdr
+case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
 case $ROLE in
-  product-owner|architect|rust-developer|test-engineer|release-engineer)
-    DIR="$WT_ROOT/$ROLE"
-    if [ -d "$DIR" ]; then
-      require_clean "$DIR"
-      git -C "$DIR" switch -C "wt/$ROLE" "$FEATURE"
-    else
-      git -C "$MAIN" worktree add -B "wt/$ROLE" "$DIR" "$FEATURE"
-    fi ;;
-  tech-lead|code-reviewer|security-auditor|performance-engineer|merger)
-    DIR="$INTEGRATION" ;;
+  product-owner|architect|rust-developer|test-engineer|release-engineer) OWN=1; DIR="$WT_ROOT/$ROLE" ;;
+  tech-lead|code-reviewer|security-auditor|performance-engineer|merger) OWN=0; DIR="$INTEGRATION" ;;
   *) die "unbekannte Rolle: $ROLE" ;;
 esac
+[ -d "$INTEGRATION" ] || die "Integrations-Worktree fehlt, zuerst: spawn.sh init $TICKET $FEATURE"
+[ "$INSTANCE" = 0 ] || [ "$OWN" = 1 ] || die "--instance gibt es nur für Rollen mit eigenem Worktree, nicht für $ROLE"
+[ "$OWN" = 0 ] || [ ! -d "$DIR" ] || require_clean "$DIR"
+
+if [ "$OWN" = 1 ]; then
+  if [ -d "$DIR" ]; then
+    git -C "$DIR" switch -C "wt/$ROLE" "$FEATURE"
+  else
+    git -C "$MAIN" worktree add -B "wt/$ROLE" "$DIR" "$FEATURE"
+  fi
+fi
 
 NAME="$ROLE-$TICKET"
 
