@@ -52,7 +52,8 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
   mindestens einem Sample ungleich 0 bestimmen.
 - **REQ-DIAG-015**: WO ein Einfüge-Verhalten außer Am Ende aktiv ist, soll die
   Messzeile zusätzlich →erstes Segment und die Anzahl der Segmente enthalten,
-  und Loslassen→Text soll die Verarbeitung des Rests nach dem Loslassen messen.
+  und Loslassen→Text sowie dessen Anteile STT und Cleanup sollen nur die
+  Verarbeitung des Rests nach dem Loslassen messen.
 - **REQ-DIAG-016**: WENN während einer Dictation ein Modell geladen wurde, soll
   die Messzeile die Ladedauer je Modell enthalten.
 - **REQ-DIAG-017**: FALLS ein Messpunkt nicht eingetreten ist (kein Block, kein
@@ -119,10 +120,11 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
 
 ## Regression „erstes Wort"
 
-- **REQ-DIAG-032**: WENN die Audioquelle den ersten Block mit 0, 100 oder
-  300 ms Verzögerung liefert und die Sprache ab dem ersten Block beginnt, soll
-  das System das erste Wort der Referenz im Ergebnistext liefern, im
-  Einfüge-Verhalten Am Ende und Satzweise.
+- **REQ-DIAG-032**: WENN die Audioquelle eine Fixture vollständig ab dem
+  ersten Block liefert, soll das System das erste Wort der Referenz im
+  Ergebnistext liefern, im Einfüge-Verhalten Am Ende und Satzweise (die
+  Pipeline verliert nichts, was die Quelle liefert; Startverzögerungen prüft
+  REQ-DIAG-024).
 - **REQ-DIAG-033**: WO Satzweise aktiv ist und zwei Sätze mit kurzer Pause
   gesprochen werden, soll das System das erste Wort des zweiten Satzes im
   Ergebnistext liefern.
