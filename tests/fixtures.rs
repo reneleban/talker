@@ -64,3 +64,33 @@ fn licensing_doc_marks_the_fleurs_fixtures_as_not_mit() {
     assert!(section.contains("CC-BY-4.0") && section.contains("ATTRIBUTION.md"));
     assert!(section.contains("nicht unter der MIT-Lizenz"));
 }
+
+/// SEC-5: die eingecheckte Prüfsummenliste deckt genau die 20 FLEURS-Dateien ab und stimmt mit
+/// ihnen überein; das Fetch-Skript prüft nach dem Download gegen dieselbe Liste.
+#[test]
+fn checksum_list_matches_the_committed_fleurs_files() {
+    let dir = repo_file("tests/fixtures/stt");
+    let list = std::fs::read_to_string(dir.join("fleurs-de.sha256")).unwrap();
+    let mut listed = Vec::new();
+    for line in list.lines() {
+        let (hash, name) = line.split_once("  ").expect("Format `<sha256>  <datei>`");
+        let actual = talker::models::sha256_file(&dir.join(name)).unwrap();
+        assert_eq!(hash, actual, "{name}");
+        listed.push(name.to_string());
+    }
+    let mut expected: Vec<String> = (1..=10)
+        .flat_map(|n| {
+            [
+                format!("fleurs-de-{n:02}.wav"),
+                format!("fleurs-de-{n:02}.ref.txt"),
+            ]
+        })
+        .collect();
+    expected.sort();
+    listed.sort();
+    assert_eq!(listed, expected);
+
+    let script = std::fs::read_to_string(repo_file("scripts/fetch_fleurs_fixtures.sh")).unwrap();
+    assert!(script.contains("--proto '=https' --proto-redir '=https'"));
+    assert!(script.contains("shasum -a 256 -c fleurs-de.sha256"));
+}

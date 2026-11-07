@@ -3,7 +3,8 @@
 # tests/fixtures/stt/fleurs-de-NN.wav (16 kHz mono, 16 bit) + fleurs-de-NN.ref.txt ab.
 # Der Download passiert nur hier (nie im App-Binary). Die Clips sind committet; das Skript
 # muss nur laufen, wenn man sie neu erzeugen will. Deterministisch: feste Datensatz-Revision,
-# feste Clip-IDs, ein zweiter Lauf liefert byte-identische Dateien.
+# feste Clip-IDs, ein zweiter Lauf liefert byte-identische Dateien
+# (am Ende geprüft gegen tests/fixtures/stt/fleurs-de.sha256).
 # Lizenz und Urheber: tests/fixtures/stt/ATTRIBUTION.md. Braucht Netz, curl, tar, afconvert (macOS).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -32,8 +33,8 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$DEST"
 
 echo "Lade dev.tsv und dev.tar.gz (ca. 220 MB) …"
-curl -fsSL "$BASE/dev.tsv" -o "$TMP/dev.tsv"
-curl -fsSL "$BASE/audio/dev.tar.gz" -o "$TMP/dev.tar.gz"
+curl -fsSL --proto '=https' --proto-redir '=https' "$BASE/dev.tsv" -o "$TMP/dev.tsv"
+curl -fsSL --proto '=https' --proto-redir '=https' "$BASE/audio/dev.tar.gz" -o "$TMP/dev.tar.gz"
 
 MEMBERS=()
 while IFS='|' read -r nn id; do
@@ -50,4 +51,6 @@ while IFS='|' read -r nn id; do
   [ -s "$DEST/fleurs-de-$nn.ref.txt" ] || { echo "Keine Referenz für $id" >&2; exit 1; }
   echo "✓ fleurs-de-$nn ($id)"
 done <<< "$CLIPS"
+# Gegen die eingecheckte Liste prüfen (schlägt bei veränderten Download-Inhalten fehl).
+(cd "$DEST" && shasum -a 256 -c fleurs-de.sha256)
 echo "Fixtures: $DEST/fleurs-de-*"
