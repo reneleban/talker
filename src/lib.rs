@@ -5,6 +5,7 @@ pub mod audio;
 pub mod cleanup;
 pub mod clipboard;
 pub mod config;
+pub mod diagnostics;
 pub mod error;
 pub mod hotkey;
 pub mod indicator;
