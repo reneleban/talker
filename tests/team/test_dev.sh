@@ -8,10 +8,14 @@ DEV="$TH_REPO/scripts/team/dev.sh"
 
 # --- AK-4: fehlendes Programm im PATH → Exit 1, Meldung nennt es ---
 BIN="$TH_TMP/bin"
-mkdir -p "$BIN/nur-herdr" "$BIN/nur-claude"
+mkdir -p "$BIN/nur-herdr" "$BIN/nur-claude" "$BIN/ohne-jq"
 ln -s "$(command -v herdr)" "$BIN/nur-herdr/herdr"
 ln -s "$(command -v claude)" "$BIN/nur-claude/claude"
+ln -s "$(command -v herdr)" "$BIN/ohne-jq/herdr"
+ln -s "$(command -v claude)" "$BIN/ohne-jq/claude"
+ln -s "$(command -v git)" "$BIN/ohne-jq/git"
 BASE=/usr/bin:/bin
+# /usr/bin enthält auf neuem macOS selbst ein jq: für den jq-Fall nur ein PATH mit herdr, claude, git
 
 out=$(cd "$TH_REPO" && PATH="$BIN/nur-claude:$BASE" TEAM_SESSION=$TS sh "$DEV" 2>&1 </dev/null); rc=$?
 assert_eq "AK-4 ohne herdr: Exit 1" 1 "$rc"
@@ -20,6 +24,9 @@ assert_contains "AK-4 ohne herdr: Meldung nennt herdr" "herdr fehlt im PATH" "$o
 out=$(cd "$TH_REPO" && PATH="$BIN/nur-herdr:$BASE" TEAM_SESSION=$TS sh "$DEV" 2>&1 </dev/null); rc=$?
 assert_eq "AK-4 ohne claude: Exit 1" 1 "$rc"
 assert_contains "AK-4 ohne claude: Meldung nennt claude" "claude fehlt im PATH" "$out"
+out=$(cd "$TH_REPO" && PATH="$BIN/ohne-jq" TEAM_SESSION=$TS /bin/sh "$DEV" 2>&1 </dev/null); rc=$?
+assert_eq "AK-4 ohne jq: Exit 1" 1 "$rc"
+assert_contains "AK-4 ohne jq: Meldung nennt jq" "jq fehlt im PATH" "$out"
 if th_session_exists; then fail "AK-4: Fehlerpfad startet keine Session"; else ok "AK-4: Fehlerpfad startet keine Session"; fi
 
 # --- AK-1: Session + Orchestrator, ohne TTY (stdout in Datei) → attach scheitert erwartet ---

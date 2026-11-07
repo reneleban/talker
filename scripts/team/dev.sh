@@ -5,7 +5,7 @@ set -eu
 
 die() { echo "dev: $*" >&2; exit 1; }
 
-for prog in herdr claude; do
+for prog in herdr claude jq; do
   command -v "$prog" >/dev/null 2>&1 || die "$prog fehlt im PATH"
 done
 
