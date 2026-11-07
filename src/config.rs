@@ -602,6 +602,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// AK-3 Grenzfälle: falscher Typ, falsche Schreibweise und leerer Wert sind Parse-Fehler;
+    /// jede gültige Stufe wird gelesen; die Datei bleibt unangetastet.
+    #[test]
+    fn log_level_wrong_type_case_and_empty_are_parse_errors() {
+        for bad in [
+            "log_level = 3",
+            "log_level = \"Info\"",
+            "log_level = \"\"",
+            "log_level = true",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad} muss ein Fehler sein");
+        }
+        for (raw, want) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+        ] {
+            let cfg = Config::parse(&format!("log_level = \"{raw}\"")).unwrap();
+            assert_eq!(cfg.log_level, want);
+        }
+        let dir = std::env::temp_dir().join(format!("talker-loglevel-type-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "log_level = 3\n").unwrap();
+        assert_eq!(Config::load_from(&path), Config::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "log_level = 3\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// REQ-STREAM-008: fehlende Pausenlänge → Default; übrige Werte werden gelesen.
     #[test]
     fn endpoint_silence_defaults_and_roundtrips() {
