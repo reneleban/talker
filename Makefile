@@ -4,7 +4,7 @@ APP_DEST ?= $(HOME)/Applications
 N ?= 10
 LATENCY_OUT ?=
 
-.PHONY: help verify build test clippy bundle install cert stress run latency-eval
+.PHONY: help verify build test clippy bundle install cert stress run latency-eval team-test
 
 help: ## Diese Übersicht
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-10s %s\n", $$1, $$2}'
@@ -47,6 +47,9 @@ pipeline-ab: ## Pipeline-Vergleich A/B/C (EVAL-0003): Nemotron vs +Gemma vs Gemm
 
 latency-eval: ## Latenz-Messreihe (Ticket 0038): N=10 Läufe/Fall (N=3 = Schnelllauf), LATENCY_OUT=<datei>; ohne Gemma nur Roh
 	N="$(N)" LATENCY_OUT="$(LATENCY_OUT)" cargo run --release --example latency_eval
+
+team-test: ## Team-Skript-Tests (Ticket 0043): braucht herdr, claude, jq; eigene Session talker-test
+	sh tests/team/run.sh
 
 run: ## App aus dem Quellbaum starten
 	cargo run --release
