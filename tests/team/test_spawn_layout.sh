@@ -17,6 +17,10 @@ rect() { # <agent> <feld>
   p=$(agent_json "$1" .result.agent.pane_id)
   th_h pane layout --pane "$p" | jq -r --arg p "$p" ".result.layout.panes[] | select(.pane_id == \$p) | .rect.$2"
 }
+# Pane-IDs zählen hexadezimal hoch (p9 → pA → … → pF → p10): Anlegereihenfolge darf daran nicht scheitern.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  th_h pane close "$(th_h pane split "$TH_PANE" --direction right --no-focus | jq -r '.result.pane.pane_id')" >/dev/null
+done
 spawn() { inpane "$SP $1 0001 chore/0001-x"; assert_eq "AK-6 $1: Exit 0" 0 "$INPANE_RC"; }
 
 spawn rust-developer

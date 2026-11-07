@@ -98,8 +98,8 @@ new_pane() {
         '[.result.tabs[].label] as $ls | [range(1; 100)] | map(if . == 1 then $l else "\($l)-\(.)" end) | map(select(. as $c | $ls | index($c) | not)) | .[0]')
       herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label "$LABEL" --cwd "$DIR" --no-focus | jq -r '.result.root_pane.pane_id'
     else
-      # 2. Pane rechts von 1, 3. unter 1, 4. unter 2 (Reihenfolge = Anlegereihenfolge, nicht Layout-Reihenfolge)
-      TPANES=$(herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -c --arg t "$TAB" '[.result.panes[] | select(.tab_id == $t) | .pane_id] | sort_by(split(":")[1][1:] | tonumber)')
+      # 2. Pane rechts von 1, 3. unter 1, 4. unter 2 (Reihenfolge = Anlegereihenfolge, nicht Layout-Reihenfolge; Pane-IDs zählen hexadezimal: p9, pA, …, pF, p10)
+      TPANES=$(herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -c --arg t "$TAB" '[.result.panes[] | select(.tab_id == $t) | .pane_id] | sort_by(split(":")[1][1:] | [length, .])')
       case $(printf '%s' "$TPANES" | jq 'length') in
         1) AT=$(printf '%s' "$TPANES" | jq -r '.[0]'); DIRN=right ;;
         2) AT=$(printf '%s' "$TPANES" | jq -r '.[0]'); DIRN=down ;;
