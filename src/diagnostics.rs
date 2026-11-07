@@ -810,4 +810,55 @@ mod tests {
         assert!(section.contains("CC-BY-4.0") && section.contains("ATTRIBUTION.md"));
         assert!(section.contains("nicht unter der MIT-Lizenz"));
     }
+
+    // ---- Doku (T20, AK-30) ----
+
+    /// REQ-DIAG-001 … 033: die Doku nennt Logdatei, Grad, Mitschnitt, Messreihe und Fixture-Skript.
+    #[test]
+    fn readme_documents_logging_capture_and_measurement() {
+        let readme = std::fs::read_to_string(repo_file("README.md")).unwrap();
+        for needle in [
+            "talker.log",
+            "talker.1.log",
+            "log_level",
+            "TALKER_LOG",
+            "TALKER_DEBUG_WAV_DIR",
+            "open --env TALKER_DEBUG_WAV_DIR=",
+            "<nr>-mic.wav",
+            "<nr>-model.wav",
+            "latency-eval",
+            "fetch_fleurs_fixtures",
+            "Log im Finder zeigen",
+        ] {
+            assert!(readme.contains(needle), "README ohne: {needle}");
+        }
+    }
+
+    /// Die Recherche liegt im Branch; `make help` führt `latency-eval`.
+    #[test]
+    fn research_note_exists_and_make_lists_latency_eval() {
+        let research =
+            std::fs::read_to_string(repo_file("docs/research/mikrofon-start-und-pre-roll.md"))
+                .unwrap();
+        assert!(research.contains("Mikrofon-Start, Pre-Roll und Latenz"));
+        let makefile = std::fs::read_to_string(repo_file("Makefile")).unwrap();
+        assert!(makefile.contains("latency-eval: ##"));
+        assert!(makefile.contains(".PHONY:") && makefile.contains("latency-eval"));
+    }
+
+    /// Nutzersichtbare Änderung → CHANGELOG-Eintrag im selben Zug.
+    #[test]
+    fn changelog_announces_the_new_features() {
+        let changelog = std::fs::read_to_string(repo_file("CHANGELOG.md")).unwrap();
+        let unreleased = changelog.split("## [").nth(1).unwrap();
+        for needle in [
+            "log_level",
+            "TALKER_LOG",
+            "TALKER_DEBUG_WAV_DIR",
+            "latency-eval",
+            "Messzeile",
+        ] {
+            assert!(unreleased.contains(needle), "CHANGELOG ohne: {needle}");
+        }
+    }
 }
