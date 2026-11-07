@@ -2550,13 +2550,13 @@ mod tests {
     /// CR-15/AK-13: scheitert ein Live-Chunk, aber `finish` klappt, bleibt die Messzeile `—`.
     #[test]
     fn live_feed_error_keeps_timing_empty_even_if_finish_succeeds() {
-        struct FeedFailsOnce;
-        impl Transcriber for FeedFailsOnce {
+        struct FeedAlwaysFails;
+        impl Transcriber for FeedAlwaysFails {
             fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
                 Ok(String::new())
             }
         }
-        impl StreamingTranscriber for FeedFailsOnce {
+        impl StreamingTranscriber for FeedAlwaysFails {
             fn begin(&mut self) {}
             fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
                 Err(TalkerError::Stt("kaputt".into()))
@@ -2569,7 +2569,7 @@ mod tests {
         let mut w = DictationWorker::new(
             &cfg,
             models_with_gemma(ModelState::Ready),
-            Box::new(|_: &Path| Ok(FeedFailsOnce)),
+            Box::new(|_: &Path| Ok(FeedAlwaysFails)),
             Box::new(|| (None::<ScriptedCleaner>, false)),
         );
         let injected: Injected = Rc::default();
