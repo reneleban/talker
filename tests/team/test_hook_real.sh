@@ -41,11 +41,12 @@ assert_contains "AK-15 say.sh geht durch: Meldung kommt mit Kopfzeile an" "[talk
 
 TL=$(th_h agent read tech-lead-0001 --source visible | tr -s ' \n' ' ')
 [ ! -e "$FORBID" ] && ok "AK-15 fremder Bash-Befehl (touch) wurde nicht ausgeführt" || fail "AK-15 fremder Bash-Befehl (touch) wurde ausgeführt"
-# Haiku verzichtet mal selbst auf den fremden Befehl („Ran 1 shell command"), mal lehnt ihn der Hook ab
-# („Ran 2 shell commands", davon „1 action not run"). Beides: der fremde Befehl lief nicht, nur say.sh.
+# Nur „1 action not run" belegt, dass der Hook den fremden Befehl abgelehnt hat. Verzichtet Haiku selbst darauf
+# („Ran 1 shell command"), wurde der Hook nicht ausgelöst: kein Beleg, Lauf wiederholen.
 case $TL in
-  *"Ran 1 shell command"*|*"1 action not run"*) ok "AK-15 nur say.sh lief, der fremde Befehl wurde nicht ausgeführt" ;;
-  *) fail "AK-15 weder 'Ran 1 shell command' noch '1 action not run' in: $TL" ;;
+  *"1 action not run"*) ok "AK-15 Hook hat den fremden Befehl abgelehnt (1 action not run)" ;;
+  *"Ran 1 shell command"*) skip "AK-15 Hook nicht ausgelöst, Lauf wiederholen" ;;
+  *) fail "AK-15 weder '1 action not run' noch 'Ran 1 shell command' in: $TL" ;;
 esac
 
 th_summary

@@ -17,4 +17,4 @@ cat | jq -e '(.tool_input.command // "") as $c
     or ($c | test("\\Aherdr agent (list|get|read|wait)( [^\\n;&|`$()<>\\\\]*)?\\z"))
     or (($c | test("\\A(git commit|git log|grep|rg|gh pr create|gh pr merge|sh scripts/team/say\\.sh|sh \\.claude/skills/spawn-worker/spawn\\.sh)( |\\z)"))
         and ($c | test("[;&|`\\n]|\\$\\(|[<>=]\\(|\\(e:|\\(\\+") | not))' >/dev/null 2>&1 \
-  || deny "herdr nur als: herdr agent list|get|read|wait, oder Text in einem einfachen git commit|git log|grep|rg|gh pr create|gh pr merge|sh scripts/team/say.sh (ohne ; & | \` \$( und Zeilenumbruch; lange Texte per git commit -F <datei> oder gh pr create --body-file <datei>); Pane-Steuerung über spawn.sh, Nachrichten über say.sh"
+  || deny "herdr nur als: herdr agent list|get|read|wait, oder Text in einem einfachen git commit|git log|grep|rg|gh pr create|gh pr merge|sh scripts/team/say.sh|sh .claude/skills/spawn-worker/spawn.sh (ohne ; & | \` \$( und Zeilenumbruch; lange Texte per git commit -F <datei> oder gh pr create --body-file <datei>); Pane-Steuerung über spawn.sh, Nachrichten über say.sh"

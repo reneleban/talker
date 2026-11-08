@@ -127,7 +127,7 @@ Status von ADR-0010.
   verwenden (der Befehl enthält das Token dann nicht). Nicht erfasst bleiben Aufrufe, in denen das Token
   zerlegt oder verschleiert ist (`her""dr`, `rg --pre`). Hook und Test heißen bewusst `pane-guard.sh` und
   `test_pane_guard.sh`, damit die Arbeit an ihnen das Token nicht im Befehl trägt. Für die verbleibenden Fälle
-  (ADR-Dateiname, Branch-Name `chore/0043-parallele-sessions-herdr`) gilt für alle Rollen: Datei mit dem
+  (Datei- oder Branch-Name, der das Token enthält) gilt für alle Rollen: Datei mit dem
   Read-Tool lesen, Tests mit `make team-test`, mit `git add -A` stagen, mit `git push origin HEAD` pushen.
   `sh .claude/skills/spawn-worker/spawn.sh` ist als Präfix frei (es prüft den Branch selbst), auch mit dem
   Token im Branch-Namen. Die zsh-Konstrukte `=(`, `(e:` und `(+` sind in einfachen Befehlen gesperrt.
