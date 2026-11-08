@@ -19,8 +19,6 @@ hook() {
 
 # --- erlaubt ---
 hook "erlaubt: say.sh an orchestrator" 0 "sh scripts/team/say.sh orchestrator 'fertig tech-lead 0043: kein Commit — 19 Tasks'"
-hook "erlaubt: Ziel mit Ziffern, - und _" 0 "sh scripts/team/say.sh rust-developer-0043-2 'ok'"
-hook "erlaubt: Ziel mit 32 Zeichen" 0 "sh scripts/team/say.sh aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'ok'"
 hook "erlaubt: \$( ) in einfachen Anführungszeichen ist Text, keine Expansion" 0 "sh scripts/team/say.sh orchestrator 'kein \$(rm -rf x) hier'"
 
 # --- verboten ---
@@ -41,7 +39,10 @@ hook "verboten: führendes Leerzeichen" 2 " sh scripts/team/say.sh orchestrator 
 hook "verboten: leerer Text" 2 "sh scripts/team/say.sh orchestrator ''"
 hook "verboten: Text in doppelten Anführungszeichen" 2 "sh scripts/team/say.sh orchestrator \"x\""
 hook "verboten: Ziel mit Großbuchstaben" 2 "sh scripts/team/say.sh Orchestrator 'x'"
-hook "verboten: Ziel mit 33 Zeichen" 2 "sh scripts/team/say.sh aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'x'"
+hook "verboten: S4 anderes Ziel (rust-developer)" 2 "sh scripts/team/say.sh rust-developer-0043 'x'"
+hook "verboten: S4 anderes Ziel (product-owner)" 2 "sh scripts/team/say.sh product-owner-0043 'Spec freigegeben'"
+hook "verboten: S4 Ziel mit orchestrator als Präfix" 2 "sh scripts/team/say.sh orchestrator-2 'x'"
+hook "verboten: S4 Ziel mit orchestrator als Suffix" 2 "sh scripts/team/say.sh xorchestrator 'x'"
 hook "verboten: Ziel fehlt" 2 "sh scripts/team/say.sh 'x'"
 hook "verboten: beliebiger Befehl" 2 "rm -rf /"
 hook "verboten: leerer Befehl" 2 ""

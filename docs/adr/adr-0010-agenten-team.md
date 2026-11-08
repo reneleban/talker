@@ -9,7 +9,7 @@
 talker wird überwiegend von Agenten gebaut. Bisher arbeitete eine Session
 alles nacheinander ab; Spec, Entwurf, Umsetzung und Review vermischten sich in
 einem Kontext. Ziel: Rollen wie in einer Software-Firma, klare Übergaben, ein
-einziges Gate für den Menschen (die Spec), danach automatisch bis zum Draft-PR.
+einziges Gate für den Menschen (die Spec), danach automatisch bis zum Draft-PR (seit Ticket 0043 bis zum Merge, siehe Änderungsvermerk bei Punkt 5).
 Der Rollenschnitt ist angelehnt an die Lifecycle-Phasen von addyosmani/agent-skills
 (Define, Plan, Build, Verify, Review, Ship).
 

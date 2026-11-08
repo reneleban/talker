@@ -1,19 +1,28 @@
 #!/bin/sh
 # Startet eine Rollen-Session als herdr-Pane (ADR-0013).
 #   spawn.sh init <ticket> <feature-branch>
-#   spawn.sh <rolle> <ticket> <feature-branch>
+#   spawn.sh [--kind claude|codex] [--instance] <rolle> <ticket> <feature-branch>
 #   spawn.sh close <name>
 # Exit: 0 bereit · 1 Abbruch vor jeder Änderung · 2 Aufruf · 3 nach einer Änderung nicht bereit/herdr-Fehler.
 # SPAWN_READY_TIMEOUT_MS (Default 60000): Bereit-Frist (Test-Naht).
 set -eu
 
-die() { echo "spawn: $*" >&2; exit "${2:-1}"; }
+die() { echo "spawn: $1" >&2; exit "${2:-1}"; }
 
 MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 WT_ROOT="$(dirname "$MAIN")/talker-wt"
 INTEGRATION="$WT_ROOT/integration"
 READY_MS=${SPAWN_READY_TIMEOUT_MS:-60000}
-ROLES_RE="product-owner|architect|tech-lead|rust-developer|test-engineer|code-reviewer|security-auditor|performance-engineer|merger|release-engineer"
+# Einzige Rollenliste: eigener Worktree bzw. Integrations-Worktree; ROLES_RE und der case unten leiten sich daraus ab.
+OWN_ROLES="product-owner architect rust-developer test-engineer release-engineer"
+SHARED_ROLES="tech-lead code-reviewer security-auditor performance-engineer merger"
+ROLES_RE=$(printf '%s %s' "$OWN_ROLES" "$SHARED_ROLES" | tr ' ' '|')
+in_roles() { case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+check_feature() {
+  printf '%s' "$FEATURE" | grep -Eq '^(feat|fix|chore)/[a-z0-9-]+$' \
+    || die "Feature-Branch muss ^(feat|fix|chore)/[a-z0-9-]+\$ entsprechen: $FEATURE"
+}
 
 require_clean() {
   [ -z "$(git -C "$1" status --porcelain)" ] || die "$1 hat uncommittete Änderungen"
@@ -55,6 +64,7 @@ ROLE=$1; TICKET=$2; FEATURE=$3
 
 if [ "$ROLE" = init ]; then
   case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
+  check_feature
   git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$FEATURE" >/dev/null \
     || git -C "$MAIN" branch "$FEATURE" main
   if [ -d "$INTEGRATION" ]; then
@@ -71,11 +81,11 @@ fi
 # Prüfungen, alle vor jeder Änderung (kein Worktree, keine Pane)
 need_herdr
 case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
-case $ROLE in
-  product-owner|architect|rust-developer|test-engineer|release-engineer) OWN=1; DIR="$WT_ROOT/$ROLE" ;;
-  tech-lead|code-reviewer|security-auditor|performance-engineer|merger) OWN=0; DIR="$INTEGRATION" ;;
-  *) die "unbekannte Rolle: $ROLE" ;;
-esac
+check_feature
+if in_roles "$ROLE" "$OWN_ROLES"; then OWN=1; DIR="$WT_ROOT/$ROLE"
+elif in_roles "$ROLE" "$SHARED_ROLES"; then OWN=0; DIR="$INTEGRATION"
+else die "unbekannte Rolle: $ROLE"
+fi
 [ -d "$INTEGRATION" ] || die "Integrations-Worktree fehlt, zuerst: spawn.sh init $TICKET $FEATURE"
 
 # Obergrenze: Umgebungsvariable (auch leer) vor team.env des Haupt-Checkouts; der Orchestrator zählt nicht.

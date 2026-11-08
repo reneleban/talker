@@ -9,6 +9,11 @@ for prog in herdr claude jq; do
   command -v "$prog" >/dev/null 2>&1 || die "$prog fehlt im PATH"
 done
 
+MIN_HERDR=0.9.5
+HERDR_VERSION=$(herdr --version 2>/dev/null | sed -n 's/^herdr \([0-9][0-9.]*\).*/\1/p' | head -n 1)
+[ -n "$HERDR_VERSION" ] && [ "$(printf '%s\n%s\n' "$MIN_HERDR" "$HERDR_VERSION" | sort -V | head -n 1)" = "$MIN_HERDR" ] \
+  || die "herdr >= $MIN_HERDR nötig (gefunden: ${HERDR_VERSION:-unbekannt}), Installation/Update: brew install herdr"
+
 S=${TEAM_SESSION:-talker}
 MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 h() { herdr --session "$S" "$@"; }
@@ -54,8 +59,8 @@ if ! h agent list | jq -e '.result.agents[] | select(.name == "orchestrator")' >
   else
     TAB=$(h tab list --workspace "$WS" | jq -r '.result.tabs | sort_by(.number) | .[0].tab_id')
     PANE=$(h pane list --workspace "$WS" | jq -r --arg t "$TAB" '[.result.panes[] | select(.tab_id == $t)] | .[0].pane_id')
-    if h agent list | jq -e --arg p "$PANE" '.result.agents[] | select(.pane_id == $p and .agent == "claude")' >/dev/null; then
-      # Nach einem Server-Neustart nimmt herdr Claude ohne Namen wieder auf (A5)
+    if h agent list | jq -e --arg p "$PANE" '.result.agents[] | select(.pane_id == $p and .agent == "claude" and (.name // "") == "")' >/dev/null; then
+      # Nach einem Server-Neustart nimmt herdr Claude ohne Namen wieder auf (A5); benannte Agenten bleiben unberührt
       h agent rename "$PANE" orchestrator >/dev/null
     else
       shell_free "$PANE" || PANE=$(h pane split "$PANE" --direction right --cwd "$MAIN" --no-focus | jq -r '.result.pane.pane_id')

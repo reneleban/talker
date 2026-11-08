@@ -21,6 +21,8 @@ mit Status je Rolle.
 Geprüft an `herdr` 0.9.5 (`herdr --version`, `herdr --skill`, CLI-Referenz
 v0.9.5 [1]) in Wegwerf-Sessions `arch-probe`/`arch-probe-2`, die danach gestoppt
 und gelöscht wurden. Belege stehen im Ticket-0043, Abschnitt `## architect`.
+Voraussetzung ist `herdr` ab 0.9.5 (Installation: `brew install herdr`); `make dev` prüft die Version
+per `herdr --version` und bricht darunter ab.
 
 ## Entscheidung
 
@@ -106,9 +108,13 @@ Status von ADR-0010.
   beweist keinen gestarteten Turn [1]. `say.sh` wartet bewusst nicht, sonst
   hinge der Absender am Turn des Empfängers.
 - Der neue Transport ist an herdr gebunden. Rückweg ist ein Revert.
-- Die Kopfzeile bleibt eine Verhaltensregel. Die Deny-Regel auf direktes
-  `herdr agent prompt` macht das Weglassen schwerer, aber nicht unmöglich (z. B.
-  `env herdr …`). Freigaben gelten nur über die Akte.
+- Die Kopfzeile ist eine Verhaltensregel, keine technische Sperre. Die Deny-Regeln auf direktes
+  `herdr …` und der PreToolUse-Hook `herdr-guard.sh` (lehnt jeden Bash-Befehl mit dem Token `herdr`
+  ab außer `herdr agent list|get|read|wait`) machen das Weglassen schwerer; sie sind aber
+  keine Sicherheitsgrenze (verschleierte Aufrufe, andere Wege auf den herdr-Socket). Deshalb gilt die
+  Spec-Freigabe nur, wenn der Mensch sie auf eine `AskUserQuestion` des PO gibt, nie aus freiem
+  Pane-Text. Freigaben gelten nur über die Akte. Folge des Hooks: Auch ein Befehl, der `herdr` nur
+  als Text enthält (z. B. eine Commit-Nachricht), wird abgelehnt.
 - Nach einem Neustart des herdr-Servers stellt herdr das Layout wieder her und
   kann Claude per `claude --resume <id>` wieder aufnehmen, dann aber ohne
   herdr-Namen [5]. `dev.sh` benennt einen solchen Orchestrator um, statt einen

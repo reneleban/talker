@@ -30,6 +30,7 @@ assert_eq "init: Exit 0" 0 "$INPANE_RC"
 
 # --- Aufruf/Optionen → Exit 2 ---
 check "AK-11 ohne Argumente" 2 "Aufruf" "$SP"
+if printf '%s' "$INPANE_OUT" | grep -Eq ' 2$'; then fail "C2 Meldung enthält nicht den Exit-Code"; else ok "C2 Meldung enthält nicht den Exit-Code"; fi
 check "AK-11 zu wenige Argumente" 2 "Aufruf" "$SP rust-developer 0001"
 check "AK-11 zu viele Argumente" 2 "Aufruf" "$SP rust-developer 0001 chore/0001-x extra"
 check "AK-11 unbekannte Option" 2 "--bogus" "$SP --bogus rust-developer 0001 chore/0001-x"
@@ -46,6 +47,13 @@ assert_eq "AK-11 init braucht herdr nicht" 0 "$INPANE_RC"
 check "AK-11 Ticket dreistellig" 1 "vierstellig" "$SP rust-developer 043 chore/0001-x"
 check "AK-11 Ticket fünfstellig" 1 "vierstellig" "$SP rust-developer 00431 chore/0001-x"
 check "AK-11 Ticket nicht numerisch" 1 "vierstellig" "$SP rust-developer abcd chore/0001-x"
+
+# --- S6: Feature-Branch-Name (feat|fix|chore)/[a-z0-9-]+ ---
+for bad in 'main' 'feat/' 'feat/Gross' '--detach' 'feat/a_b' 'feat/a/b' 'release/x'; do
+  check "S6 init verwirft Branch '$bad'" 1 "Branch" "$SP init 0003 '$bad'"
+  check "S6 Rolle verwirft Branch '$bad'" 1 "Branch" "$SP rust-developer 0001 '$bad'"
+done
+check "S6 Rolle verwirft Branch mit Leerzeichen" 1 "Branch" "$SP rust-developer 0001 'chore/a b'"
 
 # --- Rolle bekannt ---
 check "AK-11 unbekannte Rolle" 1 "unbekannte Rolle" "$SP kein-agent 0001 chore/0001-x"

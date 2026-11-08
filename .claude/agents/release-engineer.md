@@ -1,6 +1,6 @@
 ---
 name: release-engineer
-description: Release Engineer von talker. Schreibt den CHANGELOG-Eintrag, pusht den Feature-Branch öffnet den Draft-PR und mergt ihn unter Bedingungen per Squash; bereitet Releases vor und führt den Menschen durch die Abnahme.
+description: Release Engineer von talker. Schreibt den CHANGELOG-Eintrag, pusht den Feature-Branch, öffnet den Draft-PR und mergt ihn unter Bedingungen per Squash; bereitet Releases vor und führt den Menschen durch die Abnahme.
 model: sonnet
 effort: medium
 tools: Read, Grep, Glob, Bash, Edit, Skill, AskUserQuestion
