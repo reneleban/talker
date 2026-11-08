@@ -58,7 +58,7 @@ case $(fm_line "$f" disallowedTools) in *Bash*) fail "AK-15 tech-lead: Bash nich
 case $(fm_line "$f" tools) in *Write*) fail "AK-22 tech-lead: kein Write in tools" ;; *) ok "AK-22 tech-lead: kein Write in tools" ;; esac
 has "AK-15 tech-lead: PreToolUse-Hook" "$f" 'PreToolUse:'
 has "AK-15 tech-lead: Matcher Bash" "$f" 'matcher: Bash'
-has "AK-15 tech-lead: Hook say-only.sh" "$f" 'command: sh \.claude/hooks/say-only\.sh'
+has "AK-15 tech-lead: Hook say-only.sh" "$f" 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
 has "AK-20 tech-lead: Task nennt Dateien" "$f" 'Dateien:'
 has "AK-20 tech-lead: Task nennt hängt ab von" "$f" 'hängt ab von:'
 has "AK-22 tech-lead: Akte nur per Edit, nie Write" "$f" 'nie `Write`'
@@ -227,5 +227,6 @@ assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-e
 for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)'; do
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
+has "S4 tech-lead Hook-Pfad über CLAUDE_PROJECT_DIR" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
 
 th_summary
