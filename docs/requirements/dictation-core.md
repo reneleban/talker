@@ -42,6 +42,22 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
   Audio-Frame einen Live-Pegel (RMS) bereitstellen, den andere Komponenten
   lockfrei auslesen können.
   (`src/audio.rs:LevelHandle`, `rms`, Ticket-0007 AK2)
+- **REQ-DICT-022**: Das System soll jeden Audio-Block ab dem ersten Block
+  einer Aufnahme lückenlos und in Reihenfolge an die Spracherkennung
+  übergeben, auch Blöcke vor dem ersten Signal. (Ticket-0039)
+- **REQ-DICT-028**: Das System soll das aufgelöste Eingabegerät und dessen
+  Format zwischen zwei Tastendrücken wiederverwenden, ohne die Geräte
+  erneut aufzuzählen, und dabei zwischen den Aufnahmen keinen Audio-Stream
+  offen halten und kein Gerät belegen. (Ticket-0039)
+- **REQ-DICT-029**: WENN sich das konfigurierte Eingabegerät, das
+  macOS-Standard-Eingabegerät (bei leerem `mic_device`) oder dessen Format
+  seit dem letzten Tastendruck geändert hat, soll das System beim nächsten
+  Tastendruck Gerät und Format neu ermitteln und das aktuelle Gerät verwenden.
+  (Ticket-0039)
+- **REQ-DICT-030**: FALLS der Start einer Aufnahme mit dem wiederverwendeten
+  Gerät scheitert, DANN soll das System Gerät und Format einmal neu ermitteln
+  und den Start wiederholen; scheitert auch dieser, gilt REQ-DICT-006.
+  (Ticket-0039)
 
 ## Spracherkennung
 
@@ -66,9 +82,23 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
   (`src/pipeline.rs:process_utterance` → `Processed::SttFailed` →
   `Outcome::Rejected`)
 - **REQ-DICT-021**: Das System soll dem Streaming-Modell das Audio einer
-  Utterance mit 0,4 s Vorlauf- und 1,2 s Nachlauf-Stille übergeben, damit
-  weder Satzanfang noch die letzten Wörter fehlen
-  (`src/stt.rs:pad_with_silence`; ADR-0008).
+  Utterance mit 0,4 s Vorlauf und 1,2 s Nachlauf ohne Sprache übergeben —
+  digitale Stille oder leises Rauschen mit festem Seed, je nach A/B-Ergebnis
+  aus Ticket 0039 —, damit weder Satzanfang noch die letzten Wörter fehlen.
+  (`src/stt.rs:pad_with_silence`; ADR-0008, geändert Ticket-0039)
+- **REQ-DICT-024**: Das System soll die Spracherkennung im Batch- und im
+  Live-Pfad mit der Sprache aus dem Config-Feld `language` betreiben: `auto`
+  (Automatisch), `de` (Deutsch) oder `en` (Englisch). (Ticket-0039)
+- **REQ-DICT-025**: FALLS die Config kein Feld `language` enthält, DANN soll
+  das System `auto` verwenden (Bestandsconfigs bleiben gültig). (Ticket-0039)
+- **REQ-DICT-026**: FALLS `language` einen unbekannten Wert oder falschen Typ
+  hat, DANN soll das System sich wie bei einem ungültigen `insert_mode`
+  verhalten: Parse-Fehler mit Hinweis, Defaults verwenden, Datei nicht
+  überschreiben. (Ticket-0039)
+- **REQ-DICT-027**: Die Settings sollen eine Auswahl „Sprache: Automatisch /
+  Deutsch / Englisch" anbieten; WENN der Nutzer sie ändert, soll das System
+  den Wert speichern und ab der nächsten Dictation ohne Neustart verwenden.
+  (Ticket-0039)
 
 ## Injection
 
@@ -92,10 +122,12 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
 
 - **REQ-DICT-016**: WENN die Aufnahme startet, soll das System ein
   click-through, always-on-top Overlay auf dem Bildschirm der aktiven App
-  einblenden, das eine auf den Live-Mikrofon-Pegel reagierende Waveform
-  zeigt, ohne der Target App den Fokus zu entziehen.
+  einblenden, das bis zum ersten Signal (REQ-DIAG-014) den Zustand „Mikrofon
+  startet" (Balken) und erst ab dem ersten Signal eine auf den
+  Live-Mikrofon-Pegel reagierende Waveform zeigt, ohne der Target App den Fokus
+  zu entziehen.
   (`src/overlay.rs:Overlay::tick/render_waves`, `src/indicator.rs:Phase::Recording`,
-  Ticket-0007 AK1/AK5/AK6)
+  Ticket-0007 AK1/AK5/AK6, geändert Ticket-0039)
 - **REQ-DICT-017**: WÄHREND die Utterance nach dem Loslassen verarbeitet
   wird, soll das Overlay den Zustand „wird transkribiert" anzeigen, bis der
   Text eingefügt oder die Utterance verworfen wurde.
@@ -118,3 +150,7 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
   es zulässt.
   (`src/indicator.rs:Indicator::loading/ready`, Test
   `ptt_during_loading_switches_to_recording`)
+- **REQ-DICT-023**: FALLS 5 s nach dem Tastendruck noch kein erstes Signal
+  eingegangen ist, DANN soll das Overlay den Fehler „Mikrofon antwortet nicht"
+  zeigen, während die Aufnahme bis zum Loslassen weiterläuft und danach wie
+  jede andere Utterance verarbeitet wird. (Ticket-0039)

@@ -45,7 +45,8 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
   das System genau eine Messzeile auf Grad `info` loggen mit: laufender
   Diktat-Nummer, Taste→Mikro bereit, →erster Block, →erstes Signal, gehalten,
   aufgenommen, Loslassen→Text (STT, Cleanup), →eingefügt, Gerät (Name,
-  Samplerate, Kanäle), Einfüge-Verhalten, Cleanup-Modus, Kaltstart und Ergebnis.
+  Samplerate, Kanäle), Einfüge-Verhalten, Cleanup-Modus, Sprache, Kaltstart und
+  Ergebnis.
 - **REQ-DIAG-013**: Das System soll alle Zeitpunkte der Messzeile auf einer
   gemeinsamen Uhr relativ zum Tastendruck angeben.
 - **REQ-DIAG-014**: Das System soll „erstes Signal" als ersten Audio-Block mit
@@ -108,6 +109,10 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
 - **REQ-DIAG-029**: FALLS eine Fixture nicht lesbar ist, DANN soll die
   Latenz-Messreihe sie überspringen und in der Tabelle als „übersprungen:
   <Grund>" ausweisen.
+- **REQ-DIAG-035**: WO die Variable `LANGUAGE` (`auto`, `de`, `en`) gesetzt
+  ist, soll die Latenz-Messreihe mit dieser Sprache laufen, sonst mit `auto`,
+  und die verwendete Sprache in der Tabelle nennen; FALLS der Wert ungültig ist,
+  DANN soll sie mit Hinweis und Exit-Code ungleich 0 enden. (Ticket-0039)
 - **REQ-DIAG-034**: Die Latenz-Messreihe soll das Cleanup-Modell höchstens
   einmal pro Messreihe laden und dieselbe Instanz für alle Natürlich-Fälle
   verwenden, auch wenn ein Roh-Fall vorausging.
@@ -115,7 +120,8 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
 ## Fixtures
 
 - **REQ-DIAG-030**: WENN `scripts/fetch_fleurs_fixtures.sh` läuft, soll es
-  eine fest per ID gewählte Liste von rund 10 deutschen FLEURS-Clips als
+  eine fest per ID gewählte Liste von rund 15 deutschen FLEURS-Clips, davon
+  mindestens 5 von Sprecherinnen, als
   `tests/fixtures/stt/fleurs-de-*.wav` (16 kHz mono) mit `.ref.txt` ablegen,
   bei jedem Lauf identisch.
 - **REQ-DIAG-031**: Das Repo soll für die FLEURS-Fixtures Urheber, Titel,
@@ -127,9 +133,11 @@ Audioquelle für Tests, Latenz-Messreihe. Muster und ID-Konvention:
 
 - **REQ-DIAG-032**: WENN die Audioquelle eine Fixture vollständig ab dem
   ersten Block liefert, soll das System das erste Wort der Referenz im
-  Ergebnistext liefern, im Einfüge-Verhalten Am Ende und Satzweise (die
-  Pipeline verliert nichts, was die Quelle liefert; Startverzögerungen prüft
-  REQ-DIAG-024).
+  Ergebnistext liefern, im Einfüge-Verhalten Am Ende und Satzweise und mit
+  Sprache `de` und `auto` (die Pipeline verliert nichts, was die Quelle
+  liefert; Startverzögerungen prüft REQ-DIAG-024). Ausnahmen gelten nur für
+  einzeln benannte Fixtures mit Fehlerkennung des ersten Worts bei `auto`, mit
+  Messbeleg und Zustimmung des Menschen im Ticket.
 - **REQ-DIAG-033**: WO Satzweise aktiv ist und zwei Sätze mit kurzer Pause
   gesprochen werden, soll das System das erste Wort des zweiten Satzes im
   Ergebnistext liefern.

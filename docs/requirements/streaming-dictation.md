@@ -23,6 +23,11 @@ Muster und ID-Konvention: [`README.md`](README.md). Entscheidung:
   oder ersetzen.
 - **REQ-STREAM-008**: FALLS `endpoint_silence_ms` fehlt, DANN soll das System
   einen Default-Wert verwenden.
+- **REQ-STREAM-016**: WENN im Live-Modus ein Segment endet, soll das System
+  alles Audio, das nach dem Ende des Segments eingegangen oder schon angenommen,
+  aber noch nicht erkannt ist, vollständig und ohne dazwischen eingeschobene
+  Stille dem nächsten Segment zuführen, sodass dessen Satzanfang erhalten
+  bleibt. (Ticket-0039)
 
 ## Korrektur (Stufe 2)
 
