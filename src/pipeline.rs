@@ -19,6 +19,8 @@ use crate::stt::{ModelTap, PhraseCommitter, StreamingTranscriber, Transcriber};
 use crate::{audio, vocab_match};
 
 /// Hinweis, wenn kein Text erkannt wurde.
+/// Satzzeichen, mit denen ein Live-Segment beginnen kann (ADR-0015).
+const LEADING_PUNCTUATION: &[char] = &['.', ',', '?', '!', ';', ':'];
 const NOTHING_RECOGNIZED: &str = "Nichts erkannt";
 /// Wie die Messzeile „kein Text" nennt.
 const NOTHING_RECOGNIZED_REASON: &str = "nichts erkannt";
@@ -390,35 +392,51 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
     }
 
     /// Ein erkanntes Segment → Vokabular-Korrektur + Cleanup → Einfüge-Auftrag.
-    /// Leere Segmente erzeugen keinen; ab dem zweiten steht ein Leerzeichen davor.
+    /// Leere Segmente erzeugen keinen; ab dem zweiten steht ein Leerzeichen davor (außer vor Satzzeichen).
     fn live_segment(&mut self, raw: &str) -> Option<Outcome> {
         let live = self.live.as_mut()?;
         let raw = raw.trim();
         if raw.is_empty() {
             return None;
         }
-        let cleaner = live
-            .cfg
-            .cleanup_mode
-            .uses_llm()
-            .then_some(self.cleaner.as_mut())
-            .flatten()
-            .map(|c| {
-                c.set_mode(live.cfg.cleanup_mode);
-                c.set_vocab(&live.cfg.vocabulary);
-                c as &mut dyn LlmCleaner
-            });
-        let (text, cleanup_fell_back, cleanup_time) =
-            postprocess(raw.to_string(), &live.cfg, cleaner, self.cleaner_failed);
-        if let Some(t) = cleanup_time {
-            add_time(&mut self.timing.cleanup, t);
-        }
-        log::debug!("Live-Segment: {} Zeichen", text.chars().count());
-        let text = if live.emitted_any {
-            format!(" {text}")
+        // Führende Satzzeichen (Segment nach »Satz.« beginnt oft mit ».« oder »,«) hängen ohne
+        // Leerzeichen an und gehen nicht ans LLM (ADR-0015).
+        let rest_at = raw
+            .find(|c: char| !LEADING_PUNCTUATION.contains(&c))
+            .unwrap_or(raw.len());
+        let (punctuation, rest) = raw.split_at(rest_at);
+        let rest = rest.trim();
+        let mut cleanup_fell_back = false;
+        let cleaned = if rest.is_empty() {
+            None
         } else {
-            text
+            let cleaner = live
+                .cfg
+                .cleanup_mode
+                .uses_llm()
+                .then_some(self.cleaner.as_mut())
+                .flatten()
+                .map(|c| {
+                    c.set_mode(live.cfg.cleanup_mode);
+                    c.set_vocab(&live.cfg.vocabulary);
+                    c as &mut dyn LlmCleaner
+                });
+            let (cleaned, fell_back, cleanup_time) =
+                postprocess(rest.to_string(), &live.cfg, cleaner, self.cleaner_failed);
+            if let Some(t) = cleanup_time {
+                add_time(&mut self.timing.cleanup, t);
+            }
+            cleanup_fell_back = fell_back;
+            Some(cleaned)
         };
+        // Leerzeichen nur vor Text: nach einem Satzzeichen-Präfix immer, sonst ab dem zweiten Segment.
+        let text = match cleaned {
+            Some(cleaned) if !punctuation.is_empty() => format!("{punctuation} {cleaned}"),
+            Some(cleaned) if live.emitted_any => format!(" {cleaned}"),
+            Some(cleaned) => cleaned,
+            None => punctuation.to_string(),
+        };
+        log::debug!("Live-Segment: {} Zeichen", text.chars().count());
         live.emitted_any = true;
         Some(Outcome::Inject {
             text,
@@ -1866,6 +1884,69 @@ mod tests {
         assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["Erster Satz."]);
         assert!(w.live_chunk(&[0.0; 160]).is_empty());
         assert_eq!(texts(w.live_end()), [" Zweiter Satz."]);
+    }
+
+    /// REQ-STREAM-016 (T8c): ein Segment, das mit Satzzeichen beginnt, hängt ohne Leerzeichen an.
+    #[test]
+    fn live_leading_punctuation_is_attached_without_space() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || {
+                FakeStreaming::new(
+                    &[
+                        ("Satz eins", true),
+                        (".", true),
+                        ("Er sagte", true),
+                        (", dass …", true),
+                    ],
+                    "",
+                )
+            },
+            &log,
+        );
+        w.live_begin(None, &cfg);
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.extend(texts(w.live_chunk(&[0.0; 160])));
+        }
+        assert_eq!(got, ["Satz eins", ".", " Er sagte", ", dass …"]);
+    }
+
+    /// Grenzfälle T8c: erstes Segment beginnt mit Satzzeichen, Satzzeichen + Text in einem
+    /// Segment, mehrere Satzzeichen, Rest aus `finish`; das Satzzeichen geht nicht an das LLM.
+    #[test]
+    fn live_leading_punctuation_edge_cases_and_cleanup_skips_it() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Business);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || FakeStreaming::new(&[(". Danach", true), ("?!", true)], ", Rest"),
+            &log,
+        );
+        w.live_begin(None, &cfg);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), [". [Danach]"]);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["?!"]);
+        assert_eq!(texts(w.live_end()), [", [Rest]"]);
+        assert!(
+            log.borrow()
+                .iter()
+                .all(|l| !l.contains(['.', '?', '!', ','])),
+            "Satzzeichen im Cleanup: {:?}",
+            log.borrow()
+        );
+    }
+
+    /// Ohne Satzzeichen-Präfix bleibt alles beim Alten (Satzzeichen mitten im Text bleiben drin).
+    #[test]
+    fn live_text_without_leading_punctuation_is_unchanged() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[("A, b.", true)], "c"), &log);
+        w.live_begin(None, &cfg);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["A, b."]);
+        assert_eq!(texts(w.live_end()), [" c"]);
     }
 
     /// REQ-STREAM-011: Geschäftlich/Natürlich korrigieren jedes Segment einzeln.
