@@ -120,6 +120,45 @@ impl LogLevel {
     }
 }
 
+/// Erkennungssprache (REQ-DICT-024/-025): `Auto` ist der Default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    #[default]
+    Auto,
+    De,
+    En,
+}
+
+impl Language {
+    pub const ALL: [Language; 3] = [Language::Auto, Language::De, Language::En];
+
+    /// Anzeige in Settings und Messzeile.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::Auto => "Automatisch",
+            Language::De => "Deutsch",
+            Language::En => "Englisch",
+        }
+    }
+
+    /// Wert der sherpa-Option `language`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Language::Auto => "auto",
+            Language::De => "de",
+            Language::En => "en",
+        }
+    }
+
+    /// Wert von `LANGUAGE` (latency-eval): ohne Groß-/Kleinschreibung und
+    /// Randleerzeichen; leer oder unbekannt → `None`.
+    pub fn parse_env(raw: &str) -> Option<Self> {
+        let raw = raw.trim().to_ascii_lowercase();
+        Language::ALL.into_iter().find(|l| l.code() == raw)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -168,6 +207,8 @@ pub struct Config {
     pub endpoint_silence_ms: u32,
     /// Detailgrad der Logdatei (`~/Library/Logs/talker/talker.log`); `TALKER_LOG` übersteuert.
     pub log_level: LogLevel,
+    /// Erkennungssprache (auto/de/en); gilt ab der nächsten Dictation.
+    pub language: Language,
 }
 
 /// Default-Farben der Wellen: Weiß, Cyan, Blau, Violett (kühle Siri-Palette).
@@ -229,6 +270,7 @@ impl Default for Config {
             insert_mode: InsertMode::default(),
             endpoint_silence_ms: DEFAULT_ENDPOINT_SILENCE_MS,
             log_level: LogLevel::default(),
+            language: Language::default(),
         }
     }
 }
@@ -536,6 +578,77 @@ mod tests {
         }
         assert!(Config::parse("insert_mode = \"sofort\"").is_err());
         assert!(Config::parse("insert_mode = 3").is_err());
+    }
+
+    /// AK-8 / REQ-DICT-025: `language` = auto/de/en, Default Auto, fehlendes Feld → Auto.
+    #[test]
+    fn language_defaults_to_auto_and_roundtrips() {
+        assert_eq!(Language::ALL.len(), 3);
+        assert_eq!(Language::ALL, [Language::Auto, Language::De, Language::En]);
+        assert_eq!(Config::default().language, Language::Auto);
+        assert_eq!(
+            Config::parse("cleanup_mode = \"raw\"").unwrap().language,
+            Language::Auto
+        );
+        for lang in Language::ALL {
+            let cfg = Config {
+                language: lang,
+                ..Config::default()
+            };
+            let text = cfg.serialize().unwrap();
+            assert!(text.contains(&format!("language = \"{}\"", lang.code())));
+            assert_eq!(Config::parse(&text).unwrap().language, lang);
+        }
+    }
+
+    /// AK-8 Grenzfälle: leer, Groß-/Kleinschreibung, weitere Sprache, Zahl → Parse-Fehler.
+    #[test]
+    fn language_invalid_values_are_parse_errors() {
+        for bad in [
+            "language = \"\"",
+            "language = \"DE\"",
+            "language = \"fr\"",
+            "language = 1",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad} muss ein Fehler sein");
+        }
+    }
+
+    /// REQ-DICT-025: kaputtes `language` → Defaults, Datei bleibt unverändert.
+    #[test]
+    fn invalid_language_loads_defaults_and_keeps_the_file() {
+        let dir = std::env::temp_dir().join(format!("talker-language-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "language = \"fr\"\n").unwrap();
+        assert_eq!(Config::load_from(&path), Config::default());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "language = \"fr\"\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn language_code_and_label() {
+        let codes: Vec<_> = Language::ALL.iter().map(|l| l.code()).collect();
+        assert_eq!(codes, ["auto", "de", "en"]);
+        let labels: Vec<_> = Language::ALL.iter().map(|l| l.label()).collect();
+        assert_eq!(labels, ["Automatisch", "Deutsch", "Englisch"]);
+    }
+
+    /// `LANGUAGE` für latency-eval: Muster `LogLevel::parse_env`.
+    #[test]
+    fn language_parse_env_accepts_the_three_codes_only() {
+        assert_eq!(Language::parse_env("auto"), Some(Language::Auto));
+        assert_eq!(Language::parse_env("de"), Some(Language::De));
+        assert_eq!(Language::parse_env("en"), Some(Language::En));
+        assert_eq!(Language::parse_env(" DE "), Some(Language::De));
+        assert_eq!(Language::parse_env("Auto"), Some(Language::Auto));
+        assert_eq!(Language::parse_env(""), None);
+        assert_eq!(Language::parse_env("   "), None);
+        assert_eq!(Language::parse_env("fr"), None);
+        assert_eq!(Language::parse_env("deutsch"), None);
     }
 
     /// REQ-DIAG-003/-004: `log_level` — Default Info, fehlt → Info, unbekannter
