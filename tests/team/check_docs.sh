@@ -224,5 +224,8 @@ SPAWN=.claude/skills/spawn-worker/spawn.sh
 has "C9 spawn.sh Kopfkommentar nennt --kind und --instance" "$SPAWN" '^#   spawn\.sh \[--kind claude\|codex\] \[--instance\] <rolle>'
 lacks "C8 spawn.sh: Rollenliste nur einmal (kein ROLES_RE-Literal)" "$SPAWN" '^ROLES_RE="'
 assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-engineer' "$SPAWN")"
+for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)'; do
+  if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
+done
 
 th_summary

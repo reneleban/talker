@@ -34,10 +34,13 @@
     ],
     "deny": [
       "Bash(git push * main*)",
+      "Bash(git push *:main*)",
       "Bash(git push --force*)",
       "Bash(git push -f*)",
       "Bash(*--no-verify*)",
       "Bash(gh pr merge *--admin*)",
+      "Bash(gh api *merge*)",
+      "Bash(gh -R *)",
       "Bash(herdr pane *)",
       "Bash(herdr tab *)",
       "Bash(herdr workspace *)",
