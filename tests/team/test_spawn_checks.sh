@@ -30,6 +30,7 @@ assert_eq "init: Exit 0" 0 "$INPANE_RC"
 
 # --- Aufruf/Optionen → Exit 2 ---
 check "AK-11 ohne Argumente" 2 "Aufruf" "$SP"
+if printf '%s' "$INPANE_OUT" | grep -Eq ' 2$'; then fail "C2 Meldung enthält nicht den Exit-Code"; else ok "C2 Meldung enthält nicht den Exit-Code"; fi
 check "AK-11 zu wenige Argumente" 2 "Aufruf" "$SP rust-developer 0001"
 check "AK-11 zu viele Argumente" 2 "Aufruf" "$SP rust-developer 0001 chore/0001-x extra"
 check "AK-11 unbekannte Option" 2 "--bogus" "$SP --bogus rust-developer 0001 chore/0001-x"

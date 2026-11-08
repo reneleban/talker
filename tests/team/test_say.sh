@@ -20,6 +20,7 @@ run() { : >"$LOG"; inpane "PATH=$SHIM:\$PATH HERDR_LOG=$LOG $*"; }
 # --- Aufruffehler → Exit 2 (vor jeder Umgebungsprüfung) ---
 run "$SAY"
 assert_eq "AK-12 kein Argument: Exit 2" 2 "$INPANE_RC"
+if printf '%s' "$INPANE_OUT" | grep -Eq ' 2$'; then fail "C2 Meldung enthält nicht den Exit-Code"; else ok "C2 Meldung enthält nicht den Exit-Code"; fi
 run "$SAY ziel"
 assert_eq "AK-12 ein Argument: Exit 2" 2 "$INPANE_RC"
 run "$SAY ziel text extra"

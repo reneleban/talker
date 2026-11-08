@@ -7,7 +7,7 @@
 # SPAWN_READY_TIMEOUT_MS (Default 60000): Bereit-Frist (Test-Naht).
 set -eu
 
-die() { echo "spawn: $*" >&2; exit "${2:-1}"; }
+die() { echo "spawn: $1" >&2; exit "${2:-1}"; }
 
 MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 WT_ROOT="$(dirname "$MAIN")/talker-wt"

@@ -5,7 +5,7 @@
 # SAY_RETRY_TIMEOUT_MS (Default 20000): Wartezeit zwischen Versuchen bei blockiertem Ziel (Test-Naht).
 set -eu
 
-die() { echo "say: $*" >&2; exit "${2:-1}"; }
+die() { echo "say: $1" >&2; exit "${2:-1}"; }
 
 [ $# -eq 2 ] || die "Aufruf: say.sh <ziel> '<text>'" 2
 TARGET=$1; TEXT=$2
