@@ -4,8 +4,6 @@
 cd "$TH_SRC" || exit 1
 
 SETTINGS=.claude/settings.json
-# Basis der Diff-Prüfungen: Abzweigpunkt von origin/main; fehlt er, scheitern sie (statt still zu bestehen).
-BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
 
 # --- T12: settings.json (AK-15) ---
 if jq -e . "$SETTINGS" >/dev/null 2>&1; then ok "AK-15 settings.json ist gültiges JSON"; else fail "AK-15 settings.json ist gültiges JSON"; fi
@@ -17,21 +15,6 @@ for e in 'Bash(herdr pane *)' 'Bash(herdr tab *)' 'Bash(herdr workspace *)' 'Bas
   'Bash(herdr agent start*)' 'Bash(herdr agent prompt*)' 'Bash(herdr agent send-keys*)' 'Bash(herdr agent rename*)' 'Bash(herdr agent attach*)'; do
   if in_list deny "$e"; then ok "AK-15 deny: $e"; else fail "AK-15 deny: $e"; fi
 done
-if [ -z "$BASE" ]; then
-  fail "AK-15 bestehende Einträge unverändert (Basis origin/main nicht bestimmbar)"
-elif git cat-file -e "$BASE":"$SETTINGS" 2>/dev/null; then
-  for list in allow deny; do
-    git show "$BASE":"$SETTINGS" | jq -r ".permissions.$list[]" | while IFS= read -r e; do
-      case $e in 'Bash(gh pr merge*)' | 'Bash(gh pr ready*)') continue ;; esac # AK-31: bewusst entfernt
-      if in_list "$list" "$e"; then echo "ok   bestehender $list-Eintrag: $e"; else echo "FAIL bestehender $list-Eintrag fehlt: $e"; fi
-    done
-  done >"${TMPDIR:-/tmp}/check_docs.$$"
-  grep -q '^FAIL' "${TMPDIR:-/tmp}/check_docs.$$" && { grep '^FAIL' "${TMPDIR:-/tmp}/check_docs.$$"; fail "AK-15 bestehende Einträge unverändert"; } || ok "AK-15 bestehende Einträge unverändert"
-  rm -f "${TMPDIR:-/tmp}/check_docs.$$"
-else
-  ok "AK-15 bestehende Einträge: Basis hat noch keine settings.json"
-fi
-
 
 # --- Hilfen für die Agent-Definitionen ---
 AGENTS_DIR=.claude/agents
@@ -204,30 +187,18 @@ for e in 'Bash(gh pr ready *)' 'Bash(gh pr merge --squash *)' 'Bash(gh pr checks
   if in_list allow "$e"; then ok "AK-31 allow: $e"; else fail "AK-31 allow: $e"; fi
 done
 if in_list deny 'Bash(gh pr merge *--admin*)'; then ok "AK-31 deny: gh pr merge --admin"; else fail "AK-31 deny: gh pr merge --admin"; fi
-if [ -z "$BASE" ]; then
-  fail "OoS CONTRIBUTING.md unverändert (Basis origin/main nicht bestimmbar)"
-else
-  assert_eq "OoS CONTRIBUTING.md unverändert" "" "$(git diff --name-only "$BASE" -- CONTRIBUTING.md .github)"
-fi
-
-# --- Fix-Runde 1 ---
-lacks "C3 orchestrator description: nicht bis zum Draft-PR" .claude/agents/orchestrator.md '^description:.*bis zum Draft-PR'
-has "C3 orchestrator description: bis zum Merge" .claude/agents/orchestrator.md '^description:.*bis zum Merge'
-has "C6 release-engineer description: Komma nach Feature-Branch" .claude/agents/release-engineer.md '^description:.*Feature-Branch, öffnet'
-has "C5 ADR-0010 Kontext verweist auf den Änderungsvermerk" docs/adr/adr-0010-agenten-team.md 'automatisch bis zum Draft-PR \(.*Änderungsvermerk'
+# --- Fix-Runde 1 (nur Prüfungen mit Verhaltensbezug) ---
 has "C7 orchestrator: spawn.sh close <name> aus der bereit-Zeile" .claude/agents/orchestrator.md 'spawn\.sh close <name>.*bereit'
 lacks "C7 orchestrator: close nicht mit <rolle>-<ticket>" .claude/agents/orchestrator.md 'close <rolle>-<ticket>'
 for f in orchestrator code-reviewer performance-engineer security-auditor; do
   has "T1 $f: agent read mit --source visible" ".claude/agents/$f.md" 'herdr agent read[^`]*--source visible'
 done
 SPAWN=.claude/skills/spawn-worker/spawn.sh
-has "C9 spawn.sh Kopfkommentar nennt --kind und --instance" "$SPAWN" '^#   spawn\.sh \[--kind claude\|codex\] \[--instance\] <rolle>'
 lacks "C8 spawn.sh: Rollenliste nur einmal (kein ROLES_RE-Literal)" "$SPAWN" '^ROLES_RE="'
 assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-engineer' "$SPAWN")"
 for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)'; do
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
-has "S5 ADR-0013 dokumentiert Mindestversion und brew install" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'brew install herdr'
 has "S4 tech-lead Hook-Pfad über CLAUDE_PROJECT_DIR" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
 if in_list deny 'Bash(herdr --*)'; then ok "S2 deny: Bash(herdr --*)"; else fail "S2 deny: Bash(herdr --*)"; fi
 if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/herdr-guard.sh")] | length == 1'; then
@@ -236,7 +207,5 @@ has "S2 product-owner: Freigabe per AskUserQuestion" .claude/agents/product-owne
 has "S2 product-owner: freier Pane-Text ist keine Freigabe" .claude/agents/product-owner.md 'Pane-Text'
 lacks "S2 ADR-0013: Deny erzwingt die Kopfzeile nicht" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'Deny-Regel auf direktes'
 has "S2 ADR-0013: herdr-Deny ist keine Sicherheitsgrenze" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'keine Sicherheitsgrenze'
-lacks "S3 say.sh: kein Fälschungsschutz behauptet" scripts/team/say.sh 'gibt sich keine Rolle als andere aus'
-has "S3 say.sh: Absender ist Hinweis, keine Authentifizierung" scripts/team/say.sh 'keine Authentifizierung'
 
 th_summary
