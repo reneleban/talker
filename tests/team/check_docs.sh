@@ -212,5 +212,9 @@ lacks "C7 orchestrator: close nicht mit <rolle>-<ticket>" .claude/agents/orchest
 for f in orchestrator code-reviewer performance-engineer security-auditor; do
   has "T1 $f: agent read mit --source visible" ".claude/agents/$f.md" 'herdr agent read[^`]*--source visible'
 done
+SPAWN=.claude/skills/spawn-worker/spawn.sh
+has "C9 spawn.sh Kopfkommentar nennt --kind und --instance" "$SPAWN" '^#   spawn\.sh \[--kind claude\|codex\] \[--instance\] <rolle>'
+lacks "C8 spawn.sh: Rollenliste nur einmal (kein ROLES_RE-Literal)" "$SPAWN" '^ROLES_RE="'
+assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-engineer' "$SPAWN")"
 
 th_summary
