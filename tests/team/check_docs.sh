@@ -227,6 +227,7 @@ assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-e
 for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)'; do
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
+has "S5 ADR-0013 dokumentiert Mindestversion und brew install" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'brew install herdr'
 has "S4 tech-lead Hook-Pfad über CLAUDE_PROJECT_DIR" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
 if in_list deny 'Bash(herdr --*)'; then ok "S2 deny: Bash(herdr --*)"; else fail "S2 deny: Bash(herdr --*)"; fi
 if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/herdr-guard.sh")] | length == 1'; then

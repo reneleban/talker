@@ -27,6 +27,17 @@ assert_contains "AK-4 ohne claude: Meldung nennt claude" "claude fehlt im PATH" 
 out=$(cd "$TH_REPO" && PATH="$BIN/ohne-jq" TEAM_SESSION=$TS /bin/sh "$DEV" 2>&1 </dev/null); rc=$?
 assert_eq "AK-4 ohne jq: Exit 1" 1 "$rc"
 assert_contains "AK-4 ohne jq: Meldung nennt jq" "jq fehlt im PATH" "$out"
+# S5: Mindestversion 0.9.5
+for v in 0.9.4 0.8.12 "" unbekannt; do
+  mkdir -p "$BIN/alt-herdr"
+  printf '#!/bin/sh\n[ "$1" = --version ] && echo "herdr %s"\nexit 0\n' "$v" >"$BIN/alt-herdr/herdr"
+  chmod +x "$BIN/alt-herdr/herdr"
+  ln -sf "$(command -v claude)" "$BIN/alt-herdr/claude"
+  out=$(cd "$TH_REPO" && PATH="$BIN/alt-herdr:$BASE" TEAM_SESSION=$TS sh "$DEV" 2>&1 </dev/null); rc=$?
+  assert_eq "S5 Version '$v': Exit 1" 1 "$rc"
+  assert_contains "S5 Version '$v': Meldung nennt 0.9.5" "0.9.5" "$out"
+  assert_contains "S5 Version '$v': Meldung nennt die Installation" "brew install" "$out"
+done
 if th_session_exists; then fail "AK-4: Fehlerpfad startet keine Session"; else ok "AK-4: Fehlerpfad startet keine Session"; fi
 
 # --- AK-1: Session + Orchestrator, ohne TTY (stdout in Datei) → attach scheitert erwartet ---

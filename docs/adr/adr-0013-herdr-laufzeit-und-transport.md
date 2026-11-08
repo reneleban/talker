@@ -21,6 +21,8 @@ mit Status je Rolle.
 Geprüft an `herdr` 0.9.5 (`herdr --version`, `herdr --skill`, CLI-Referenz
 v0.9.5 [1]) in Wegwerf-Sessions `arch-probe`/`arch-probe-2`, die danach gestoppt
 und gelöscht wurden. Belege stehen im Ticket-0043, Abschnitt `## architect`.
+Voraussetzung ist `herdr` ab 0.9.5 (Installation: `brew install herdr`); `make dev` prüft die Version
+per `herdr --version` und bricht darunter ab.
 
 ## Entscheidung
 

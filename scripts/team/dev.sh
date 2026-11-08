@@ -9,6 +9,11 @@ for prog in herdr claude jq; do
   command -v "$prog" >/dev/null 2>&1 || die "$prog fehlt im PATH"
 done
 
+MIN_HERDR=0.9.5
+HERDR_VERSION=$(herdr --version 2>/dev/null | sed -n 's/^herdr \([0-9][0-9.]*\).*/\1/p' | head -n 1)
+[ -n "$HERDR_VERSION" ] && [ "$(printf '%s\n%s\n' "$MIN_HERDR" "$HERDR_VERSION" | sort -V | head -n 1)" = "$MIN_HERDR" ] \
+  || die "herdr >= $MIN_HERDR nötig (gefunden: ${HERDR_VERSION:-unbekannt}), Installation/Update: brew install herdr"
+
 S=${TEAM_SESSION:-talker}
 MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 h() { herdr --session "$S" "$@"; }
