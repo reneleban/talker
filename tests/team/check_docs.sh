@@ -205,5 +205,6 @@ assert_eq "OoS CONTRIBUTING.md unverändert" "" "$(git diff --name-only a08241b 
 # --- Fix-Runde 1 ---
 lacks "C3 orchestrator description: nicht bis zum Draft-PR" .claude/agents/orchestrator.md '^description:.*bis zum Draft-PR'
 has "C3 orchestrator description: bis zum Merge" .claude/agents/orchestrator.md '^description:.*bis zum Merge'
+has "C6 release-engineer description: Komma nach Feature-Branch" .claude/agents/release-engineer.md '^description:.*Feature-Branch, öffnet'
 
 th_summary
