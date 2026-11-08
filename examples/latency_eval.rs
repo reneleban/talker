@@ -317,7 +317,13 @@ where
     let (tx, rx) = channel();
     let recording =
         audio::start(Box::new(source), live.then_some(tx)).map_err(|e| e.to_string())?;
-    let mut trace = DictationTrace::new(1, pressed_at, insert, cleanup);
+    let mut trace = DictationTrace::new(
+        1,
+        pressed_at,
+        insert,
+        cleanup,
+        talker::config::Language::Auto,
+    );
     trace.mic_ready_at = Some(HostInstant::now());
 
     let mut injected = String::new();
