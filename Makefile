@@ -3,6 +3,7 @@
 APP_DEST ?= $(HOME)/Applications
 N ?= 10
 LATENCY_OUT ?=
+LANGUAGE ?=
 
 .PHONY: help verify build test clippy bundle install cert stress run latency-eval team-test dev
 
@@ -45,8 +46,8 @@ stt-eval: ## STT-Qualitäts-Testreihe (EVAL-0002); Fixtures: scripts/gen_stt_fix
 pipeline-ab: ## Pipeline-Vergleich A/B/C (EVAL-0003): Nemotron vs +Gemma vs Gemma-Audio
 	cargo run --release --example pipeline_ab
 
-latency-eval: ## Latenz-Messreihe (Ticket 0038): N=10 Läufe/Fall (N=3 = Schnelllauf), LATENCY_OUT=<datei>; ohne Gemma nur Roh
-	N="$(N)" LATENCY_OUT="$(LATENCY_OUT)" cargo run --release --example latency_eval
+latency-eval: ## Latenz-Messreihe (Ticket 0038): N=10 Läufe/Fall (N=3 = Schnelllauf), LATENCY_OUT=<datei>, LANGUAGE=auto|de|en (Default auto); ohne Gemma nur Roh
+	N="$(N)" LATENCY_OUT="$(LATENCY_OUT)" LANGUAGE="$(LANGUAGE)" cargo run --release --example latency_eval
 
 dev: ## Team-Einstieg: herdr-Session talker starten (Orchestrator), verbinden (ADR-0013)
 	sh scripts/team/dev.sh
