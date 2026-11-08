@@ -46,7 +46,9 @@ SHIM="$TH_TMP/bin/attach-shim"
 mkdir -p "$SHIM"
 printf '#!/bin/sh\nif [ "$1" = session ] && [ "$2" = attach ]; then echo "SHIM-ATTACH-ABGELEHNT"; exit 1; fi\nexec "%s" "$@"\n' "$(command -v herdr)" >"$SHIM/herdr"
 chmod +x "$SHIM/herdr"
-(cd "$TH_REPO" && env -u HERDR_ENV -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID PATH="$SHIM:$PATH" TEAM_SESSION=$TS sh "$DEV" >"$TH_TMP/dev1.out" 2>&1 </dev/null); rc=$?
+# für den ganzen Rest des Skripts (auch run_dev): kein dev.sh-Aufruf erreicht ein echtes `session attach`
+PATH="$SHIM:$PATH"; export PATH
+(cd "$TH_REPO" && env -u HERDR_ENV -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID TEAM_SESSION=$TS sh "$DEV" >"$TH_TMP/dev1.out" 2>&1 </dev/null); rc=$?
 assert_eq "AK-1 attach (Shim) endet mit Exit 1" 1 "$rc"
 grep -E '^dev:|^\{"error' "$TH_TMP/dev1.out" | sed 's/^/       /' || true
 assert_contains "AK-1 attach wurde aufgerufen (Shim-Meldung)" "SHIM-ATTACH-ABGELEHNT" "$(cat "$TH_TMP/dev1.out")"
