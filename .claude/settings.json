@@ -67,7 +67,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/herdr-guard.sh\" || exit 2"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/pane-guard.sh\" || exit 2"
           }
         ]
       }

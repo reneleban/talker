@@ -2,8 +2,8 @@
 # S2: Bash-Wächter gegen direkte herdr-Aufrufe (alle Rollen). Reiner stdin→Exit-Code-Test, ohne herdr.
 . "$(dirname "$0")/lib.sh"
 
-HOOK="$TH_SRC/.claude/hooks/herdr-guard.sh"
-TMP=$(mktemp -d "${TMPDIR:-/tmp}/herdr-guard.XXXXXX")
+HOOK="$TH_SRC/.claude/hooks/pane-guard.sh"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/pane-guard.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 hook() { # <name> <erwarteter Exit> <command>
@@ -124,6 +124,23 @@ hook "N5 erlaubt: say.sh, ( vor dem Token im Fließtext" 0 "sh scripts/team/say.
 hook "N5 erlaubt: git commit -m mit Klammer vor dem Token" 0 "git commit -m 'fix(guard): (herdr) Positivliste'"
 hook "N5 erlaubt: rg mit herdr" 0 "rg -n herdr docs"
 hook "N5 erlaubt: git log --grep=herdr" 0 "git log --oneline --grep=herdr"
+
+# --- R9: spawn.sh frei, auch mit dem Token im Branch-Namen (Feature-Branch dieses Tickets) ---
+hook "R9 erlaubt: spawn.sh init mit Token im Branch" 0 "sh .claude/skills/spawn-worker/spawn.sh init 0043 chore/0043-parallele-sessions-herdr"
+hook "R9 erlaubt: spawn.sh Rolle mit Token im Branch" 0 "sh .claude/skills/spawn-worker/spawn.sh release-engineer 0043 chore/0043-parallele-sessions-herdr"
+hook "R9 verboten: spawn.sh, danach zweiter Befehl mit Token" 2 "sh .claude/skills/spawn-worker/spawn.sh init 0043 chore/0043-herdr; herdr pane close p1"
+hook "R9 verboten: anderes Skript mit Token im Branch" 2 "sh .claude/skills/spawn-worker/other.sh init 0043 chore/0043-parallele-sessions-herdr"
+
+# --- Q1: zsh =( ), (e: ) und (+ ) sind Ausführung im Argument ---
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  hook "Q1 verboten: $c" 2 "$c"
+done <<'EOF'
+grep x =(herdr agent prompt po ja)
+rg x =(herdr pane list)
+grep x pro*(e:herdr pane close p1:)
+grep x pro*(+herdr_fn)
+EOF
 
 # --- kaputte Eingabe ---
 printf '%s' 'kein json' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: Eingabe ist kein JSON (fail-closed)" 2 $?

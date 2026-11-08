@@ -39,9 +39,13 @@ while [ $i -lt 120 ]; do
 done
 assert_contains "AK-15 say.sh geht durch: Meldung kommt mit Kopfzeile an" "[talker von tech-lead-0001] HOOKTEST-OK" "$SEEN"
 
-TL=$(th_h agent read tech-lead-0001 --source recent-unwrapped --lines 200 | tr -s ' \n' ' ')
+TL=$(th_h agent read tech-lead-0001 --source visible | tr -s ' \n' ' ')
 [ ! -e "$FORBID" ] && ok "AK-15 fremder Bash-Befehl (touch) wurde nicht ausgeführt" || fail "AK-15 fremder Bash-Befehl (touch) wurde ausgeführt"
-assert_contains "AK-15 genau ein Bash-Befehl lief (say.sh), der fremde wurde vom Hook abgelehnt" "Ran 1 shell command" "$TL"
-assert_not_contains "AK-15 nicht zwei Bash-Befehle ausgeführt" "Ran 2 shell commands" "$TL"
+# Haiku verzichtet mal selbst auf den fremden Befehl („Ran 1 shell command"), mal lehnt ihn der Hook ab
+# („Ran 2 shell commands", davon „1 action not run"). Beides: der fremde Befehl lief nicht, nur say.sh.
+case $TL in
+  *"Ran 1 shell command"*|*"1 action not run"*) ok "AK-15 nur say.sh lief, der fremde Befehl wurde nicht ausgeführt" ;;
+  *) fail "AK-15 weder 'Ran 1 shell command' noch '1 action not run' in: $TL" ;;
+esac
 
 th_summary

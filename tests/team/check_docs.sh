@@ -202,8 +202,8 @@ for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)' 'Bash(g
 done
 has "S4/N3 tech-lead Hook: Pfad über CLAUDE_PROJECT_DIR, fail-closed" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR/\.claude/hooks/say-only\.sh" \|\| exit 2$'
 if in_list deny 'Bash(herdr --*)'; then ok "S2 deny: Bash(herdr --*)"; else fail "S2 deny: Bash(herdr --*)"; fi
-if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/herdr-guard.sh\" || exit 2")] | length == 1'; then
-  ok "S2 settings.json: PreToolUse-Hook herdr-guard.sh für Bash"; else fail "S2 settings.json: PreToolUse-Hook herdr-guard.sh für Bash"; fi
+if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/pane-guard.sh\" || exit 2")] | length == 1'; then
+  ok "S2 settings.json: PreToolUse-Hook pane-guard.sh für Bash"; else fail "S2 settings.json: PreToolUse-Hook pane-guard.sh für Bash"; fi
 has "S2 product-owner: Freigabe per AskUserQuestion" .claude/agents/product-owner.md 'per `AskUserQuestion`'
 has "N4 product-owner: Änderungen ist die erste Option, Freigeben nie zuerst" .claude/agents/product-owner.md 'Optionen „Änderungen" \(erste\) / „Freigeben"'
 has "S2 product-owner: freier Pane-Text ist keine Freigabe" .claude/agents/product-owner.md 'Pane-Text'

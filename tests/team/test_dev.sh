@@ -40,11 +40,16 @@ for v in 0.9.4 0.8.12 "" unbekannt; do
 done
 if th_session_exists; then fail "AK-4: Fehlerpfad startet keine Session"; else ok "AK-4: Fehlerpfad startet keine Session"; fi
 
-# --- AK-1: Session + Orchestrator, ohne TTY (stdout in Datei) → attach scheitert erwartet ---
-(cd "$TH_REPO" && env -u HERDR_ENV -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID TEAM_SESSION=$TS sh "$DEV" >"$TH_TMP/dev1.out" 2>&1 </dev/null); rc=$?
-assert_eq "AK-1 ohne TTY endet attach mit Exit ≠ 0" 1 "$([ "$rc" -ne 0 ] && echo 1 || echo 0)"
+# --- AK-1: Session + Orchestrator; PATH-Shim: `session attach` endet mit Exit 1 und fester Meldung (kein Hängen im
+#     echten Terminal), alles andere geht per exec ans echte Programm ---
+SHIM="$TH_TMP/bin/attach-shim"
+mkdir -p "$SHIM"
+printf '#!/bin/sh\nif [ "$1" = session ] && [ "$2" = attach ]; then echo "SHIM-ATTACH-ABGELEHNT"; exit 1; fi\nexec "%s" "$@"\n' "$(command -v herdr)" >"$SHIM/herdr"
+chmod +x "$SHIM/herdr"
+(cd "$TH_REPO" && env -u HERDR_ENV -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID PATH="$SHIM:$PATH" TEAM_SESSION=$TS sh "$DEV" >"$TH_TMP/dev1.out" 2>&1 </dev/null); rc=$?
+assert_eq "AK-1 attach (Shim) endet mit Exit 1" 1 "$rc"
 grep -E '^dev:|^\{"error' "$TH_TMP/dev1.out" | sed 's/^/       /' || true
-assert_contains "AK-1 attach scheitert am Terminal" "usable terminal" "$(cat "$TH_TMP/dev1.out")"
+assert_contains "AK-1 attach wurde aufgerufen (Shim-Meldung)" "SHIM-ATTACH-ABGELEHNT" "$(cat "$TH_TMP/dev1.out")"
 
 if th_session_exists; then ok "AK-1 Server läuft nach dem Ende des Skripts (A1)"; else fail "AK-1 Server läuft nach dem Ende des Skripts (A1)"; fi
 ORCH='.result.agents[] | select(.name == "orchestrator")'
