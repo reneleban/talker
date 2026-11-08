@@ -378,6 +378,41 @@ fn assert_first_word_present(insert_mode: InsertMode, set: FixtureSet) {
     assert!(report.is_empty(), "{}", report.join("\n\n"));
 }
 
+/// Benannte Ausnahmen: laufen mit und werden ausgegeben, aber nicht geprüft (Entscheidung A1).
+const FIRST_WORD_EXEMPTIONS: [(Language, &str, &str); 2] = [
+    (
+        Language::Auto,
+        "dev-java",
+        "Sprachwahl des Modells bei auto, belegt Runde 3",
+    ),
+    (
+        Language::Auto,
+        "fleurs-de-03",
+        "Sprachwahl des Modells bei auto, belegt Runde 3",
+    ),
+];
+
+fn exemption(language: Language, clip: &str) -> Option<&'static str> {
+    FIRST_WORD_EXEMPTIONS
+        .iter()
+        .find(|(l, name, _)| *l == language && *name == clip)
+        .map(|(_, _, reason)| *reason)
+}
+
+#[test]
+fn exemptions_apply_only_to_the_named_clip_under_auto() {
+    assert!(exemption(Language::Auto, "dev-java").is_some());
+    assert!(exemption(Language::Auto, "fleurs-de-03").is_some());
+    // Unter `de` bleiben beide scharf, ebenso `en`, andere Clips und fleurs-de-13.
+    for language in [Language::De, Language::En] {
+        assert!(exemption(language, "dev-java").is_none());
+        assert!(exemption(language, "fleurs-de-03").is_none());
+    }
+    assert!(exemption(Language::Auto, "fleurs-de-13").is_none());
+    assert!(exemption(Language::Auto, "dev-node").is_none());
+    assert!(exemption(Language::Auto, "").is_none());
+}
+
 /// `Some(Tabelle)` mit den Fehlfällen, `None` wenn alle Clips das erste Wort haben.
 fn first_word_failures(
     insert_mode: InsertMode,
@@ -393,6 +428,13 @@ fn first_word_failures(
         let result = pieces.concat();
         let got = normalize_words(&result).into_iter().next();
         if got.as_deref() != Some(expected.as_str()) {
+            if let Some(reason) = exemption(language, &name) {
+                println!(
+                    "ausgenommen ({reason}): {name} · {language:?}: {expected} → {} · {result:?}",
+                    got.as_deref().unwrap_or("—")
+                );
+                continue;
+            }
             failures.push(format!(
                 "| {name} | {expected} | {} | {} | {result:?} |",
                 got.as_deref().unwrap_or("—"),
