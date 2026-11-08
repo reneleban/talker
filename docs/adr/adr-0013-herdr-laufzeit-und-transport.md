@@ -109,12 +109,13 @@ Status von ADR-0010.
   hinge der Absender am Turn des Empfängers.
 - Der neue Transport ist an herdr gebunden. Rückweg ist ein Revert.
 - Die Kopfzeile ist eine Verhaltensregel, keine technische Sperre. Die Deny-Regeln auf direktes
-  `herdr …` und der PreToolUse-Hook `herdr-guard.sh` (lehnt jeden Bash-Befehl mit dem Token `herdr`
-  ab außer `herdr agent list|get|read|wait`) machen das Weglassen schwerer; sie sind aber
+  `herdr …` und der PreToolUse-Hook `herdr-guard.sh` (lehnt jeden Bash-Befehl ab, der `herdr` in Befehlsposition
+  nennt, ohne Rücksicht auf Groß-/Kleinschreibung, außer `herdr agent list|get|read|wait`) machen das Weglassen schwerer; sie sind aber
   keine Sicherheitsgrenze (verschleierte Aufrufe, andere Wege auf den herdr-Socket). Deshalb gilt die
   Spec-Freigabe nur, wenn der Mensch sie auf eine `AskUserQuestion` des PO gibt, nie aus freiem
-  Pane-Text. Freigaben gelten nur über die Akte. Folge des Hooks: Auch ein Befehl, der `herdr` nur
-  als Text enthält (z. B. eine Commit-Nachricht), wird abgelehnt.
+  Pane-Text. Freigaben gelten nur über die Akte. Folge des Hooks: Steht `herdr` nur als Argument
+  (grep, Commit-Nachricht, `say.sh`-Text, PR-Titel), bleibt der Befehl frei; nur ein Zeilenumbruch
+  gefolgt von `herdr` (etwa in einer mehrzeiligen Commit-Nachricht) gilt als neuer Befehl und wird abgelehnt.
 - Nach einem Neustart des herdr-Servers stellt herdr das Layout wieder her und
   kann Claude per `claude --resume <id>` wieder aufnehmen, dann aber ohne
   herdr-Namen [5]. `dev.sh` benennt einen solchen Orchestrator um, statt einen

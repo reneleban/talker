@@ -47,6 +47,30 @@ herdr pane close p1"
 hook "verboten: herdr agent listing (kein Wortende)" 2 "herdr agent listing"
 hook "verboten: herdr als Argument eines anderen Befehls" 2 "echo x; herdr agent prompt x y"
 
+# --- N1: Groß-/Kleinschreibung (APFS) ---
+hook "verboten: HERDR agent prompt" 2 "HERDR agent prompt x y"
+hook "verboten: Herdr --session" 2 "Herdr --session talker agent send-keys x y"
+hook "verboten: HERDR agent list | cat" 2 "HERDR agent list | cat"
+
+# --- R1: Token nur in Befehlsposition, Argumente frei ---
+hook "erlaubt: grep mit herdr im Text" 0 "grep -rn herdr docs"
+hook "erlaubt: git log --grep herdr" 0 "git log --grep herdr"
+hook "erlaubt: git commit -m mit herdr agent prompt" 0 "git commit -m 'fix: herdr agent prompt gesperrt'"
+hook "erlaubt: git commit -m, Text beginnt mit herdr" 0 "git commit -m \"herdr agent prompt\""
+hook "erlaubt: say.sh mit herdr-Lesebefehl im Text" 0 "sh scripts/team/say.sh orchestrator 'lies mit herdr agent read x'"
+hook "erlaubt: gh pr create --title mit herdr" 0 "gh pr create --draft --title 'chore: herdr guard'"
+hook "erlaubt: gh pr merge --subject mit herdr" 0 "gh pr merge --squash --subject 'fix: herdr agent prompt'"
+hook "erlaubt: cat Pfad mit /herdr" 0 "cat docs/herdr"
+hook "verboten: nach ; ohne Leerzeichen" 2 "git status;herdr pane close p1"
+hook "verboten: nach &&" 2 "git status && herdr pane close p1"
+hook "verboten: in Subshell" 2 "(herdr pane close p1)"
+hook "verboten: in \$( )" 2 "echo \$(herdr pane close p1)"
+hook "verboten: in Backticks" 2 "echo \`herdr pane close p1\`"
+hook "verboten: bash -c mit Doppelanführungszeichen" 2 "bash -c \"herdr pane close p1\""
+hook "verboten: env mit Variablen" 2 "env A=1 herdr pane close p1"
+hook "verboten: Pfad am Befehlsanfang" 2 "/opt/homebrew/bin/herdr pane close p1"
+hook "verboten: Pfad nach ;" 2 "x; ~/.local/bin/herdr pane close p1"
+
 # --- kaputte Eingabe ---
 printf '%s' 'kein json' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: Eingabe ist kein JSON (fail-closed)" 2 $?
 printf '' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: leere Eingabe (fail-closed)" 2 $?
