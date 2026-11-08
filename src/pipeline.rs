@@ -214,6 +214,7 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
         let Some(transcriber) = self.transcriber.as_mut() else {
             return Outcome::Rejected("Kein STT-Modell");
         };
+        transcriber.set_language(cfg.language);
         // Cleaner nur im LLM-Modus übergeben: aufgelöstes Raw darf einen
         // (für andere Apps) geladenen Cleaner nicht anwenden.
         let cleaner_ref = resolved
@@ -315,6 +316,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         let Some(transcriber) = self.transcriber.as_mut() else {
             return LiveStart::Unavailable;
         };
+        transcriber.set_language(cfg.language);
         transcriber.begin();
         if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
             self.load_cleaner_timed();
@@ -656,6 +658,15 @@ where
     C: LlmCleaner,
 {
     let mut delivery = Delivery::default();
+    // Die Sprache gilt vom Tastendruck (`DictationTrace.language`), nicht von der Config beim Job.
+    let language = match &job {
+        SttJob::Utterance { trace, .. } => trace.language,
+        SttJob::Live { feed } => feed.trace.language,
+    };
+    let cfg = &Config {
+        language,
+        ..cfg.clone()
+    };
     // Reste eines früheren, nicht abgeholten Auftrags verwerfen.
     if let Some((_, tap)) = debug {
         tap.take();
@@ -930,7 +941,13 @@ impl PttSession {
         on_ready: impl FnOnce(MicReady) + Send + 'static,
     ) -> PressOutcome {
         self.nr += 1;
-        let mut trace = DictationTrace::new(self.nr, pressed_at, cfg.insert_mode, cfg.cleanup_mode);
+        let mut trace = DictationTrace::new(
+            self.nr,
+            pressed_at,
+            cfg.insert_mode,
+            cfg.cleanup_mode,
+            cfg.language,
+        );
         if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
             trace.result = DictationResult::Blocked;
             (self.report)(trace);
@@ -2378,6 +2395,7 @@ mod tests {
             audio::HostInstant::from_nanos(1_000),
             cfg.insert_mode,
             cfg.cleanup_mode,
+            cfg.language,
         ))
     }
 
@@ -3672,5 +3690,158 @@ mod tests {
             .expect("Dictation hängt am blockierenden Log-Backend");
         assert_eq!(result, DictationResult::Inserted);
         assert_eq!(injected, ["hallo"]);
+    }
+
+    // ---- Sprache im Worker (0039 T4, REQ-DICT-024/-027) ----
+
+    use crate::config::Language;
+
+    type LanguageLog = Rc<RefCell<Vec<Language>>>;
+
+    /// Transcriber-Fake, der jedes `set_language` protokolliert.
+    struct LanguageStt {
+        seen: LanguageLog,
+    }
+
+    impl Transcriber for LanguageStt {
+        fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
+            Ok("hallo".into())
+        }
+        fn set_language(&mut self, language: Language) {
+            self.seen.borrow_mut().push(language);
+        }
+    }
+
+    impl StreamingTranscriber for LanguageStt {
+        fn begin(&mut self) {}
+        fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+            Ok(crate::stt::StreamUpdate {
+                text: String::new(),
+                endpoint: false,
+            })
+        }
+        fn finish(&mut self) -> crate::error::Result<String> {
+            Ok("hallo".into())
+        }
+    }
+
+    /// Worker mit Sprach-Fake; liefert Sprach-Log und Zähler der `load_transcriber`-Aufrufe.
+    fn language_worker(
+        cfg: &Config,
+    ) -> (
+        DictationWorker<LanguageStt, ScriptedCleaner>,
+        LanguageLog,
+        Rc<RefCell<usize>>,
+    ) {
+        let seen = LanguageLog::default();
+        let loads = Rc::new(RefCell::new(0usize));
+        let (s, l) = (Rc::clone(&seen), Rc::clone(&loads));
+        let w = DictationWorker::new(
+            cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(move |_: &Path| {
+                *l.borrow_mut() += 1;
+                Ok(LanguageStt {
+                    seen: Rc::clone(&s),
+                })
+            }),
+            Box::new(|| (None::<ScriptedCleaner>, false)),
+        );
+        (w, seen, loads)
+    }
+
+    fn language_cfg(insert_mode: InsertMode, language: Language) -> Config {
+        Config {
+            insert_mode,
+            cleanup_mode: CleanupMode::Raw,
+            language,
+            ..Config::default()
+        }
+    }
+
+    /// AK-7/AK-9: Batch (`handle`) und Live (`live_begin`) übergeben je Wert die Sprache der Config.
+    #[test]
+    fn worker_passes_the_configured_language_on_batch_and_live() {
+        for language in [Language::Auto, Language::De, Language::En] {
+            let cfg = language_cfg(InsertMode::AtEnd, language);
+            let (mut w, seen, _) = language_worker(&cfg);
+            w.handle(&[0.0; 1600], None, &cfg);
+            assert_eq!(*seen.borrow(), vec![language], "Batch {language:?}");
+
+            let cfg = language_cfg(InsertMode::PerSentence, language);
+            let (mut w, seen, _) = language_worker(&cfg);
+            assert_eq!(w.live_begin(None, &cfg), LiveStart::Started);
+            assert_eq!(*seen.borrow(), vec![language], "Live {language:?}");
+        }
+    }
+
+    /// AK-9: Sprachwechsel zwischen zwei Jobs wirkt im 2. Job, ohne das Modell neu zu laden.
+    #[test]
+    fn language_change_between_jobs_applies_without_reloading() {
+        let cfg = language_cfg(InsertMode::AtEnd, Language::De);
+        let (mut w, seen, loads) = language_worker(&cfg);
+        w.handle(&[0.0; 1600], None, &cfg);
+        let cfg = Config {
+            language: Language::En,
+            ..cfg
+        };
+        w.handle(&[0.0; 1600], None, &cfg);
+        assert_eq!(*seen.borrow(), vec![Language::De, Language::En]);
+        assert_eq!(*loads.borrow(), 1, "kein Neuladen bei Sprachwechsel");
+    }
+
+    /// AK-9: Ändert sich die Config zwischen Press und Job, zählt die Sprache vom Press
+    /// (`DictationTrace.language`) — Batch und Live.
+    #[test]
+    fn process_job_uses_the_language_of_the_press() {
+        let press = language_cfg(InsertMode::AtEnd, Language::De);
+        let later = Config {
+            language: Language::En,
+            ..press.clone()
+        };
+        let (mut w, seen, _) = language_worker(&press);
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&press),
+            &later,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(*seen.borrow(), vec![Language::De]);
+        assert_eq!(trace.language, Language::De);
+
+        let press = language_cfg(InsertMode::PerSentence, Language::De);
+        let later = Config {
+            language: Language::En,
+            ..press.clone()
+        };
+        let (mut w, seen, _) = language_worker(&press);
+        process_job(
+            &mut w,
+            live_job(&press, 1),
+            &later,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(*seen.borrow(), vec![Language::De]);
+    }
+
+    /// REQ-DIAG-018: kein Transcript in der Messzeile, auch nicht mit Sprache.
+    #[test]
+    fn trace_line_with_language_has_no_transcript() {
+        let cfg = language_cfg(InsertMode::AtEnd, Language::En);
+        let (mut w, _, _) = language_worker(&cfg);
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        let line = trace.to_string();
+        assert!(line.contains("Sprache: Englisch"), "{line}");
+        assert!(!line.contains("hallo"), "{line}");
     }
 }
