@@ -435,7 +435,7 @@ first_word_case!(
 );
 
 /// REQ-DIAG-033: zwei Sätze mit kurzer Pause, Satzweise → das erste Wort des zweiten Satzes
-/// steht am Anfang des zuletzt eingefügten Stücks.
+/// steht am Anfang des Textes aller Stücke nach dem ersten.
 #[test]
 #[ignore = "bekannt: erste Wörter des zweiten Satzes fehlen nach der Pause (3 von 3 Paaren, z. B. »Hast du schon« fehlt), Behebung in 0039"]
 fn first_word_of_the_second_sentence_survives_the_pause() {
@@ -458,9 +458,10 @@ fn first_word_of_the_second_sentence_survives_the_pause() {
         pcm.extend(read_pcm(&b));
         let expected = first_word(&reference(&b)).expect("Referenz ohne Wort");
         let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence);
-        let last_first = pieces
-            .last()
-            .and_then(|p| normalize_words(p).into_iter().next());
+        // REQ-DIAG-033: das erste Wort des zweiten Satzes steht im Text aller Stücke nach dem ersten.
+        let last_first = normalize_words(&pieces.get(1..).unwrap_or_default().concat())
+            .into_iter()
+            .next();
         if pieces.len() < 2 || last_first.as_deref() != Some(expected.as_str()) {
             failures.push(format!(
                 "| {first} + {second} | {expected} | {} | {} | {pieces:?} |",
@@ -500,26 +501,111 @@ fn model_tap_holds_exactly_the_model_input_including_silence() {
     t.transcribe(&[]).unwrap();
     assert!(tap.take().is_empty());
 
-    // Live mit Pause: Vorlauf, alle Chunks, 6400 Nullen nach dem Endpoint-Reset, Nachlauf.
+    // Live mit Pause: Vorlauf, alle Chunks lückenlos (keine Stille nach dem Reset), Nachlauf.
     let mut pcm = sentence.clone();
     pcm.extend(std::iter::repeat_n(0.0, 24_000));
     pcm.extend_from_slice(&sentence);
     let (updates, _) = stream(&mut t, &pcm);
-    let endpoints = updates.iter().filter(|u| u.endpoint).count();
-    assert_eq!(endpoints, 1);
-    let live = tap.take();
-    // Jeder Reset (auch einer ohne Text) hängt 6400 Nullen an — mindestens einer je Endpoint.
-    let extra = live.len() - (LEAD + pcm.len() + TAIL);
-    assert_eq!(extra % LEAD, 0, "Rest {extra}");
-    assert!(
-        extra / LEAD >= endpoints,
-        "{} Resets, {endpoints} Endpoints",
-        extra / LEAD
-    );
-    assert!(live[..LEAD].iter().all(|s| *s == 0.0));
-    assert!(live[live.len() - TAIL..].iter().all(|s| *s == 0.0));
+    assert_eq!(updates.iter().filter(|u| u.endpoint).count(), 1);
+    assert_tap_gapless(&tap.take(), &pcm);
 
     // Ohne Tap bleibt alles beim Alten (kein Mitschnitt, gleiche Erkennung).
     let mut plain = transcriber();
     assert!(!plain.transcribe(&sentence).unwrap().is_empty());
+}
+
+/// REQ-STREAM-016 (AK-11): Tap = Vorlauf ‖ Eingang ‖ Nachlauf, der Mittelteil bitgleich.
+fn assert_tap_gapless(tap: &[f32], input: &[f32]) {
+    const LEAD: usize = 6_400;
+    const TAIL: usize = 19_200;
+    assert_eq!(tap.len(), LEAD + input.len() + TAIL, "Länge");
+    assert!(tap[..LEAD].iter().all(|s| *s == 0.0));
+    assert!(
+        tap[LEAD..LEAD + input.len()] == *input,
+        "Mittelteil weicht vom Eingang ab"
+    );
+    assert!(tap[LEAD + input.len()..].iter().all(|s| *s == 0.0));
+}
+
+fn live_tap(pcm: &[f32], chunk: usize) -> (Vec<talker::stt::StreamUpdate>, Vec<f32>) {
+    let tap = talker::stt::ModelTap::default();
+    let mut t = transcriber().with_model_tap(tap.clone());
+    t.begin();
+    let updates = pcm.chunks(chunk).map(|c| t.feed(c).unwrap()).collect();
+    t.finish().unwrap();
+    (updates, tap.take())
+}
+
+/// AK-11 Grenzfälle: Endpoint direkt nach dem Vorlauf (Stille am Anfang), zwei Endpoints
+/// kurz nacheinander, Endpoint unmittelbar vor dem Loslassen, Pause genau `endpoint_silence_ms`.
+#[test]
+fn live_tap_stays_gapless_at_segment_ends() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let silence = |n: usize| std::iter::repeat_n(0.0f32, n);
+    let silence_ms = talker::config::DEFAULT_ENDPOINT_SILENCE_MS as usize * 16;
+
+    // Stille direkt nach dem Vorlauf, dann Satz.
+    let mut a: Vec<f32> = silence(24_000).collect();
+    a.extend_from_slice(&s);
+    // Zwei Endpoints kurz nacheinander.
+    let mut b = s.clone();
+    b.extend(silence(24_000));
+    b.extend_from_slice(&s);
+    b.extend(silence(24_000));
+    b.extend_from_slice(&s);
+    // Endpoint unmittelbar vor dem Loslassen: Pause am Ende.
+    let mut c = s.clone();
+    c.extend(silence(24_000));
+    // Pause genau endpoint_silence_ms.
+    let mut d = s.clone();
+    d.extend(silence(silence_ms));
+    d.extend_from_slice(&s);
+
+    for (name, pcm) in [("start", a), ("zwei", b), ("ende", c), ("genau", d)] {
+        let (_, tap) = live_tap(&pcm, 8_960);
+        println!("{name}: {} Samples", pcm.len());
+        assert_tap_gapless(&tap, &pcm);
+    }
+}
+
+/// AK-11 Grenzfall Zwangs-Endpoint: Utterance über 60 s ohne Pause.
+#[test]
+fn live_tap_stays_gapless_at_the_forced_endpoint() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let pcm: Vec<f32> = s.iter().copied().cycle().take(16_000 * 62).collect();
+    let (updates, tap) = live_tap(&pcm, 8_960);
+    assert_tap_gapless(&tap, &pcm);
+    let endpoints = updates.iter().filter(|u| u.endpoint).count();
+    assert_eq!(endpoints, 1, "Zwangs-Segment-Ende nach 60 s genau einmal");
+}
+
+/// AK-11: Stille vor dem ersten Wort erzeugt kein Segment und kostet kein Wort.
+#[test]
+fn silence_before_the_first_word_gives_no_segment_and_loses_nothing() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let mut pcm = vec![0.0f32; 48_000]; // 3 s Stille
+    pcm.extend_from_slice(&s);
+    let mut t = transcriber();
+    let (updates, rest) = stream(&mut t, &pcm);
+    assert!(
+        updates.iter().all(|u| !u.endpoint || !u.text.is_empty()),
+        "Segment ohne Text"
+    );
+    let text = format!(
+        "{} {rest}",
+        updates
+            .iter()
+            .filter(|u| u.endpoint)
+            .map(|u| u.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+    .to_lowercase();
+    assert!(
+        text.contains("dies ist ein test"),
+        "Satzanfang fehlt: {text:?}"
+    );
 }

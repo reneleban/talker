@@ -24,7 +24,7 @@ pub trait Transcriber {
 }
 
 /// Geteilter Puffer für den Debug-Mitschnitt (ADR-0012): sammelt exakt das, was das Modell
-/// bekommt (inkl. Vor-/Nachlauf-Stille und der Stille nach jedem Reset). `Clone` teilt den Puffer.
+/// bekommt (inkl. Vor-/Nachlauf-Stille). `Clone` teilt den Puffer.
 #[derive(Clone, Default)]
 pub struct ModelTap(Arc<Mutex<Vec<f32>>>);
 
@@ -46,6 +46,10 @@ pub struct NemotronTranscriber {
     inner: OnlineRecognizer,
     /// Laufende Utterance im Live-Betrieb (`begin` … `finish`).
     live: Option<OnlineStream>,
+    /// Gesamttext des Streams an der letzten Segment-Grenze (ungetrimmt, ADR-0015).
+    committed: String,
+    /// Samples seit der letzten Grenze bzw. seit dem Beginn des offenen Segments.
+    since_boundary: usize,
     /// Nur für den Debug-Mitschnitt gesetzt.
     tap: Option<ModelTap>,
     language: Language,
@@ -59,8 +63,11 @@ const TAIL_SILENCE_SAMPLES: usize = 19_200; // 1,2 s bei 16 kHz
 /// Chunk des Pakets: 560 ms bei 16 kHz — der Nachlauf muss ihn füllen.
 const CHUNK_SAMPLES: usize = 8_960;
 const _: () = assert!(TAIL_SILENCE_SAMPLES >= CHUNK_SAMPLES);
-/// Zwangs-Endpoint für sehr lange Segmente ohne Pause.
-const MAX_SEGMENT_SECONDS: f32 = 60.0;
+/// Zwangs-Segment-Ende für sehr lange Segmente ohne Pause (talker zählt, nicht sherpa).
+const MAX_SEGMENT_SAMPLES: usize = 60 * 16_000;
+/// sherpas Regel 3 (Utterance-Länge) zählt ab dem Stream-Start und würde ohne Reset
+/// dauerhaft feuern — sie darf nie greifen.
+const RULE3_NEVER: f32 = 1.0e9;
 
 use crate::config::DEFAULT_ENDPOINT_SILENCE_MS;
 
@@ -121,7 +128,7 @@ impl NemotronTranscriber {
             enable_endpoint: true,
             rule1_min_trailing_silence: endpoint_silence_ms as f32 / 1000.0,
             rule2_min_trailing_silence: endpoint_silence_ms as f32 / 1000.0,
-            rule3_min_utterance_length: MAX_SEGMENT_SECONDS,
+            rule3_min_utterance_length: RULE3_NEVER,
             ..Default::default()
         };
         let inner = OnlineRecognizer::create(&config)
@@ -129,6 +136,8 @@ impl NemotronTranscriber {
         Ok(Self {
             inner,
             live: None,
+            committed: String::new(),
+            since_boundary: 0,
             tap: None,
             language: Language::default(),
         })
@@ -186,7 +195,7 @@ impl Transcriber for NemotronTranscriber {
 
 /// Zwischenstand nach einem `feed`: Text des offenen Segments; `endpoint` ist
 /// wahr, wenn eine Sprechpause das Segment beendet hat (Text ist dann final,
-/// der Recognizer bereits für das nächste Segment zurückgesetzt).
+/// das nächste Segment beginnt hinter diesem Text; der Stream wird nicht zurückgesetzt).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUpdate {
     pub text: String,
@@ -257,9 +266,21 @@ impl NemotronTranscriber {
         }
         self.inner
             .get_result(stream)
-            .map(|r| r.text.trim().to_string())
+            .map(|r| r.text)
             .unwrap_or_default()
     }
+}
+
+/// Offenes Segment: Gesamttext ohne das bereits ausgelieferte Präfix `committed`.
+/// Ist es kein Präfix (bei Greedy ohne ITN nicht zu erwarten, ADR-0015), zählt der Text
+/// ab dem gemeinsamen Präfix.
+fn open_segment<'a>(total: &'a str, committed: &str) -> &'a str {
+    let common = total
+        .char_indices()
+        .zip(committed.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or_else(|| total.len().min(committed.len()), |((i, _), _)| i);
+    &total[common..]
 }
 
 impl StreamingTranscriber for NemotronTranscriber {
@@ -267,6 +288,8 @@ impl StreamingTranscriber for NemotronTranscriber {
         let stream = self.inner.create_stream();
         stream.set_option("language", self.language.code());
         self.accept(&stream, &[0.0; LEAD_SILENCE_SAMPLES]);
+        self.committed.clear();
+        self.since_boundary = 0;
         self.live = Some(stream);
     }
 
@@ -277,18 +300,25 @@ impl StreamingTranscriber for NemotronTranscriber {
             .ok_or_else(|| TalkerError::Stt("feed ohne begin".into()))?;
         if !pcm_16k_mono.is_empty() {
             self.accept(&stream, pcm_16k_mono);
+            self.since_boundary += pcm_16k_mono.len();
         }
-        let text = self.drain(&stream);
-        // Eine Pause ohne erkannten Text ist kein Segment-Ende (nur zurücksetzen).
-        let ended = self.inner.is_endpoint(&stream);
+        let total = self.drain(&stream);
+        if !total.starts_with(&self.committed) {
+            log::warn!("Live-Text ist nicht präfixstabil; Segment ab dem gemeinsamen Präfix");
+        }
+        let text = open_segment(&total, &self.committed).trim().to_string();
+        // Eine Pause ohne neuen Text ist kein Segment-Ende; ohne Text gibt es auch nichts zu erzwingen.
+        let ended = !text.is_empty()
+            && (self.inner.is_endpoint(&stream) || self.since_boundary >= MAX_SEGMENT_SAMPLES);
         if ended {
-            self.inner.reset(&stream);
-            // Wie beim Start braucht das Modell Vorlauf, sonst fehlt der Satzanfang.
-            self.accept(&stream, &[0.0; LEAD_SILENCE_SAMPLES]);
+            self.committed = total;
+            self.since_boundary = 0;
+        } else if text.is_empty() {
+            self.since_boundary = 0;
         }
         self.live = Some(stream);
         Ok(StreamUpdate {
-            endpoint: ended && !text.is_empty(),
+            endpoint: ended,
             text,
         })
     }
@@ -300,7 +330,8 @@ impl StreamingTranscriber for NemotronTranscriber {
             .ok_or_else(|| TalkerError::Stt("finish ohne begin".into()))?;
         self.accept(&stream, &[0.0; TAIL_SILENCE_SAMPLES]);
         stream.input_finished();
-        Ok(self.drain(&stream))
+        let total = self.drain(&stream);
+        Ok(open_segment(&total, &self.committed).trim().to_string())
     }
 }
 
@@ -374,6 +405,27 @@ impl StreamingTranscriber for FakeStreaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REQ-STREAM-016: offenes Segment = Gesamttext ohne das bereits ausgelieferte Präfix.
+    #[test]
+    fn open_segment_is_the_text_after_the_committed_prefix() {
+        assert_eq!(
+            open_segment("Satz eins. Satz zwei", "Satz eins."),
+            " Satz zwei"
+        );
+        assert_eq!(open_segment("Satz eins.", "Satz eins."), "");
+        assert_eq!(open_segment("Hallo", ""), "Hallo");
+        assert_eq!(open_segment("", ""), "");
+    }
+
+    /// Grenzfall: `committed` ist kein Präfix → ab dem gemeinsamen Präfix, auch mit Mehrbyte-Zeichen.
+    #[test]
+    fn open_segment_without_prefix_starts_at_the_common_prefix() {
+        assert_eq!(open_segment("Grüne Wiese", "Grüße"), "ne Wiese");
+        assert_eq!(open_segment("Äpfel", "Öl"), "Äpfel");
+        assert_eq!(open_segment("ab", "abc"), "");
+        assert_eq!(open_segment("xyz", "abc"), "xyz");
+    }
 
     /// Trait-Default von `set_language` ist ein No-op: Fakes bleiben unverändert.
     #[test]
