@@ -197,7 +197,7 @@ SPAWN=.claude/skills/spawn-worker/spawn.sh
 lacks "C8 spawn.sh: Rollenliste nur einmal (kein ROLES_RE-Literal)" "$SPAWN" '^ROLES_RE="'
 assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-engineer' "$SPAWN")"
 for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)' 'Bash(git push *refs/heads/main*)' \
-  'Bash(git -C *)' 'Bash(gh pr -R *)' 'Bash(gh pr --repo *)'; do
+  'Bash(git -C *)' 'Bash(gh pr -R *)' 'Bash(gh pr --repo *)' 'Bash(git -c *)' 'Bash(gh --repo *)'; do
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
 has "S4/N3 tech-lead Hook: Pfad über CLAUDE_PROJECT_DIR, fail-closed" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR/\.claude/hooks/say-only\.sh" \|\| exit 2$'

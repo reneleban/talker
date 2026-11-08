@@ -24,7 +24,6 @@ hook "erlaubt: herdr agent wait mit Timeout" 0 "herdr agent wait rust-developer-
 hook "erlaubt: say.sh" 0 "sh scripts/team/say.sh orchestrator 'fertig'"
 hook "erlaubt: spawn.sh" 0 "sh .claude/skills/spawn-worker/spawn.sh rust-developer 0043 chore/0043-x"
 hook "erlaubt: git status" 0 "git status --short"
-hook "erlaubt: Dateiname mit herdr im Pfad (adr-0013-herdr-laufzeit)" 0 "git add docs/adr/adr-0013-herdr-laufzeit-und-transport.md"
 hook "erlaubt: leerer Befehl ohne herdr" 0 ""
 
 # --- verboten ---
@@ -60,7 +59,8 @@ hook "erlaubt: git commit -m, Text beginnt mit herdr" 0 "git commit -m \"herdr a
 hook "erlaubt: say.sh mit herdr-Lesebefehl im Text" 0 "sh scripts/team/say.sh orchestrator 'lies mit herdr agent read x'"
 hook "erlaubt: gh pr create --title mit herdr" 0 "gh pr create --draft --title 'chore: herdr guard'"
 hook "erlaubt: gh pr merge --subject mit herdr" 0 "gh pr merge --squash --subject 'fix: herdr agent prompt'"
-hook "erlaubt: cat Pfad mit /herdr" 0 "cat docs/herdr"
+hook "verboten: cat Pfad mit /herdr (nicht auf der Positivliste)" 2 "cat docs/herdr"
+hook "verboten: git add Dateiname mit herdr (nicht auf der Positivliste)" 2 "git add docs/adr/adr-0013-herdr-laufzeit-und-transport.md"
 hook "verboten: nach ; ohne Leerzeichen" 2 "git status;herdr pane close p1"
 hook "verboten: nach &&" 2 "git status && herdr pane close p1"
 hook "verboten: in Subshell" 2 "(herdr pane close p1)"
@@ -70,6 +70,60 @@ hook "verboten: bash -c mit Doppelanführungszeichen" 2 "bash -c \"herdr pane cl
 hook "verboten: env mit Variablen" 2 "env A=1 herdr pane close p1"
 hook "verboten: Pfad am Befehlsanfang" 2 "/opt/homebrew/bin/herdr pane close p1"
 hook "verboten: Pfad nach ;" 2 "x; ~/.local/bin/herdr pane close p1"
+
+# --- N5/R6: Positivliste, Token überall gesperrt außer Lesebefehl und einfachem Befehl der Liste ---
+while IFS= read -r c; do
+  [ -n "$c" ] || continue
+  hook "N5 verboten: $c" 2 "$c"
+done <<'EOF'
+eval herdr pane close p1
+eval 'herdr pane close p1'
+echo herdr | xargs -n1 true
+xargs herdr pane close
+xargs -n1 herdr pane close
+find . -exec herdr pane close p1 ;
+{ herdr pane close p1; }
+if true; then herdr pane close p1; fi
+! herdr pane close p1
+2>/dev/null herdr pane close p1
+\herdr pane close p1
+X=herdr; $X pane close p1
+timeout 5 herdr pane close p1
+nice herdr pane close p1
+sh -xc 'herdr pane close p1'
+bash -lc 'herdr pane close p1'
+dash -c 'herdr pane close p1'
+sh  -c 'herdr pane close p1'
+env -i herdr pane close p1
+sudo -u x herdr pane close p1
+osascript -e 'do shell script "herdr pane close p1"'
+for i in 1; do herdr pane close p1; done
+while true; do herdr pane close p1; done
+grep x <(herdr pane close p1)
+git log --format=%H > >(herdr pane close p1)
+git commit -m x; herdr pane close p1
+grep x && herdr pane close p1
+gh pr create --title x | herdr pane close p1
+grep $(herdr pane close p1)
+grep `herdr pane close p1`
+sh scripts/team/say.sh orchestrator x & herdr pane close p1
+gh pr merge --subject 'a; herdr pane close p1'
+echo git commit; herdr pane close p1
+grepx herdr
+EOF
+hook "N5 verboten: Block über Zeilenumbrüche (if/then)" 2 "if true
+then herdr pane close p1
+fi"
+hook "N5 verboten: rg, dann Zeilenumbruch und Token" 2 "rg x
+herdr pane close p1"
+hook "N5 verboten: git commit -m, Zeilenumbruch im Text vor dem Token" 2 "git commit -m 'a
+herdr pane close p1'"
+hook "N5 verboten: Lesebefehl, Zeilenumbruch, weiterer Befehl" 2 "herdr agent list
+git status"
+hook "N5 erlaubt: say.sh, ( vor dem Token im Fließtext" 0 "sh scripts/team/say.sh orchestrator 'fertig (herdr agent read x) und weiter'"
+hook "N5 erlaubt: git commit -m mit Klammer vor dem Token" 0 "git commit -m 'fix(guard): (herdr) Positivliste'"
+hook "N5 erlaubt: rg mit herdr" 0 "rg -n herdr docs"
+hook "N5 erlaubt: git log --grep=herdr" 0 "git log --oneline --grep=herdr"
 
 # --- kaputte Eingabe ---
 printf '%s' 'kein json' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: Eingabe ist kein JSON (fail-closed)" 2 $?
