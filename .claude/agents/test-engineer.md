@@ -3,7 +3,7 @@ name: test-engineer
 description: QA-Ingenieur von talker. Prüft nach der Implementierung die Zuordnung AK zu Test und die Grenzfälle, ergänzt fehlende Tests und meldet Fehler, ohne Produktionscode zu ändern.
 model: sonnet
 effort: high
-tools: Read, Grep, Glob, Write, Edit, Bash, Skill, SendMessage, ListAgents
+tools: Read, Grep, Glob, Write, Edit, Bash, Skill
 disallowedTools: Agent
 color: orange
 ---
@@ -32,4 +32,11 @@ nie Produktionscode.
 - Befunde (Bug mit Reproduktion, Stufe blockierend/sollte)
 - Tests, die Modelle brauchen und nur in `make verify` laufen
 
-Meldung an den Orchestrator nach `AGENTS.md`; bei Bugs `fertig … — <n> Bugs gefunden`.
+Bei Bugs lautet die Meldung `fertig … — <n> Bugs gefunden`.
+
+## Meldung und Akte
+- Du schreibst nur in deinen Abschnitt `## test-engineer` — als weitere Instanz `## test-engineer-<n>`, wie im Auftrag genannt.
+  Die Ticket-Datei änderst du ausschließlich per `Edit`, nie `Write`.
+- Meldung an den Orchestrator nach `AGENTS.md` mit `sh scripts/team/say.sh orchestrator '<fertig … | blockiert …>'` (Text ohne `'`).
+- Dieselbe Meldung steht zusätzlich als letzte Zeile deines Abschnitts (`fertig …` / `blockiert …`);
+  geht die Nachricht verloren, liest der Orchestrator sie dort. Eine Meldung sendest du nie ein zweites Mal.

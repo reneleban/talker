@@ -1,6 +1,6 @@
 # ADR-0010 — Agenten-Team mit eigenen Sessions je Rolle
 
-- Status: akzeptiert
+- Status: akzeptiert; Punkt 2 und die Ghostty-Konsequenzen abgelöst durch ADR-0013
 - Datum: 2026-11-06
 - Kontext: `AGENTS.md` (Team, Ablauf, Übergabe-Protokoll), `.claude/agents/`, `.claude/skills/`
 
@@ -9,7 +9,7 @@
 talker wird überwiegend von Agenten gebaut. Bisher arbeitete eine Session
 alles nacheinander ab; Spec, Entwurf, Umsetzung und Review vermischten sich in
 einem Kontext. Ziel: Rollen wie in einer Software-Firma, klare Übergaben, ein
-einziges Gate für den Menschen (die Spec), danach automatisch bis zum Draft-PR.
+einziges Gate für den Menschen (die Spec), danach automatisch bis zum Draft-PR (seit Ticket 0043 bis zum Merge, siehe Änderungsvermerk bei Punkt 5).
 Der Rollenschnitt ist angelehnt an die Lifecycle-Phasen von addyosmani/agent-skills
 (Define, Plan, Build, Verify, Review, Ship).
 
@@ -33,6 +33,9 @@ Der Rollenschnitt ist angelehnt an die Lifecycle-Phasen von addyosmani/agent-ski
 5. **Gates**: Spec-Freigabe durch den Menschen (gilt auch als Push-Freigabe des
    Feature-Branches), Merge nach `main` durch den Menschen, Abnahme (Field-Test)
    vor jedem Release statt je Feature.
+   *Änderung 2026-11-08 (Ticket 0043):* Den Merge nach `main` führt der release-engineer unter
+   Bedingungen aus (CI grün, verify:fast grün, kein blockierender Befund, kein Konflikt; nicht bei
+   Breaking Change, Release, Tag). Spec-Freigabe und Release-Abnahme bleiben Gates des Menschen.
 6. **Abläufe eingebettet**: Was eine Rolle braucht, steht in ihrer Definition;
    was mehrere brauchen, ist ein Projekt-Skill im Repo. Keine Verweise auf
    global installierte Skills.

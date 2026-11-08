@@ -22,15 +22,55 @@
       "Bash(git push -u origin chore/*)",
       "Bash(gh pr create --draft *)",
       "Bash(gh pr view*)",
-      "Bash(sh .claude/skills/spawn-worker/spawn.sh *)"
+      "Bash(gh pr ready *)",
+      "Bash(gh pr merge --squash *)",
+      "Bash(gh pr checks *)",
+      "Bash(sh .claude/skills/spawn-worker/spawn.sh *)",
+      "Bash(sh scripts/team/say.sh *)",
+      "Bash(herdr agent list)",
+      "Bash(herdr agent get *)",
+      "Bash(herdr agent read *)",
+      "Bash(herdr agent wait *)"
     ],
     "deny": [
       "Bash(git push * main*)",
+      "Bash(git push *:main*)",
+      "Bash(git push *refs/heads/main*)",
+      "Bash(git -C *)",
+      "Bash(git -c *)",
+      "Bash(gh --repo *)",
       "Bash(git push --force*)",
       "Bash(git push -f*)",
       "Bash(*--no-verify*)",
-      "Bash(gh pr merge*)",
-      "Bash(gh pr ready*)"
+      "Bash(gh pr merge *--admin*)",
+      "Bash(gh api *merge*)",
+      "Bash(gh -R *)",
+      "Bash(gh pr -R *)",
+      "Bash(gh pr --repo *)",
+      "Bash(herdr --*)",
+      "Bash(herdr pane *)",
+      "Bash(herdr tab *)",
+      "Bash(herdr workspace *)",
+      "Bash(herdr session *)",
+      "Bash(herdr server *)",
+      "Bash(herdr agent start*)",
+      "Bash(herdr agent prompt*)",
+      "Bash(herdr agent send-keys*)",
+      "Bash(herdr agent rename*)",
+      "Bash(herdr agent attach*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/pane-guard.sh\" || exit 2"
+          }
+        ]
+      }
     ]
   }
 }
