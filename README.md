@@ -47,7 +47,7 @@ Alles lokal — auch dein Prompt-Rohmaterial geht an keine Cloud.
 - **Robust**: Nutzer-Clipboard wird gesichert und wiederhergestellt; keine
   Pipeline-Stufe bricht hart ab.
 - Menüleisten-App mit Einstellungen (PTT-Taste, Mikrofon, Cleanup-Modus,
-  Login-Start).
+  Sprache, Login-Start).
 
 ## Source-first: bau es selbst
 
@@ -134,7 +134,11 @@ bleiben. Alternative von Hand: Schlüsselbundverwaltung → Zertifikatsassistent
 ## Konfiguration
 
 `~/Library/Application Support/talker/config.toml` — wird von den Einstellungen
-geschrieben (PTT-Taste, Mikrofon, Cleanup an/aus, STT-Modellpfad, Protokoll-Detailgrad).
+geschrieben (PTT-Taste, Mikrofon, Cleanup an/aus, Sprache, STT-Modellpfad, Protokoll-Detailgrad).
+
+**Sprache.** Die Einstellung „Sprache“ (Automatisch / Deutsch / Englisch) legt fest, in
+welcher Sprache die Spracherkennung hört; sie gilt ab dem nächsten Diktat ohne Neustart.
+Config-Feld `language` (`"auto"`, `"de"`, `"en"`), Default `auto`.
 
 ## Diagnose: Logdatei, Messzeile, Mitschnitt
 
@@ -155,7 +159,7 @@ kommen Details dazu. Transcript-Text steht nie im Log.
 **Messzeile.** Nach jedem Diktat, auch bei verworfenen oder fehlgeschlagenen:
 
 ```
-Diktat #17: Taste→Mikro bereit 120 ms · →erster Block 380 ms · →erstes Signal 640 ms · gehalten 4,2 s · aufgenommen 3,6 s · Loslassen→Text 780 ms (STT 520 ms · Cleanup 240 ms) · →eingefügt 35 ms · Gerät: AirPods (48 kHz, 1 Kanal) · Einfügen: Am Ende · Modus: Natürlich · Kaltstart: nein · Ergebnis: eingefügt
+Diktat #17: Taste→Mikro bereit 120 ms · →erster Block 380 ms · →erstes Signal 640 ms · gehalten 4,2 s · aufgenommen 3,6 s · Loslassen→Text 780 ms (STT 520 ms · Cleanup 240 ms) · →eingefügt 35 ms · Gerät: AirPods (48 kHz, 1 Kanal) · Einfügen: Am Ende · Modus: Natürlich · Sprache: Automatisch · Kaltstart: nein · Ergebnis: eingefügt
 ```
 
 Nicht erreichte Messpunkte stehen als `—`. Satzweise/Wortgruppenweise ergänzen
@@ -175,14 +179,15 @@ open --env TALKER_DEBUG_WAV_DIR="$HOME/talker-debug" ~/Applications/talker.app
 ```
 
 **Messreihe.** `make latency-eval` verarbeitet alle STT-Fixtures je Am Ende/Satzweise ×
-Roh/Natürlich ohne Einfügen und gibt eine Markdown-Tabelle mit p50/p95 aus. `N=<zahl>` setzt
+Roh/Natürlich ohne Einfügen und gibt eine Markdown-Tabelle mit p50/p95 aus. `LANGUAGE=auto|de|en` setzt die
+Sprache (Default `auto`, ungültig → Abbruch), `N=<zahl>` setzt
 die Läufe je Fall (Default 10, dazu ein verworfener Aufwärmlauf), `LATENCY_OUT=<datei>` schreibt
 die Tabelle zusätzlich in eine Datei. `N=3` ist der Schnelllauf; `N=10` dauert über 30 Minuten,
 weil Satzweise im Echtzeittakt läuft. Die Spalte „je Audio-s“ setzt `Loslassen→Text` ins
 Verhältnis zur Clip-Länge (die Latenz am Ende wächst mit ihr). Braucht das Nemotron-Modell;
 ohne Gemma laufen nur die Roh-Fälle, die Natürlich-Fälle stehen unter „Übersprungen“.
 
-**Fixtures.** Die zehn FLEURS-Clips (`tests/fixtures/stt/fleurs-de-*`, CC-BY-4.0, siehe
+**Fixtures.** Die fünfzehn FLEURS-Clips (`tests/fixtures/stt/fleurs-de-*`, darunter fünf von Sprecherinnen, CC-BY-4.0, siehe
 `tests/fixtures/stt/ATTRIBUTION.md`) erzeugt `scripts/fetch_fleurs_fixtures.sh` neu; das
 Skript lädt sie einmalig aus Hugging Face (Netz nötig).
 
