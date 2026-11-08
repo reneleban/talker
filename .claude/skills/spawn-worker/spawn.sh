@@ -13,7 +13,7 @@ MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 WT_ROOT="$(dirname "$MAIN")/talker-wt"
 INTEGRATION="$WT_ROOT/integration"
 READY_MS=${SPAWN_READY_TIMEOUT_MS:-60000}
-# Einzige Rollenliste: eigener Worktree bzw. Integrations-Worktree; ROLES_RE und der case unten leiten sich daraus ab.
+# Einzige Rollenliste: eigener Worktree bzw. Integrations-Worktree; ROLES_RE und die Prüfung per in_roles leiten sich daraus ab.
 OWN_ROLES="product-owner architect rust-developer test-engineer release-engineer"
 SHARED_ROLES="tech-lead code-reviewer security-auditor performance-engineer merger"
 ROLES_RE=$(printf '%s %s' "$OWN_ROLES" "$SHARED_ROLES" | tr ' ' '|')

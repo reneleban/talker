@@ -47,13 +47,50 @@ herdr pane close p1"
 hook "verboten: herdr agent listing (kein Wortende)" 2 "herdr agent listing"
 hook "verboten: herdr als Argument eines anderen Befehls" 2 "echo x; herdr agent prompt x y"
 
+# --- N1: Groß-/Kleinschreibung (APFS) ---
+hook "verboten: HERDR agent prompt" 2 "HERDR agent prompt x y"
+hook "verboten: Herdr --session" 2 "Herdr --session talker agent send-keys x y"
+hook "verboten: HERDR agent list | cat" 2 "HERDR agent list | cat"
+
+# --- R1: Token nur in Befehlsposition, Argumente frei ---
+hook "erlaubt: grep mit herdr im Text" 0 "grep -rn herdr docs"
+hook "erlaubt: git log --grep herdr" 0 "git log --grep herdr"
+hook "erlaubt: git commit -m mit herdr agent prompt" 0 "git commit -m 'fix: herdr agent prompt gesperrt'"
+hook "erlaubt: git commit -m, Text beginnt mit herdr" 0 "git commit -m \"herdr agent prompt\""
+hook "erlaubt: say.sh mit herdr-Lesebefehl im Text" 0 "sh scripts/team/say.sh orchestrator 'lies mit herdr agent read x'"
+hook "erlaubt: gh pr create --title mit herdr" 0 "gh pr create --draft --title 'chore: herdr guard'"
+hook "erlaubt: gh pr merge --subject mit herdr" 0 "gh pr merge --squash --subject 'fix: herdr agent prompt'"
+hook "erlaubt: cat Pfad mit /herdr" 0 "cat docs/herdr"
+hook "verboten: nach ; ohne Leerzeichen" 2 "git status;herdr pane close p1"
+hook "verboten: nach &&" 2 "git status && herdr pane close p1"
+hook "verboten: in Subshell" 2 "(herdr pane close p1)"
+hook "verboten: in \$( )" 2 "echo \$(herdr pane close p1)"
+hook "verboten: in Backticks" 2 "echo \`herdr pane close p1\`"
+hook "verboten: bash -c mit Doppelanführungszeichen" 2 "bash -c \"herdr pane close p1\""
+hook "verboten: env mit Variablen" 2 "env A=1 herdr pane close p1"
+hook "verboten: Pfad am Befehlsanfang" 2 "/opt/homebrew/bin/herdr pane close p1"
+hook "verboten: Pfad nach ;" 2 "x; ~/.local/bin/herdr pane close p1"
+
 # --- kaputte Eingabe ---
 printf '%s' 'kein json' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: Eingabe ist kein JSON (fail-closed)" 2 $?
 printf '' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: leere Eingabe (fail-closed)" 2 $?
 
-# --- fail-closed ohne jq ---
+# --- N3: fehlende Hook-Datei oder leeres CLAUDE_PROJECT_DIR → Exit 2 (nicht 127, sonst fail-open) ---
+CMD_SETTINGS=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$TH_SRC/.claude/settings.json")
+CMD_TECHLEAD=$(sed -n 's/^ *command: //p' "$TH_SRC/.claude/agents/tech-lead.md")
 mkdir -p "$TMP/leer"
 printf '%s' '{"tool_input":{"command":"git status"}}' >"$TMP/ok.json"
+CLAUDE_PROJECT_DIR="$TH_SRC" sh -c "$CMD_SETTINGS" <"$TMP/ok.json" >/dev/null 2>&1
+assert_eq "N3 settings: Hook mit gültigem Pfad lässt git status durch" 0 $?
+for pair in "settings:$CMD_SETTINGS" "tech-lead:$CMD_TECHLEAD"; do
+  n=${pair%%:*}; c=${pair#*:}
+  CLAUDE_PROJECT_DIR="" sh -c "$c" <"$TMP/ok.json" >/dev/null 2>&1
+  assert_eq "N3 $n: leeres CLAUDE_PROJECT_DIR → Exit 2" 2 $?
+  CLAUDE_PROJECT_DIR="$TMP/leer" sh -c "$c" <"$TMP/ok.json" >/dev/null 2>&1
+  assert_eq "N3 $n: fehlende Hook-Datei → Exit 2" 2 $?
+done
+
+# --- fail-closed ohne jq ---
 PATH="$TMP/leer" /bin/sh "$HOOK" <"$TMP/ok.json" >/dev/null 2>"$TMP/err"
 assert_eq "verboten: jq fehlt im PATH (fail-closed)" 2 $?
 assert_contains "jq fehlt: Begründung nennt jq" jq "$(cat "$TMP/err")"

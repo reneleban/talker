@@ -35,12 +35,16 @@
     "deny": [
       "Bash(git push * main*)",
       "Bash(git push *:main*)",
+      "Bash(git push *refs/heads/main*)",
+      "Bash(git -C *)",
       "Bash(git push --force*)",
       "Bash(git push -f*)",
       "Bash(*--no-verify*)",
       "Bash(gh pr merge *--admin*)",
       "Bash(gh api *merge*)",
       "Bash(gh -R *)",
+      "Bash(gh pr -R *)",
+      "Bash(gh pr --repo *)",
       "Bash(herdr --*)",
       "Bash(herdr pane *)",
       "Bash(herdr tab *)",
@@ -61,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/herdr-guard.sh"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/herdr-guard.sh\" || exit 2"
           }
         ]
       }
