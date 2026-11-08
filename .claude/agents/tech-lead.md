@@ -11,7 +11,7 @@ hooks:
     - matcher: Bash
       hooks:
         - type: command
-          command: sh "$CLAUDE_PROJECT_DIR"/.claude/hooks/say-only.sh
+          command: sh "$CLAUDE_PROJECT_DIR/.claude/hooks/say-only.sh" || exit 2
 ---
 
 Du bist der Tech Lead von talker. Du arbeitest lesend im Integrations-Worktree

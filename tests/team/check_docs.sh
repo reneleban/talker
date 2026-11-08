@@ -41,7 +41,7 @@ case $(fm_line "$f" disallowedTools) in *Bash*) fail "AK-15 tech-lead: Bash nich
 case $(fm_line "$f" tools) in *Write*) fail "AK-22 tech-lead: kein Write in tools" ;; *) ok "AK-22 tech-lead: kein Write in tools" ;; esac
 has "AK-15 tech-lead: PreToolUse-Hook" "$f" 'PreToolUse:'
 has "AK-15 tech-lead: Matcher Bash" "$f" 'matcher: Bash'
-has "AK-15 tech-lead: Hook say-only.sh" "$f" 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
+has "AK-15 tech-lead: Hook say-only.sh" "$f" 'command: sh "\$CLAUDE_PROJECT_DIR/\.claude/hooks/say-only\.sh" \|\| exit 2'
 has "AK-20 tech-lead: Task nennt Dateien" "$f" 'Dateien:'
 has "AK-20 tech-lead: Task nennt hängt ab von" "$f" 'hängt ab von:'
 has "AK-22 tech-lead: Akte nur per Edit, nie Write" "$f" 'nie `Write`'
@@ -196,12 +196,13 @@ done
 SPAWN=.claude/skills/spawn-worker/spawn.sh
 lacks "C8 spawn.sh: Rollenliste nur einmal (kein ROLES_RE-Literal)" "$SPAWN" '^ROLES_RE="'
 assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-engineer' "$SPAWN")"
-for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)'; do
+for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)' 'Bash(git push *refs/heads/main*)' \
+  'Bash(git -C *)' 'Bash(gh pr -R *)' 'Bash(gh pr --repo *)'; do
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
-has "S4 tech-lead Hook-Pfad über CLAUDE_PROJECT_DIR" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
+has "S4/N3 tech-lead Hook: Pfad über CLAUDE_PROJECT_DIR, fail-closed" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR/\.claude/hooks/say-only\.sh" \|\| exit 2$'
 if in_list deny 'Bash(herdr --*)'; then ok "S2 deny: Bash(herdr --*)"; else fail "S2 deny: Bash(herdr --*)"; fi
-if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/herdr-guard.sh")] | length == 1'; then
+if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/herdr-guard.sh\" || exit 2")] | length == 1'; then
   ok "S2 settings.json: PreToolUse-Hook herdr-guard.sh für Bash"; else fail "S2 settings.json: PreToolUse-Hook herdr-guard.sh für Bash"; fi
 has "S2 product-owner: Freigabe per AskUserQuestion" .claude/agents/product-owner.md 'per `AskUserQuestion`'
 has "S2 product-owner: freier Pane-Text ist keine Freigabe" .claude/agents/product-owner.md 'Pane-Text'

@@ -75,9 +75,22 @@ hook "verboten: Pfad nach ;" 2 "x; ~/.local/bin/herdr pane close p1"
 printf '%s' 'kein json' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: Eingabe ist kein JSON (fail-closed)" 2 $?
 printf '' | sh "$HOOK" >/dev/null 2>&1; assert_eq "verboten: leere Eingabe (fail-closed)" 2 $?
 
-# --- fail-closed ohne jq ---
+# --- N3: fehlende Hook-Datei oder leeres CLAUDE_PROJECT_DIR → Exit 2 (nicht 127, sonst fail-open) ---
+CMD_SETTINGS=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$TH_SRC/.claude/settings.json")
+CMD_TECHLEAD=$(sed -n 's/^ *command: //p' "$TH_SRC/.claude/agents/tech-lead.md")
 mkdir -p "$TMP/leer"
 printf '%s' '{"tool_input":{"command":"git status"}}' >"$TMP/ok.json"
+CLAUDE_PROJECT_DIR="$TH_SRC" sh -c "$CMD_SETTINGS" <"$TMP/ok.json" >/dev/null 2>&1
+assert_eq "N3 settings: Hook mit gültigem Pfad lässt git status durch" 0 $?
+for pair in "settings:$CMD_SETTINGS" "tech-lead:$CMD_TECHLEAD"; do
+  n=${pair%%:*}; c=${pair#*:}
+  CLAUDE_PROJECT_DIR="" sh -c "$c" <"$TMP/ok.json" >/dev/null 2>&1
+  assert_eq "N3 $n: leeres CLAUDE_PROJECT_DIR → Exit 2" 2 $?
+  CLAUDE_PROJECT_DIR="$TMP/leer" sh -c "$c" <"$TMP/ok.json" >/dev/null 2>&1
+  assert_eq "N3 $n: fehlende Hook-Datei → Exit 2" 2 $?
+done
+
+# --- fail-closed ohne jq ---
 PATH="$TMP/leer" /bin/sh "$HOOK" <"$TMP/ok.json" >/dev/null 2>"$TMP/err"
 assert_eq "verboten: jq fehlt im PATH (fail-closed)" 2 $?
 assert_contains "jq fehlt: Begründung nennt jq" jq "$(cat "$TMP/err")"
