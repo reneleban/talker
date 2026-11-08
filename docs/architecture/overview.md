@@ -78,7 +78,8 @@ direkt oder indirekt referenziert. `logging` ist das `log`-Backend (ADR-0011):
 alle Module loggen über die `log`-Makros, ohne `logging` zu kennen; nur
 `main.rs` (Init) und `ui` (Detailgrad, „Log im Finder zeigen") hängen direkt
 davon ab. `audio` kapselt die Herkunft der Blöcke hinter `AudioSource`
-(Mikrofon oder WAV, ADR-0012).
+(Mikrofon oder WAV, ADR-0012); `MicCache` merkt Gerät und Format zwischen
+Tastendrücken, das erste Signal liest das Overlay lockfrei (ADR-0014).
 
 ## Laufzeitsicht — eine Utterance (CONTEXT.md)
 
@@ -103,8 +104,9 @@ sequenceDiagram
     Hotkey->>Session: press(HostInstant::now())
     Session->>Session: Diktat-Nr. vergeben, Setup-Gate prüfen (Modell ready?)
     Session->>Session: Frontmost-App erfassen (Kontext-Awareness)
-    Session->>Audio: start(MicSource) — Callback stempelt Blöcke (HostInstant)
-    Session->>Indicator: start_recording(mode)
+    Session->>Audio: start(MicSource + MicCache) — gemerktes Gerät, Callback stempelt Blöcke (HostInstant)
+    Session->>Indicator: mic_started(level, signal, mode) — Balken bleiben
+    Audio-->>Indicator: erstes Signal (Atomic, im Overlay-Takt gelesen) → Wellen
     Note over User,Audio: Nutzer spricht — Pegel live im Overlay
 
     User->>Hotkey: PTT-Taste loslassen
