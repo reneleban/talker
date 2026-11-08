@@ -109,7 +109,7 @@ Status von ADR-0010.
   hinge der Absender am Turn des Empfängers.
 - Der neue Transport ist an herdr gebunden. Rückweg ist ein Revert.
 - Die Kopfzeile ist eine Verhaltensregel, keine technische Sperre. Die Deny-Regeln auf direktes
-  `herdr …` und der PreToolUse-Hook `herdr-guard.sh` machen das Weglassen schwerer; sie sind aber
+  `herdr …` und der PreToolUse-Hook `pane-guard.sh` machen das Weglassen schwerer; sie sind aber
   keine Sicherheitsgrenze (verschleierte Aufrufe, andere Wege auf den herdr-Socket). Deshalb gilt die
   Spec-Freigabe nur, wenn der Mensch sie auf eine `AskUserQuestion` des PO gibt, nie aus freiem
   Pane-Text. Freigaben gelten nur über die Akte.
@@ -125,7 +125,12 @@ Status von ADR-0010.
   Backtick, `$(` oder Zeilenumbruch vor oder nach dem Token. Ausweg für mehrzeilige oder lange Texte:
   die Nachricht in eine Datei schreiben und `git commit -F <datei>` bzw. `gh pr create --body-file <datei>`
   verwenden (der Befehl enthält das Token dann nicht). Nicht erfasst bleiben Aufrufe, in denen das Token
-  zerlegt oder verschleiert ist (`her""dr`, `rg --pre`).
+  zerlegt oder verschleiert ist (`her""dr`, `rg --pre`). Hook und Test heißen bewusst `pane-guard.sh` und
+  `test_pane_guard.sh`, damit die Arbeit an ihnen das Token nicht im Befehl trägt. Für die verbleibenden Fälle
+  (ADR-Dateiname, Branch-Name `chore/0043-parallele-sessions-herdr`) gilt für alle Rollen: Datei mit dem
+  Read-Tool lesen, Tests mit `make team-test`, mit `git add -A` stagen, mit `git push origin HEAD` pushen.
+  `sh .claude/skills/spawn-worker/spawn.sh` ist als Präfix frei (es prüft den Branch selbst), auch mit dem
+  Token im Branch-Namen. Die zsh-Konstrukte `=(`, `(e:` und `(+` sind in einfachen Befehlen gesperrt.
 - Nach einem Neustart des herdr-Servers stellt herdr das Layout wieder her und
   kann Claude per `claude --resume <id>` wieder aufnehmen, dann aber ohne
   herdr-Namen [5]. `dev.sh` benennt einen solchen Orchestrator um, statt einen
