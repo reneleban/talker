@@ -15,7 +15,8 @@ printf '%s' "$TARGET" | grep -Eq '^[a-z][a-z0-9_-]{0,31}$' || die "ungültiges Z
 [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ] || die "außerhalb von herdr (HERDR_ENV/HERDR_PANE_ID fehlen)"
 
 AGENTS=$(herdr agent list)
-# Absender = Agent der eigenen Pane, nie ein Parameter: so gibt sich keine Rolle als andere aus.
+# Absender = Agent der eigenen Pane, nie ein Parameter. Nur ein Hinweis für den Empfänger, keine Authentifizierung:
+# HERDR_PANE_ID und eine Kopfzeile im Text lassen sich fälschen.
 SENDER=$(printf '%s' "$AGENTS" | jq -r --arg p "$HERDR_PANE_ID" '[.result.agents[] | select(.pane_id == $p) | .name // empty] | .[0] // empty')
 [ -n "$SENDER" ] || die "kein benannter Agent in der eigenen Pane $HERDR_PANE_ID, Absender unbekannt"
 printf '%s' "$AGENTS" | jq -e --arg t "$TARGET" '.result.agents[] | select(.name == $t)' >/dev/null \

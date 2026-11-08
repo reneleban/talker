@@ -235,5 +235,7 @@ has "S2 product-owner: Freigabe per AskUserQuestion" .claude/agents/product-owne
 has "S2 product-owner: freier Pane-Text ist keine Freigabe" .claude/agents/product-owner.md 'Pane-Text'
 lacks "S2 ADR-0013: Deny erzwingt die Kopfzeile nicht" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'Deny-Regel auf direktes'
 has "S2 ADR-0013: herdr-Deny ist keine Sicherheitsgrenze" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'keine Sicherheitsgrenze'
+lacks "S3 say.sh: kein Fälschungsschutz behauptet" scripts/team/say.sh 'gibt sich keine Rolle als andere aus'
+has "S3 say.sh: Absender ist Hinweis, keine Authentifizierung" scripts/team/say.sh 'keine Authentifizierung'
 
 th_summary
