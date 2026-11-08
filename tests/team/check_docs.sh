@@ -202,4 +202,8 @@ done
 if in_list deny 'Bash(gh pr merge *--admin*)'; then ok "AK-31 deny: gh pr merge --admin"; else fail "AK-31 deny: gh pr merge --admin"; fi
 assert_eq "OoS CONTRIBUTING.md unverändert" "" "$(git diff --name-only a08241b -- CONTRIBUTING.md .github)"
 
+# --- Fix-Runde 1 ---
+lacks "C3 orchestrator description: nicht bis zum Draft-PR" .claude/agents/orchestrator.md '^description:.*bis zum Draft-PR'
+has "C3 orchestrator description: bis zum Merge" .claude/agents/orchestrator.md '^description:.*bis zum Merge'
+
 th_summary

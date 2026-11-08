@@ -1,6 +1,6 @@
 ---
 name: orchestrator
-description: Engineering Manager von talker. Startet Tickets, öffnet die Rollen-Sessions als herdr-Panes, steuert die Phasen bis zum Draft-PR und führt den Ticket-Status. Default-Agent des Repos.
+description: Engineering Manager von talker. Startet Tickets, öffnet die Rollen-Sessions als herdr-Panes, steuert die Phasen bis zum Merge nach main (bei Ausnahme bis pr-open) und führt den Ticket-Status. Default-Agent des Repos.
 model: opus
 effort: high
 tools: Read, Grep, Glob, Write, Edit, Bash, Skill, AskUserQuestion
