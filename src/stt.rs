@@ -12,11 +12,15 @@ use sherpa_onnx::{
     OnlineTransducerModelConfig,
 };
 
+use crate::config::Language;
 use crate::error::{Result, TalkerError};
 
 /// PCM-Buffer (16 kHz mono) → Raw Transcript.
 pub trait Transcriber {
     fn transcribe(&mut self, pcm_16k_mono: &[f32]) -> Result<String>;
+
+    /// Sprache für die nächsten Aufrufe (`transcribe`, `begin`); Default: ignoriert.
+    fn set_language(&mut self, _language: Language) {}
 }
 
 /// Geteilter Puffer für den Debug-Mitschnitt (ADR-0012): sammelt exakt das, was das Modell
@@ -44,6 +48,7 @@ pub struct NemotronTranscriber {
     live: Option<OnlineStream>,
     /// Nur für den Debug-Mitschnitt gesetzt.
     tap: Option<ModelTap>,
+    language: Language,
 }
 
 /// Stille vor dem Audio: das Streaming-Modell verschluckt sonst den Satzanfang.
@@ -125,6 +130,7 @@ impl NemotronTranscriber {
             inner,
             live: None,
             tap: None,
+            language: Language::default(),
         })
     }
 
@@ -159,8 +165,7 @@ impl Transcriber for NemotronTranscriber {
             return Ok(String::new());
         }
         let stream = self.inner.create_stream();
-        // Sprache automatisch erkennen (de/en-Mix im Alltag).
-        stream.set_option("language", "auto");
+        stream.set_option("language", self.language.code());
         self.accept(&stream, &pad_with_silence(pcm_16k_mono));
         stream.input_finished();
         while self.inner.is_ready(&stream) {
@@ -172,6 +177,10 @@ impl Transcriber for NemotronTranscriber {
             .map(|r| r.text)
             .unwrap_or_default();
         Ok(text.trim().to_string())
+    }
+
+    fn set_language(&mut self, language: Language) {
+        self.language = language;
     }
 }
 
@@ -256,7 +265,7 @@ impl NemotronTranscriber {
 impl StreamingTranscriber for NemotronTranscriber {
     fn begin(&mut self) {
         let stream = self.inner.create_stream();
-        stream.set_option("language", "auto");
+        stream.set_option("language", self.language.code());
         self.accept(&stream, &[0.0; LEAD_SILENCE_SAMPLES]);
         self.live = Some(stream);
     }
@@ -365,6 +374,14 @@ impl StreamingTranscriber for FakeStreaming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trait-Default von `set_language` ist ein No-op: Fakes bleiben unverändert.
+    #[test]
+    fn set_language_default_is_a_noop_for_fakes() {
+        let mut fake = FakeTranscriber { reply: "x" };
+        fake.set_language(Language::De);
+        assert_eq!(fake.transcribe(&[0.1]).unwrap(), "x");
+    }
 
     /// REQ-DIAG-019: `take` leert, `Clone` teilt den Puffer.
     #[test]
