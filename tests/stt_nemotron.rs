@@ -281,9 +281,11 @@ fn dictate(
     pcm: Vec<f32>,
     start_delay_ms: u64,
     insert_mode: InsertMode,
+    language: Language,
 ) -> (Vec<String>, DictationTrace) {
     let cfg = Config {
         insert_mode,
+        language,
         cleanup_mode: CleanupMode::Raw,
         ..Config::default()
     };
@@ -369,15 +371,70 @@ fn since_press(trace: &DictationTrace, at: Option<HostInstant>) -> String {
 /// `e2e_no_sample_is_lost_for_any_start_delay_and_format` (AK-20).
 /// Schlägt mit einer Tabelle (erwartet / erkannt / →erstes Signal) fehl, wenn nicht.
 fn assert_first_word_present(insert_mode: InsertMode, set: FixtureSet) {
+    let report: Vec<String> = [Language::De, Language::Auto]
+        .into_iter()
+        .filter_map(|language| first_word_failures(insert_mode, set, language))
+        .collect();
+    assert!(report.is_empty(), "{}", report.join("\n\n"));
+}
+
+/// Benannte Ausnahmen: laufen mit und werden ausgegeben, aber nicht geprüft (Entscheidung A1).
+const FIRST_WORD_EXEMPTIONS: [(Language, &str, &str); 2] = [
+    (
+        Language::Auto,
+        "dev-java",
+        "Sprachwahl des Modells bei auto, belegt Runde 3",
+    ),
+    (
+        Language::Auto,
+        "fleurs-de-03",
+        "Sprachwahl des Modells bei auto, belegt Runde 3",
+    ),
+];
+
+fn exemption(language: Language, clip: &str) -> Option<&'static str> {
+    FIRST_WORD_EXEMPTIONS
+        .iter()
+        .find(|(l, name, _)| *l == language && *name == clip)
+        .map(|(_, _, reason)| *reason)
+}
+
+#[test]
+fn exemptions_apply_only_to_the_named_clip_under_auto() {
+    assert!(exemption(Language::Auto, "dev-java").is_some());
+    assert!(exemption(Language::Auto, "fleurs-de-03").is_some());
+    // Unter `de` bleiben beide scharf, ebenso `en`, andere Clips und fleurs-de-13.
+    for language in [Language::De, Language::En] {
+        assert!(exemption(language, "dev-java").is_none());
+        assert!(exemption(language, "fleurs-de-03").is_none());
+    }
+    assert!(exemption(Language::Auto, "fleurs-de-13").is_none());
+    assert!(exemption(Language::Auto, "dev-node").is_none());
+    assert!(exemption(Language::Auto, "").is_none());
+}
+
+/// `Some(Tabelle)` mit den Fehlfällen, `None` wenn alle Clips das erste Wort haben.
+fn first_word_failures(
+    insert_mode: InsertMode,
+    set: FixtureSet,
+    language: Language,
+) -> Option<String> {
     let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut worker = worker();
     let mut failures = Vec::new();
     for (name, wav) in fixtures(set) {
         let expected = first_word(&reference(&wav)).expect("Referenz ohne Wort");
-        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), 0, insert_mode);
+        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), 0, insert_mode, language);
         let result = pieces.concat();
         let got = normalize_words(&result).into_iter().next();
         if got.as_deref() != Some(expected.as_str()) {
+            if let Some(reason) = exemption(language, &name) {
+                println!(
+                    "ausgenommen ({reason}): {name} · {language:?}: {expected} → {} · {result:?}",
+                    got.as_deref().unwrap_or("—")
+                );
+                continue;
+            }
             failures.push(format!(
                 "| {name} | {expected} | {} | {} | {result:?} |",
                 got.as_deref().unwrap_or("—"),
@@ -385,12 +442,16 @@ fn assert_first_word_present(insert_mode: InsertMode, set: FixtureSet) {
             ));
         }
     }
-    println!("{set:?} · {insert_mode:?}: {} Fehlfälle", failures.len());
-    assert!(
-        failures.is_empty(),
-        "erstes Wort fehlt ({insert_mode:?}, {set:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
-        failures.join("\n")
+    println!(
+        "{set:?} · {insert_mode:?} · {language:?}: {} Fehlfälle",
+        failures.len()
     );
+    (!failures.is_empty()).then(|| {
+        format!(
+            "erstes Wort fehlt ({insert_mode:?}, {set:?}, {language:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
+            failures.join("\n")
+        )
+    })
 }
 
 macro_rules! first_word_case {
@@ -400,45 +461,35 @@ macro_rules! first_word_case {
             assert_first_word_present($mode, $set);
         }
     };
-    ($name:ident, $mode:expr, $set:expr, ignore = $reason:expr) => {
-        #[test]
-        #[ignore = $reason]
-        fn $name() {
-            assert_first_word_present($mode, $set);
-        }
-    };
 }
 
-first_word_case!(
-    first_word_at_end_say,
-    InsertMode::AtEnd,
-    FixtureSet::Say,
-    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 90 ms, Behebung in 0039"
-);
+first_word_case!(first_word_at_end_say, InsertMode::AtEnd, FixtureSet::Say);
 first_word_case!(
     first_word_at_end_fleurs,
     InsertMode::AtEnd,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 30 ms, Behebung in 0039"
+    FixtureSet::Fleurs
 );
 first_word_case!(
     first_word_per_sentence_say,
     InsertMode::PerSentence,
-    FixtureSet::Say,
-    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 90 ms, Behebung in 0039"
+    FixtureSet::Say
 );
 first_word_case!(
     first_word_per_sentence_fleurs,
     InsertMode::PerSentence,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 30 ms, Behebung in 0039"
+    FixtureSet::Fleurs
 );
 
 /// REQ-DIAG-033: zwei Sätze mit kurzer Pause, Satzweise → das erste Wort des zweiten Satzes
 /// steht am Anfang des Textes aller Stücke nach dem ersten.
 #[test]
-#[ignore = "bekannt: erste Wörter des zweiten Satzes fehlen nach der Pause (3 von 3 Paaren, z. B. »Hast du schon« fehlt), Behebung in 0039"]
 fn first_word_of_the_second_sentence_survives_the_pause() {
+    for language in [Language::De, Language::Auto] {
+        assert_second_sentence_first_word(language);
+    }
+}
+
+fn assert_second_sentence_first_word(language: Language) {
     let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut worker = worker();
     let pairs = [
@@ -457,7 +508,7 @@ fn first_word_of_the_second_sentence_survives_the_pause() {
         pcm.extend(std::iter::repeat_n(0.0, 19_200)); // 1,2 s Pause
         pcm.extend(read_pcm(&b));
         let expected = first_word(&reference(&b)).expect("Referenz ohne Wort");
-        let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence);
+        let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence, language);
         // REQ-DIAG-033: das erste Wort des zweiten Satzes steht im Text aller Stücke nach dem ersten.
         let last_first = normalize_words(&pieces.get(1..).unwrap_or_default().concat())
             .into_iter()
@@ -472,7 +523,7 @@ fn first_word_of_the_second_sentence_survives_the_pause() {
     }
     assert!(
         failures.is_empty(),
-        "erstes Wort des zweiten Satzes fehlt:\n| Paar | erwartet | erkannt | Stücke | Ergebnis |\n|---|---|---|---|---|\n{}",
+        "erstes Wort des zweiten Satzes fehlt ({language:?}):\n| Paar | erwartet | erkannt | Stücke | Ergebnis |\n|---|---|---|---|---|\n{}",
         failures.join("\n")
     );
 }
