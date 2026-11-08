@@ -812,6 +812,8 @@ pub enum MicReady {
     /// Aufnahme läuft, mit dem für diese Utterance aufgelösten Modus.
     Recording {
         level: audio::LevelHandle,
+        /// Erstes Signal der Aufnahme (REQ-DICT-016): schaltet das Overlay auf Wellen.
+        signal: audio::SignalHandle,
         mode: CleanupMode,
         /// Gesetzt bei Live-Diktat: Strom für den STT-Worker (`run_live`).
         live: Option<LiveFeed>,
@@ -984,6 +986,7 @@ impl PttSession {
                     let format = rec.info().format;
                     on_ready(MicReady::Recording {
                         level: rec.level(),
+                        signal: rec.signal(),
                         mode,
                         live: live.then(|| LiveFeed {
                             trace: Box::new(snapshot),
@@ -1447,6 +1450,45 @@ mod tests {
                 .iter()
                 .all(|t| t.result == DictationResult::Discarded("zu kurz"))
         );
+    }
+
+    /// REQ-DICT-016: `MicReady::Recording` trägt ein Signal-Handle, das bei
+    /// führenden Null-Blöcken erst mit dem ersten Block ≠ 0 wahr wird.
+    #[test]
+    fn mic_ready_signal_arrives_only_with_the_first_nonzero_block() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done = Mutex::new(done_tx);
+        let factory: SourceFactory = Box::new(move |_| {
+            let mut samples = vec![0.0; 3_200];
+            samples.extend(vec![0.1; 1_600]);
+            let mut opts = wav_opts(1_600, 0);
+            opts.pace = audio::Pace::RealTime;
+            let (source, signal) = audio::WavSource::from_samples(samples, opts);
+            let _ = done.lock().unwrap().send(signal);
+            Box::new(source)
+        });
+        let mut session = PttSession::new(factory, Arc::new(|_| {}));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            move |ready| {
+                if let MicReady::Recording { signal, .. } = ready {
+                    let _ = ready_tx.send(signal);
+                }
+            },
+        );
+        let signal = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!signal.arrived(), "Null-Blöcke sind kein Signal");
+        let source_done = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(source_done.wait(std::time::Duration::from_secs(5)));
+        assert!(signal.arrived());
+        session.release(audio::HostInstant::now());
     }
 
     /// Messpunkte bis zum Loslassen: Mikro bereit, Blöcke, Signal, Gerät, Dauer.

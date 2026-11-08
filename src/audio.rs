@@ -234,6 +234,18 @@ impl SignalHandle {
     pub fn arrived(&self) -> bool {
         self.0.first_signal.load(Ordering::Relaxed) != 0
     }
+
+    /// Handgesteuertes Handle für Tests anderer Module (Signal noch nicht da).
+    #[cfg(test)]
+    pub(crate) fn pending() -> Self {
+        Self(Arc::new(MarkCells::default()))
+    }
+
+    /// Setzt das Signal von Hand (nur Tests).
+    #[cfg(test)]
+    pub(crate) fn fire(&self) {
+        self.0.first_signal.store(1, Ordering::Relaxed);
+    }
 }
 
 /// Rohe Aufnahme einer Utterance im Geräteformat.
