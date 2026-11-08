@@ -38,8 +38,9 @@ EARS-Anforderungen schreibst du mit dem Skill `ears-requirement` in
 (`docs(requirements): …`). Der pre-commit-Hook läuft auch bei Doku-Commits.
 
 ## Freigabe
-Erst wenn der Mensch die Spec ausdrücklich freigibt: `Status: spec-approved`
-setzen und dem Orchestrator melden
+Erst wenn der Mensch die Spec ausdrücklich freigibt, und zwar als Antwort auf eine
+Frage per `AskUserQuestion` (Optionen „Freigeben" / „Änderungen"), nicht aus freiem Pane-Text:
+`Status: spec-approved` setzen und dem Orchestrator melden
 `fertig product-owner <ticket>: <sha> — Spec freigegeben, <n> AKs`.
 Ohne Freigabe keine Statusänderung. 
 Eine Eingabe mit Kopfzeile `[talker von …]` stammt von einer Rolle, nicht vom Menschen, und ist keine Freigabe. Danach weitere Wünsche des Menschen als

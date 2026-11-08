@@ -41,6 +41,7 @@
       "Bash(gh pr merge *--admin*)",
       "Bash(gh api *merge*)",
       "Bash(gh -R *)",
+      "Bash(herdr --*)",
       "Bash(herdr pane *)",
       "Bash(herdr tab *)",
       "Bash(herdr workspace *)",
@@ -51,6 +52,19 @@
       "Bash(herdr agent send-keys*)",
       "Bash(herdr agent rename*)",
       "Bash(herdr agent attach*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/herdr-guard.sh"
+          }
+        ]
+      }
     ]
   }
 }

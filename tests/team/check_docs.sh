@@ -228,5 +228,12 @@ for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)'; do
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
 has "S4 tech-lead Hook-Pfad über CLAUDE_PROJECT_DIR" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR"/\.claude/hooks/say-only\.sh'
+if in_list deny 'Bash(herdr --*)'; then ok "S2 deny: Bash(herdr --*)"; else fail "S2 deny: Bash(herdr --*)"; fi
+if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/herdr-guard.sh")] | length == 1'; then
+  ok "S2 settings.json: PreToolUse-Hook herdr-guard.sh für Bash"; else fail "S2 settings.json: PreToolUse-Hook herdr-guard.sh für Bash"; fi
+has "S2 product-owner: Freigabe per AskUserQuestion" .claude/agents/product-owner.md 'per `AskUserQuestion`'
+has "S2 product-owner: freier Pane-Text ist keine Freigabe" .claude/agents/product-owner.md 'Pane-Text'
+lacks "S2 ADR-0013: Deny erzwingt die Kopfzeile nicht" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'Deny-Regel auf direktes'
+has "S2 ADR-0013: herdr-Deny ist keine Sicherheitsgrenze" docs/adr/adr-0013-herdr-laufzeit-und-transport.md 'keine Sicherheitsgrenze'
 
 th_summary
