@@ -109,13 +109,23 @@ Status von ADR-0010.
   hinge der Absender am Turn des Empfängers.
 - Der neue Transport ist an herdr gebunden. Rückweg ist ein Revert.
 - Die Kopfzeile ist eine Verhaltensregel, keine technische Sperre. Die Deny-Regeln auf direktes
-  `herdr …` und der PreToolUse-Hook `herdr-guard.sh` (lehnt jeden Bash-Befehl ab, der `herdr` in Befehlsposition
-  nennt, ohne Rücksicht auf Groß-/Kleinschreibung, außer `herdr agent list|get|read|wait`) machen das Weglassen schwerer; sie sind aber
+  `herdr …` und der PreToolUse-Hook `herdr-guard.sh` machen das Weglassen schwerer; sie sind aber
   keine Sicherheitsgrenze (verschleierte Aufrufe, andere Wege auf den herdr-Socket). Deshalb gilt die
   Spec-Freigabe nur, wenn der Mensch sie auf eine `AskUserQuestion` des PO gibt, nie aus freiem
-  Pane-Text. Freigaben gelten nur über die Akte. Folge des Hooks: Steht `herdr` nur als Argument
-  (grep, Commit-Nachricht, `say.sh`-Text, PR-Titel), bleibt der Befehl frei; nur ein Zeilenumbruch
-  gefolgt von `herdr` (etwa in einer mehrzeiligen Commit-Nachricht) gilt als neuer Befehl und wird abgelehnt.
+  Pane-Text. Freigaben gelten nur über die Akte.
+  Der Hook arbeitet mit einer Positivliste: Das Token `herdr` ist im Befehlstext überall gesperrt
+  (ohne Rücksicht auf Groß-/Kleinschreibung), außer (1) `herdr agent list|get|read|wait` als ganzer Befehl
+  und (2) einem einzelnen einfachen Befehl ohne `;` `&` `|` Backtick `$(` `<(` `>(` und Zeilenumbruch, der mit
+  `git commit`, `git log`, `grep`, `rg`, `gh pr create`, `gh pr merge` oder `sh scripts/team/say.sh` beginnt.
+  Frei sind damit z. B. `grep -rn herdr docs`, `git log --grep herdr`, `git commit -m '…herdr…'`, ein
+  `say.sh`-Text in einfachen Anführungszeichen (auch mit `(` vor dem Token) und `gh pr create --title '…herdr…'`.
+  Gesperrt sind alle anderen Befehle mit dem Token, auch Dateipfade (`git add docs/…herdr…`, `cat docs/herdr`;
+  Ausweg: Glob ohne das Token oder `git add -A`), Präfixe und Wrapper (`eval`, `xargs`, `find -exec`,
+  `sh -xc`, `bash -lc`, `env -i`, `sudo`, `timeout`, Blöcke, `if/then`, `!`) sowie jeder Text mit `; & |`,
+  Backtick, `$(` oder Zeilenumbruch vor oder nach dem Token. Ausweg für mehrzeilige oder lange Texte:
+  die Nachricht in eine Datei schreiben und `git commit -F <datei>` bzw. `gh pr create --body-file <datei>`
+  verwenden (der Befehl enthält das Token dann nicht). Nicht erfasst bleiben Aufrufe, in denen das Token
+  zerlegt oder verschleiert ist (`her""dr`, `rg --pre`).
 - Nach einem Neustart des herdr-Servers stellt herdr das Layout wieder her und
   kann Claude per `claude --resume <id>` wieder aufnehmen, dann aber ohne
   herdr-Namen [5]. `dev.sh` benennt einen solchen Orchestrator um, statt einen
