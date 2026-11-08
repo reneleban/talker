@@ -15,6 +15,11 @@ INTEGRATION="$WT_ROOT/integration"
 READY_MS=${SPAWN_READY_TIMEOUT_MS:-60000}
 ROLES_RE="product-owner|architect|tech-lead|rust-developer|test-engineer|code-reviewer|security-auditor|performance-engineer|merger|release-engineer"
 
+check_feature() {
+  printf '%s' "$FEATURE" | grep -Eq '^(feat|fix|chore)/[a-z0-9-]+$' \
+    || die "Feature-Branch muss ^(feat|fix|chore)/[a-z0-9-]+\$ entsprechen: $FEATURE"
+}
+
 require_clean() {
   [ -z "$(git -C "$1" status --porcelain)" ] || die "$1 hat uncommittete Änderungen"
 }
@@ -55,6 +60,7 @@ ROLE=$1; TICKET=$2; FEATURE=$3
 
 if [ "$ROLE" = init ]; then
   case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
+  check_feature
   git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$FEATURE" >/dev/null \
     || git -C "$MAIN" branch "$FEATURE" main
   if [ -d "$INTEGRATION" ]; then
@@ -71,6 +77,7 @@ fi
 # Prüfungen, alle vor jeder Änderung (kein Worktree, keine Pane)
 need_herdr
 case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
+check_feature
 case $ROLE in
   product-owner|architect|rust-developer|test-engineer|release-engineer) OWN=1; DIR="$WT_ROOT/$ROLE" ;;
   tech-lead|code-reviewer|security-auditor|performance-engineer|merger) OWN=0; DIR="$INTEGRATION" ;;
