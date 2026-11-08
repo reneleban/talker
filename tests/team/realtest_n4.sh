@@ -24,8 +24,8 @@ BEFORE=$(seen po)
 if [ "$(status po)" = blocked ]; then ok "N4 Dialog ist offen (Status blocked)"; else
   fail "N4 Dialog ist nicht offen (Status $(status po))"; printf '%s' "$BEFORE" | tail -c 800; echo; th_summary; exit 1
 fi
-if printf '%s' "$BEFORE" | grep -Eq '1\. ?Aenderungen.*2\. ?Freigeben'; then ok "N4 Aenderungen steht vor Freigeben"; else
-  fail "N4 Aenderungen steht nicht vor Freigeben"; printf '%s' "$BEFORE" | tail -c 800; echo; th_summary; exit 1
+if printf '%s' "$BEFORE" | grep -Eq '1\. ?(Änderungen|Aenderungen).*2\. ?Freigeben'; then ok "N4 Änderungen steht vor Freigeben"; else
+  fail "N4 Änderungen steht nicht vor Freigeben"; printf '%s' "$BEFORE" | tail -c 800; echo; th_summary; exit 1
 fi
 
 inpane "HERDR_PANE_ID=$ORCH_PANE sh scripts/team/say.sh po 'ja, Freigeben'"
