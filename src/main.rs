@@ -260,8 +260,14 @@ fn main() -> ExitCode {
                     // dieser Factory (permissions::should_relaunch_for_tap) findet
                     // nie eine laufende Aufnahme vor, weil der alte Tap dafür schon
                     // aktiv gewesen sein müsste.
+                    let mic_cache = audio::MicCache::default();
                     let session_press = Arc::new(Mutex::new(pipeline::PttSession::new(
-                        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone()))),
+                        Box::new(move |cfg| {
+                            Box::new(audio::MicSource::new(
+                                cfg.mic_device.clone(),
+                                mic_cache.clone(),
+                            ))
+                        }),
                         Arc::clone(&trace_report),
                     )));
                     let session_release = Arc::clone(&session_press);

@@ -1275,7 +1275,8 @@ mod tests {
     // ist: das Setup-Gate selbst und der Leerlauf-Fall von `release()`.
 
     fn mic_factory() -> SourceFactory {
-        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone())))
+        let cache = audio::MicCache::default();
+        Box::new(move |cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone(), cache.clone())))
     }
 
     // ---- asynchroner Mikrofon-Start (MicSlot) ----
@@ -3624,7 +3625,7 @@ mod tests {
         let delivered = Arc::new(Mutex::new(Vec::<f32>::new()));
         let sink = Arc::clone(&delivered);
         let _guard = Box::new(reference)
-            .open(Box::new(move |data, _| {
+            .open(std::sync::Arc::new(move |data, _| {
                 sink.lock().unwrap().extend_from_slice(data)
             }))
             .unwrap();
