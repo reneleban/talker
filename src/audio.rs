@@ -367,6 +367,12 @@ impl<D: Clone> MicCache<D> {
             *slot = Some(entry);
         }
     }
+
+    fn clear(&self) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = None;
+        }
+    }
 }
 
 /// Zugriff auf das Eingabegerät; in Tests ein zählender Fake.
@@ -505,14 +511,10 @@ impl<B: MicBackend> MicSource<B> {
 
     /// Cache-Treffer, wenn Wunsch, Gerät und Format unverändert sind (günstige Prüfabfrage,
     /// keine Aufzählung); sonst volle Neuermittlung.
-    fn resolve(&self) -> Result<(B::Device, MicFormat, String)> {
-        if let Some(c) = self.cache.get()
-            && c.wanted == self.device_name
-            && self.still_current(&c)
-        {
-            return Ok((c.device, c.format, c.label));
-        }
-        self.discover()
+    fn cached(&self) -> Option<(B::Device, MicFormat, String)> {
+        let c = self.cache.get()?;
+        (c.wanted == self.device_name && self.still_current(&c))
+            .then_some((c.device, c.format, c.label))
     }
 
     fn still_current(&self, cached: &CachedMic<B::Device>) -> bool {
@@ -564,8 +566,30 @@ impl<B: MicBackend> MicSource<B> {
 
 impl<B: MicBackend> AudioSource for MicSource<B> {
     fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
-        let (device, format, label) = self.resolve()?;
-        let stop = self.backend.open(&device, format, on_block)?;
+        let (hit, (device, format, label)) = match self.cached() {
+            Some(c) => (true, c),
+            None => (false, self.discover()?),
+        };
+        let started = self.backend.open(&device, format, Arc::clone(&on_block));
+        // Scheitert der Start, bleibt kein Eintrag stehen; mit Cache-Daten gibt es genau einen Neuversuch.
+        let ((format, label), stop) = match started {
+            Ok(stop) => ((format, label), stop),
+            Err(e) => {
+                self.cache.clear();
+                if !hit {
+                    return Err(e);
+                }
+                log::warn!("Mikrofon-Start mit gemerktem Gerät gescheitert ({e}) — neu ermitteln.");
+                let (device, format, label) = self.discover()?;
+                match self.backend.open(&device, format, on_block) {
+                    Ok(stop) => ((format, label), stop),
+                    Err(e) => {
+                        self.cache.clear();
+                        return Err(e);
+                    }
+                }
+            }
+        };
         Ok(Opened {
             info: SourceInfo {
                 format: AudioFormat {
@@ -1919,5 +1943,61 @@ mod tests {
         let src = MicSource::with_backend(None, cache, b.clone());
         assert!(Box::new(src).open(Arc::new(|_, _| {})).is_err());
         assert_eq!(b.0.lock().unwrap().streams, 0);
+    }
+
+    #[test]
+    fn ak6_failed_open_with_cache_retries_once_with_rediscovery() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, Some("USB")));
+        reset_counts(&b);
+        {
+            let mut w = b.0.lock().unwrap();
+            w.opens = 0;
+            w.fail_opens = 1;
+        }
+        let o = press(&b, &cache, Some("USB"));
+        let w = b.0.lock().unwrap();
+        assert_eq!(w.opens, 2, "genau ein Neuversuch");
+        assert_eq!(w.find_by_name, 1, "genau eine Neuermittlung");
+        assert_eq!(w.streams, 1);
+        assert_eq!(o.info.device, "Mic usb");
+    }
+
+    #[test]
+    fn ak6_both_opens_fail_returns_err_without_third_attempt() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, None));
+        {
+            let mut w = b.0.lock().unwrap();
+            w.opens = 0;
+            w.fail_opens = 5;
+        }
+        let src = MicSource::with_backend(None, cache, b.clone());
+        assert!(Box::new(src).open(Arc::new(|_, _| {})).is_err());
+        let w = b.0.lock().unwrap();
+        assert_eq!(w.opens, 2, "höchstens 2 Versuche");
+        assert_eq!(w.streams, 0);
+    }
+
+    #[test]
+    fn ak6_first_press_without_cache_does_not_retry() {
+        let (b, cache) = world();
+        b.0.lock().unwrap().fail_opens = 5;
+        let src = MicSource::with_backend(None, cache, b.clone());
+        assert!(Box::new(src).open(Arc::new(|_, _| {})).is_err());
+        assert_eq!(b.0.lock().unwrap().opens, 1);
+    }
+
+    #[test]
+    fn ak6_failed_open_does_not_keep_failing_device_cached() {
+        let (b, cache) = world();
+        b.0.lock().unwrap().fail_opens = 1;
+        let src = MicSource::with_backend(None, cache.clone(), b.clone());
+        assert!(Box::new(src).open(Arc::new(|_, _| {})).is_err());
+        reset_counts(&b);
+        drop(press(&b, &cache, None));
+        // Ohne Cache-Eintrag: volle Ermittlung, danach kein Neuversuch nötig.
+        assert_eq!(b.0.lock().unwrap().opens, 2);
+        assert!(cache.get().is_some());
     }
 }
