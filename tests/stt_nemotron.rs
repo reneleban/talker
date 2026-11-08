@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use talker::config::Language;
 use talker::stt::{NemotronTranscriber, StreamingTranscriber, Transcriber};
 
 fn read_wav_16k_mono(path: &str) -> Vec<f32> {
@@ -51,6 +52,90 @@ fn transcribes_english_sample() {
     for expected in ["test", "speech recognition", "computer"] {
         assert!(text.contains(expected), "»{expected}« fehlt in: {text:?}");
     }
+}
+
+const DE_WORDS: [&str; 3] = ["test", "spracherkennung", "rechner"];
+const EN_WORDS: [&str; 3] = ["test", "speech recognition", "computer"];
+
+fn batch_with(language: Language, fixture: &str) -> String {
+    let pcm = read_wav_16k_mono(fixture);
+    let mut t = transcriber();
+    t.set_language(language);
+    t.transcribe(&pcm).unwrap().to_lowercase()
+}
+
+fn live_with(language: Language, fixture: &str) -> String {
+    let pcm = read_wav_16k_mono(fixture);
+    let mut t = transcriber();
+    t.set_language(language);
+    let (updates, rest) = stream(&mut t, &pcm);
+    let finals = updates
+        .iter()
+        .filter(|u| u.endpoint)
+        .map(|u| u.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{finals} {rest}").to_lowercase()
+}
+
+fn assert_contains_all(text: &str, words: [&str; 3]) {
+    for expected in words {
+        assert!(text.contains(expected), "»{expected}« fehlt in: {text:?}");
+    }
+}
+
+/// AK-7 / REQ-DICT-024: Sprache je Pfad (Batch + Live) und je Wert.
+#[test]
+fn set_language_de_recognizes_german_in_batch_and_live() {
+    assert_contains_all(
+        &batch_with(Language::De, "tests/fixtures/de_test.wav"),
+        DE_WORDS,
+    );
+    assert_contains_all(
+        &live_with(Language::De, "tests/fixtures/de_test.wav"),
+        DE_WORDS,
+    );
+}
+
+#[test]
+fn set_language_auto_and_en_recognize_english_in_batch_and_live() {
+    for language in [Language::Auto, Language::En] {
+        assert_contains_all(
+            &batch_with(language, "tests/fixtures/en_test.wav"),
+            EN_WORDS,
+        );
+        assert_contains_all(&live_with(language, "tests/fixtures/en_test.wav"), EN_WORDS);
+    }
+}
+
+/// „Darf nicht passieren“: `De` fällt nicht still auf `auto` zurück – ein anderer Code
+/// (`en`) auf deutschem Audio liefert nachweislich einen anderen Text als `de`.
+#[test]
+fn set_language_value_reaches_the_model_not_silently_auto() {
+    let de = batch_with(Language::De, "tests/fixtures/de_test.wav");
+    let en = batch_with(Language::En, "tests/fixtures/de_test.wav");
+    println!("de: {de:?}\nen: {en:?}");
+    assert_ne!(de, en, "Sprachcode wirkt nicht auf das Modell");
+}
+
+/// Eine laufende Live-Utterance behält die Sprache ihres `begin`.
+#[test]
+fn live_utterance_keeps_the_language_of_its_begin() {
+    let pcm = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let mut t = transcriber();
+    t.set_language(Language::De);
+    t.begin();
+    t.set_language(Language::En);
+    let mut text = String::new();
+    for c in pcm.chunks(8_960) {
+        let u = t.feed(c).unwrap();
+        if u.endpoint {
+            text.push_str(&u.text);
+            text.push(' ');
+        }
+    }
+    text.push_str(&t.finish().unwrap());
+    assert_contains_all(&text.to_lowercase(), DE_WORDS);
 }
 
 /// 560-ms-Chunks wie im Live-Betrieb einspeisen.
