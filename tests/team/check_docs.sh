@@ -4,6 +4,8 @@
 cd "$TH_SRC" || exit 1
 
 SETTINGS=.claude/settings.json
+# Basis der Diff-Prüfungen: Abzweigpunkt von origin/main; fehlt er, scheitern sie (statt still zu bestehen).
+BASE=$(git merge-base origin/main HEAD 2>/dev/null || true)
 
 # --- T12: settings.json (AK-15) ---
 if jq -e . "$SETTINGS" >/dev/null 2>&1; then ok "AK-15 settings.json ist gültiges JSON"; else fail "AK-15 settings.json ist gültiges JSON"; fi
@@ -15,9 +17,11 @@ for e in 'Bash(herdr pane *)' 'Bash(herdr tab *)' 'Bash(herdr workspace *)' 'Bas
   'Bash(herdr agent start*)' 'Bash(herdr agent prompt*)' 'Bash(herdr agent send-keys*)' 'Bash(herdr agent rename*)' 'Bash(herdr agent attach*)'; do
   if in_list deny "$e"; then ok "AK-15 deny: $e"; else fail "AK-15 deny: $e"; fi
 done
-if git cat-file -e 586bff4:"$SETTINGS" 2>/dev/null; then
+if [ -z "$BASE" ]; then
+  fail "AK-15 bestehende Einträge unverändert (Basis origin/main nicht bestimmbar)"
+elif git cat-file -e "$BASE":"$SETTINGS" 2>/dev/null; then
   for list in allow deny; do
-    git show 586bff4:"$SETTINGS" | jq -r ".permissions.$list[]" | while IFS= read -r e; do
+    git show "$BASE":"$SETTINGS" | jq -r ".permissions.$list[]" | while IFS= read -r e; do
       case $e in 'Bash(gh pr merge*)' | 'Bash(gh pr ready*)') continue ;; esac # AK-31: bewusst entfernt
       if in_list "$list" "$e"; then echo "ok   bestehender $list-Eintrag: $e"; else echo "FAIL bestehender $list-Eintrag fehlt: $e"; fi
     done
@@ -25,7 +29,7 @@ if git cat-file -e 586bff4:"$SETTINGS" 2>/dev/null; then
   grep -q '^FAIL' "${TMPDIR:-/tmp}/check_docs.$$" && { grep '^FAIL' "${TMPDIR:-/tmp}/check_docs.$$"; fail "AK-15 bestehende Einträge unverändert"; } || ok "AK-15 bestehende Einträge unverändert"
   rm -f "${TMPDIR:-/tmp}/check_docs.$$"
 else
-  skip "bestehende Einträge: Basis-Commit 586bff4 nicht vorhanden"
+  ok "AK-15 bestehende Einträge: Basis hat noch keine settings.json"
 fi
 
 
@@ -200,7 +204,11 @@ for e in 'Bash(gh pr ready *)' 'Bash(gh pr merge --squash *)' 'Bash(gh pr checks
   if in_list allow "$e"; then ok "AK-31 allow: $e"; else fail "AK-31 allow: $e"; fi
 done
 if in_list deny 'Bash(gh pr merge *--admin*)'; then ok "AK-31 deny: gh pr merge --admin"; else fail "AK-31 deny: gh pr merge --admin"; fi
-assert_eq "OoS CONTRIBUTING.md unverändert" "" "$(git diff --name-only a08241b -- CONTRIBUTING.md .github)"
+if [ -z "$BASE" ]; then
+  fail "OoS CONTRIBUTING.md unverändert (Basis origin/main nicht bestimmbar)"
+else
+  assert_eq "OoS CONTRIBUTING.md unverändert" "" "$(git diff --name-only "$BASE" -- CONTRIBUTING.md .github)"
+fi
 
 # --- Fix-Runde 1 ---
 lacks "C3 orchestrator description: nicht bis zum Draft-PR" .claude/agents/orchestrator.md '^description:.*bis zum Draft-PR'
