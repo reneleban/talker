@@ -279,7 +279,7 @@ impl Captured {
 }
 
 /// Wird je Block auf dem Thread der Quelle aufgerufen (Audio-Callback: keine Datei-I/O, kein Log).
-pub type OnBlock = Box<dyn FnMut(&[f32], HostInstant) + Send>;
+pub type OnBlock = Arc<dyn Fn(&[f32], HostInstant) + Send + Sync>;
 
 /// Geöffnete Quelle: Drop von `stop` beendet die Lieferung — danach kommt kein Block mehr.
 pub struct Opened {
@@ -324,52 +324,126 @@ fn i16_to_f32(data: &[i16], out: &mut Vec<f32>) {
     out.extend(data.iter().map(|&s| f32::from(s) / 32768.0));
 }
 
-/// Mikrofon über cpal (CoreAudio). `device_name`: Gerät per Name aus der Config,
-/// nicht (mehr) vorhanden → Fallback auf das System-Default-Mikrofon.
-pub struct MicSource {
-    device_name: Option<String>,
+/// Format des Eingabegeräts; Teil des Gerätecaches (Änderung → neu ermitteln).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MicFormat {
+    channels: u16,
+    sample_rate: u32,
+    sample_format: SampleFormat,
 }
 
-impl MicSource {
-    pub fn new(device_name: Option<String>) -> Self {
-        Self { device_name }
+/// Gemerkt wird nur Geräte-Referenz und Format — nie ein Stream (ADR-0014 §2).
+#[derive(Clone)]
+struct CachedMic<D> {
+    wanted: Option<String>,
+    device: D,
+    uid: String,
+    format: MicFormat,
+    label: String,
+}
+
+/// Gerätecache über Tastendrücke hinweg; gesperrt wird er nur kurz auf dem Start-Thread.
+pub struct MicCache<D = cpal::Device>(Arc<Mutex<Option<CachedMic<D>>>>);
+
+impl<D> Clone for MicCache<D> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
     }
 }
 
-impl AudioSource for MicSource {
-    fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
-        let host = cpal::default_host();
-        let device = self
-            .device_name
-            .as_deref()
-            .and_then(|wanted| {
-                let found = host
-                    .input_devices()
-                    .ok()?
-                    .find(|d| d.description().is_ok_and(|desc| desc.name() == wanted));
-                if found.is_none() {
-                    log::warn!("Mikrofon »{wanted}« nicht gefunden — nutze System-Default.");
-                }
-                found
-            })
-            .or_else(|| host.default_input_device())
-            .ok_or_else(|| TalkerError::Audio("kein Mikrofon verfügbar".into()))?;
-        let device_label = device
+impl<D> Default for MicCache<D> {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+}
+
+impl<D: Clone> MicCache<D> {
+    fn get(&self) -> Option<CachedMic<D>> {
+        self.0.lock().ok()?.clone()
+    }
+
+    fn set(&self, entry: CachedMic<D>) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(entry);
+        }
+    }
+}
+
+/// Zugriff auf das Eingabegerät; in Tests ein zählender Fake.
+pub trait MicBackend: Send {
+    type Device: Clone + Send;
+    /// Standard-Eingabegerät (keine Aufzählung).
+    fn default_device(&self) -> Option<Self::Device>;
+    /// Gerät per Name (Aufzählung).
+    fn find_by_name(&self, name: &str) -> Option<Self::Device>;
+    /// Stabile Kennung; `Err` = Gerät weg.
+    fn uid(&self, device: &Self::Device) -> Result<String>;
+    fn label(&self, device: &Self::Device) -> String;
+    fn format(&self, device: &Self::Device) -> Result<MicFormat>;
+    /// Stream bauen und starten; Drop des Ergebnisses beendet ihn.
+    fn open(
+        &self,
+        device: &Self::Device,
+        format: MicFormat,
+        on_block: OnBlock,
+    ) -> Result<Box<dyn Send>>;
+}
+
+pub struct CpalBackend;
+
+impl MicBackend for CpalBackend {
+    type Device = cpal::Device;
+
+    fn default_device(&self) -> Option<cpal::Device> {
+        cpal::default_host().default_input_device()
+    }
+
+    fn find_by_name(&self, name: &str) -> Option<cpal::Device> {
+        cpal::default_host()
+            .input_devices()
+            .ok()?
+            .find(|d| d.description().is_ok_and(|desc| desc.name() == name))
+    }
+
+    fn uid(&self, device: &cpal::Device) -> Result<String> {
+        device
+            .id()
+            .map(|id| id.to_string())
+            .map_err(|e| TalkerError::Audio(format!("Geräte-ID nicht lesbar: {e}")))
+    }
+
+    fn label(&self, device: &cpal::Device) -> String {
+        device
             .description()
             .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "unbekannt".into());
+            .unwrap_or_else(|_| "unbekannt".into())
+    }
+
+    fn format(&self, device: &cpal::Device) -> Result<MicFormat> {
         let supported = device
             .default_input_config()
             .map_err(|e| TalkerError::Audio(format!("Eingabeformat nicht lesbar: {e}")))?;
-        let sample_format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
-        let format = AudioFormat {
-            channels: config.channels,
-            sample_rate: config.sample_rate,
+        Ok(MicFormat {
+            channels: supported.channels(),
+            sample_rate: supported.sample_rate(),
+            sample_format: supported.sample_format(),
+        })
+    }
+
+    fn open(
+        &self,
+        device: &cpal::Device,
+        format: MicFormat,
+        on_block: OnBlock,
+    ) -> Result<Box<dyn Send>> {
+        let config = cpal::StreamConfig {
+            channels: format.channels,
+            sample_rate: format.sample_rate,
+            buffer_size: cpal::BufferSize::Default,
         };
         let err_fn = |e| log::warn!("Audio-Stream-Fehler: {e}");
 
-        let stream = match sample_format {
+        let stream = match format.sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 config,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
@@ -402,13 +476,105 @@ impl AudioSource for MicSource {
         stream
             .play()
             .map_err(|e| TalkerError::Audio(format!("Aufnahme-Start fehlgeschlagen: {e}")))?;
+        Ok(Box::new(stream))
+    }
+}
 
+/// Mikrofon über cpal (CoreAudio). `device_name`: Gerät per Name aus der Config,
+/// nicht (mehr) vorhanden → Fallback auf das System-Default-Mikrofon.
+pub struct MicSource<B: MicBackend = CpalBackend> {
+    device_name: Option<String>,
+    cache: MicCache<B::Device>,
+    backend: B,
+}
+
+impl MicSource {
+    pub fn new(device_name: Option<String>, cache: MicCache) -> Self {
+        Self::with_backend(device_name, cache, CpalBackend)
+    }
+}
+
+impl<B: MicBackend> MicSource<B> {
+    fn with_backend(device_name: Option<String>, cache: MicCache<B::Device>, backend: B) -> Self {
+        Self {
+            device_name,
+            cache,
+            backend,
+        }
+    }
+
+    /// Cache-Treffer, wenn Wunsch, Gerät und Format unverändert sind (günstige Prüfabfrage,
+    /// keine Aufzählung); sonst volle Neuermittlung.
+    fn resolve(&self) -> Result<(B::Device, MicFormat, String)> {
+        if let Some(c) = self.cache.get()
+            && c.wanted == self.device_name
+            && self.still_current(&c)
+        {
+            return Ok((c.device, c.format, c.label));
+        }
+        self.discover()
+    }
+
+    fn still_current(&self, cached: &CachedMic<B::Device>) -> bool {
+        let same_device = match self.device_name {
+            None => self
+                .backend
+                .default_device()
+                .and_then(|d| self.backend.uid(&d).ok())
+                .is_some_and(|uid| uid == cached.uid),
+            Some(_) => self
+                .backend
+                .uid(&cached.device)
+                .is_ok_and(|uid| uid == cached.uid),
+        };
+        same_device
+            && self
+                .backend
+                .format(&cached.device)
+                .is_ok_and(|f| f == cached.format)
+    }
+
+    fn discover(&self) -> Result<(B::Device, MicFormat, String)> {
+        let named = self.device_name.as_deref().and_then(|wanted| {
+            let found = self.backend.find_by_name(wanted);
+            if found.is_none() {
+                log::warn!("Mikrofon »{wanted}« nicht gefunden — nutze System-Default.");
+            }
+            found
+        });
+        // Ausweichen aufs Standardgerät wird nicht gemerkt: jeder Druck sucht wieder per Name.
+        let cacheable = self.device_name.is_none() || named.is_some();
+        let device = named
+            .or_else(|| self.backend.default_device())
+            .ok_or_else(|| TalkerError::Audio("kein Mikrofon verfügbar".into()))?;
+        let format = self.backend.format(&device)?;
+        let label = self.backend.label(&device);
+        if cacheable && let Ok(uid) = self.backend.uid(&device) {
+            self.cache.set(CachedMic {
+                wanted: self.device_name.clone(),
+                device: device.clone(),
+                uid,
+                format,
+                label: label.clone(),
+            });
+        }
+        Ok((device, format, label))
+    }
+}
+
+impl<B: MicBackend> AudioSource for MicSource<B> {
+    fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
+        let (device, format, label) = self.resolve()?;
+        let stop = self.backend.open(&device, format, on_block)?;
         Ok(Opened {
             info: SourceInfo {
-                format,
-                device: device_label,
+                format: AudioFormat {
+                    channels: format.channels,
+                    sample_rate: format.sample_rate,
+                },
+                device: label,
             },
-            stop: Box::new(stream),
+            stop,
         })
     }
 }
@@ -534,7 +700,7 @@ impl Drop for WavGuard {
 }
 
 impl AudioSource for WavSource {
-    fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+    fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
         let WavSource {
             mono_16k,
             opts,
@@ -621,7 +787,7 @@ pub fn start(source: Box<dyn AudioSource>, live: Option<Sender<Feed>>) -> Result
         let level = level.clone();
         let marks = Arc::clone(&marks);
         let live = live.clone();
-        Box::new(move |data, at| {
+        Arc::new(move |data, at| {
             marks.record(data, at);
             level.set(rms(data));
             if let Ok(mut b) = buf.lock() {
@@ -1028,7 +1194,7 @@ mod tests {
     }
 
     impl AudioSource for ScriptedSource {
-        fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+        fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
             for (i, block) in self.blocks.iter().enumerate() {
                 on_block(block, HostInstant::from_nanos(1_000 * (i as u64 + 1)));
             }
@@ -1178,7 +1344,7 @@ mod tests {
     fn marks_are_set_once_and_accept_a_zero_timestamp() {
         struct ZeroStart;
         impl AudioSource for ZeroStart {
-            fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+            fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
                 on_block(&[0.5], HostInstant::from_nanos(0));
                 on_block(&[0.7], HostInstant::from_nanos(50));
                 Ok(Opened {
@@ -1247,7 +1413,7 @@ mod tests {
         let got = Arc::new(Mutex::new((Vec::new(), Vec::new())));
         let sink = Arc::clone(&got);
         let opened = Box::new(source)
-            .open(Box::new(move |data, at| {
+            .open(Arc::new(move |data, at| {
                 let mut g = sink.lock().unwrap();
                 g.0.push(data.to_vec());
                 g.1.push(at);
@@ -1372,7 +1538,7 @@ mod tests {
         let seen = Arc::clone(&count);
         let (tx, rx) = std::sync::mpsc::channel();
         let opened = Box::new(source)
-            .open(Box::new(move |_, _| {
+            .open(Arc::new(move |_, _| {
                 seen.fetch_add(1, Ordering::SeqCst);
                 let _ = tx.send(());
             }))
@@ -1453,7 +1619,7 @@ mod tests {
     #[test]
     fn zero_sample_rate_fails_at_open_not_with_a_panic() {
         let (source, _done) = WavSource::from_samples(ramp(10), wav_opts(1, 0, 160, 0));
-        assert!(Box::new(source).open(Box::new(|_, _| {})).is_err());
+        assert!(Box::new(source).open(Arc::new(|_, _| {})).is_err());
     }
 
     /// Führende Null-Blöcke über `Recording` → erster Block < erstes Signal (AK-10 mit WavSource).
@@ -1476,7 +1642,7 @@ mod tests {
     }
 
     impl AudioSource for GatedSource {
-        fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+        fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
             std::thread::spawn(move || {
                 while let Ok(block) = self.blocks.recv() {
                     on_block(&block, HostInstant::from_nanos(1));
@@ -1546,5 +1712,212 @@ mod tests {
         blocks.send(Vec::new()).unwrap();
         acks.recv().unwrap();
         assert!(!rec.signal().arrived());
+    }
+
+    // ---- Gerätecache (MicSource) ----
+
+    #[derive(Default)]
+    struct World {
+        default_uid: String,
+        named: Vec<(String, String)>,
+        formats: Vec<(String, MicFormat)>,
+        gone: Vec<String>,
+        find_by_name: usize,
+        default_device: usize,
+        uid: usize,
+        format: usize,
+        opens: usize,
+        fail_opens: usize,
+        streams: usize,
+    }
+
+    #[derive(Clone)]
+    struct FakeBackend(Arc<Mutex<World>>);
+
+    struct StreamGuard(Arc<Mutex<World>>);
+    impl Drop for StreamGuard {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().streams -= 1;
+        }
+    }
+
+    fn fmt(rate: u32, channels: u16) -> MicFormat {
+        MicFormat {
+            channels,
+            sample_rate: rate,
+            sample_format: SampleFormat::F32,
+        }
+    }
+
+    impl MicBackend for FakeBackend {
+        type Device = String;
+        fn default_device(&self) -> Option<String> {
+            let mut w = self.0.lock().unwrap();
+            w.default_device += 1;
+            Some(w.default_uid.clone())
+        }
+        fn find_by_name(&self, name: &str) -> Option<String> {
+            let mut w = self.0.lock().unwrap();
+            w.find_by_name += 1;
+            w.named
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, u)| u.clone())
+        }
+        fn uid(&self, d: &String) -> Result<String> {
+            let mut w = self.0.lock().unwrap();
+            w.uid += 1;
+            if w.gone.contains(d) {
+                return Err(TalkerError::Audio("weg".into()));
+            }
+            Ok(d.clone())
+        }
+        fn label(&self, d: &String) -> String {
+            format!("Mic {d}")
+        }
+        fn format(&self, d: &String) -> Result<MicFormat> {
+            let mut w = self.0.lock().unwrap();
+            w.format += 1;
+            Ok(w.formats
+                .iter()
+                .find(|(u, _)| u == d)
+                .map_or(fmt(48_000, 1), |(_, f)| *f))
+        }
+        fn open(&self, _: &String, _: MicFormat, _: OnBlock) -> Result<Box<dyn Send>> {
+            let mut w = self.0.lock().unwrap();
+            w.opens += 1;
+            if w.fail_opens > 0 {
+                w.fail_opens -= 1;
+                return Err(TalkerError::Audio("open scheitert".into()));
+            }
+            w.streams += 1;
+            Ok(Box::new(StreamGuard(Arc::clone(&self.0))))
+        }
+    }
+
+    fn world() -> (FakeBackend, MicCache<String>) {
+        let w = World {
+            default_uid: "built-in".into(),
+            named: vec![("USB".into(), "usb".into())],
+            ..World::default()
+        };
+        (FakeBackend(Arc::new(Mutex::new(w))), MicCache::default())
+    }
+
+    /// Ein Tastendruck: öffnen, Opened zurückgeben.
+    fn press(b: &FakeBackend, cache: &MicCache<String>, wanted: Option<&str>) -> Opened {
+        let src = MicSource::with_backend(wanted.map(String::from), cache.clone(), b.clone());
+        Box::new(src).open(Arc::new(|_, _| {})).unwrap()
+    }
+
+    fn reset_counts(b: &FakeBackend) {
+        let mut w = b.0.lock().unwrap();
+        w.find_by_name = 0;
+        w.default_device = 0;
+        w.uid = 0;
+        w.format = 0;
+    }
+
+    #[test]
+    fn ak4_second_press_default_uses_cache_without_enumeration() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, None));
+        assert_eq!(b.0.lock().unwrap().streams, 0, "kein Stream nach Loslassen");
+        reset_counts(&b);
+        let o = press(&b, &cache, None);
+        let w = b.0.lock().unwrap();
+        assert_eq!(w.find_by_name, 0);
+        assert!(w.default_device <= 1 && w.uid <= 1 && w.format <= 1);
+        assert_eq!(o.info.device, "Mic built-in");
+        assert_eq!(o.info.format.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn ak4_second_press_named_uses_cache_without_enumeration() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, Some("USB")));
+        reset_counts(&b);
+        let o = press(&b, &cache, Some("USB"));
+        let w = b.0.lock().unwrap();
+        assert_eq!(w.find_by_name, 0);
+        assert_eq!(w.default_device, 0);
+        assert!(w.uid <= 1 && w.format <= 1);
+        assert_eq!(o.info.device, "Mic usb");
+    }
+
+    #[test]
+    fn ak4_no_stream_stays_open_between_recordings() {
+        let (b, cache) = world();
+        let o = press(&b, &cache, None);
+        assert_eq!(b.0.lock().unwrap().streams, 1);
+        drop(o);
+        assert_eq!(b.0.lock().unwrap().streams, 0);
+    }
+
+    #[test]
+    fn ak5a_changed_mic_device_uses_new_device() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, None));
+        let o = press(&b, &cache, Some("USB"));
+        assert_eq!(o.info.device, "Mic usb");
+    }
+
+    #[test]
+    fn ak5b_changed_default_device_is_picked_up() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, None));
+        b.0.lock().unwrap().default_uid = "airpods".into();
+        let o = press(&b, &cache, None);
+        assert_eq!(o.info.device, "Mic airpods");
+    }
+
+    #[test]
+    fn ak5c_changed_format_is_picked_up() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, None));
+        b.0.lock()
+            .unwrap()
+            .formats
+            .push(("built-in".into(), fmt(44_100, 2)));
+        let o = press(&b, &cache, None);
+        assert_eq!(o.info.format.sample_rate, 44_100);
+        assert_eq!(o.info.format.channels, 2);
+    }
+
+    #[test]
+    fn unplugged_named_device_is_rediscovered() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, Some("USB")));
+        {
+            let mut w = b.0.lock().unwrap();
+            w.gone.push("usb".into());
+            w.named.clear();
+        }
+        reset_counts(&b);
+        let o = press(&b, &cache, Some("USB"));
+        assert_eq!(b.0.lock().unwrap().find_by_name, 1);
+        assert_eq!(o.info.device, "Mic built-in");
+    }
+
+    #[test]
+    fn missing_named_device_fallback_is_not_cached() {
+        let (b, cache) = world();
+        drop(press(&b, &cache, Some("Nope")));
+        reset_counts(&b);
+        drop(press(&b, &cache, Some("Nope")));
+        assert_eq!(
+            b.0.lock().unwrap().find_by_name,
+            1,
+            "jeder Druck sucht per Name"
+        );
+    }
+
+    #[test]
+    fn open_error_is_returned_and_leaves_no_stream() {
+        let (b, cache) = world();
+        b.0.lock().unwrap().fail_opens = 1;
+        let src = MicSource::with_backend(None, cache, b.clone());
+        assert!(Box::new(src).open(Arc::new(|_, _| {})).is_err());
+        assert_eq!(b.0.lock().unwrap().streams, 0);
     }
 }
