@@ -157,6 +157,8 @@ Erkennung von Geräte- und Formatwechseln:
 - „Taste→Mikro bereit" in der Messzeile bleibt der Zeitpunkt nach
   `audio::start`, ohne Bedeutungswechsel. Das erste Signal steht schon heute in der
   Zeile.
+- AK-4 aus Ticket-0039 ist entsprechend präzisiert (Entscheidung des Menschen, 2026-11-08):
+  keine Aufzählung und keine volle Neuermittlung je Druck, die Prüfabfrage ist zulässig.
 - Je Druck bleiben etwa 4 CoreAudio-Property-Abfragen sowie Stream-Aufbau und
   `play()`. Den Stream-Aufbau zu sparen ist Sache von 0040 (vorgebauter Stream),
   das auf `MicCache` aufsetzen kann.
