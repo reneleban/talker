@@ -224,6 +224,18 @@ impl MarkCells {
     }
 }
 
+/// Lesender Griff auf das erste Signal einer laufenden Aufnahme (REQ-DICT-016):
+/// `arrived()` ist wahr, sobald ein Block mit einem Sample ≠ 0 eingetroffen ist.
+/// Nur ein Atomic-Load — der Audio-Callback meldet nichts, der Verbraucher fragt.
+#[derive(Clone)]
+pub struct SignalHandle(Arc<MarkCells>);
+
+impl SignalHandle {
+    pub fn arrived(&self) -> bool {
+        self.0.first_signal.load(Ordering::Relaxed) != 0
+    }
+}
+
 /// Rohe Aufnahme einer Utterance im Geräteformat.
 #[derive(Debug)]
 pub struct Captured {
@@ -626,6 +638,11 @@ impl Recording {
     /// Handle auf den Live-Pegel (fürs Aufnahme-Overlay).
     pub fn level(&self) -> LevelHandle {
         self.level.clone()
+    }
+
+    /// Griff auf das erste Signal (fürs Aufnahme-Overlay).
+    pub fn signal(&self) -> SignalHandle {
+        SignalHandle(Arc::clone(&self.marks))
     }
 
     /// Format und Gerät der Quelle — Eingabe für [`ChunkAssembler::new`].
@@ -1438,5 +1455,84 @@ mod tests {
         let captured = rec.stop();
         assert!(captured.marks.first_block < captured.marks.first_signal);
         assert_eq!(captured.raw.len(), 4_800);
+    }
+
+    /// Quelle, die Blöcke erst auf Kommando liefert und jeden Block quittiert.
+    struct GatedSource {
+        blocks: std::sync::mpsc::Receiver<Vec<f32>>,
+        acks: std::sync::mpsc::Sender<()>,
+    }
+
+    impl AudioSource for GatedSource {
+        fn open(self: Box<Self>, mut on_block: OnBlock) -> Result<Opened> {
+            std::thread::spawn(move || {
+                while let Ok(block) = self.blocks.recv() {
+                    on_block(&block, HostInstant::from_nanos(1));
+                    let _ = self.acks.send(());
+                }
+            });
+            Ok(Opened {
+                info: SourceInfo {
+                    format: AudioFormat {
+                        channels: 1,
+                        sample_rate: 16_000,
+                    },
+                    device: "x".into(),
+                },
+                stop: Box::new(()),
+            })
+        }
+    }
+
+    fn gated() -> (
+        Recording,
+        std::sync::mpsc::Sender<Vec<f32>>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (block_tx, block_rx) = std::sync::mpsc::channel();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let source = GatedSource {
+            blocks: block_rx,
+            acks: ack_tx,
+        };
+        (start(Box::new(source), None).unwrap(), block_tx, ack_rx)
+    }
+
+    /// REQ-DICT-016: erst der Block mit einem Sample ≠ 0 setzt `arrived()`; Clones teilen den Zustand.
+    #[test]
+    fn signal_arrives_with_the_first_nonzero_block_and_clones_share_it() {
+        let (rec, blocks, acks) = gated();
+        let signal = rec.signal();
+        let clone = signal.clone();
+        assert!(!signal.arrived(), "vor dem ersten Block");
+        for _ in 0..2 {
+            blocks.send(vec![0.0; 4]).unwrap();
+            acks.recv().unwrap();
+            assert!(!signal.arrived() && !clone.arrived(), "Null-Block");
+        }
+        blocks.send(vec![0.0, 1e-9]).unwrap();
+        acks.recv().unwrap();
+        assert!(signal.arrived() && clone.arrived());
+        blocks.send(vec![0.0; 4]).unwrap();
+        acks.recv().unwrap();
+        assert!(signal.arrived(), "bleibt wahr");
+    }
+
+    #[test]
+    fn signal_is_true_from_the_first_block_with_a_single_nonzero_sample() {
+        let (rec, blocks, acks) = gated();
+        blocks.send(vec![0.0, 0.0, 1e-9, 0.0]).unwrap();
+        acks.recv().unwrap();
+        assert!(rec.signal().arrived());
+    }
+
+    #[test]
+    fn signal_stays_false_with_only_zero_blocks() {
+        let (rec, blocks, acks) = gated();
+        blocks.send(vec![0.0; 4]).unwrap();
+        acks.recv().unwrap();
+        blocks.send(Vec::new()).unwrap();
+        acks.recv().unwrap();
+        assert!(!rec.signal().arrived());
     }
 }
