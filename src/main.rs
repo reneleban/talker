@@ -283,7 +283,12 @@ fn main() -> ExitCode {
                             );
                             let on_ready = move |ready: pipeline::MicReady| {
                                 match ready {
-                                    pipeline::MicReady::Recording { level, mode, live } => {
+                                    pipeline::MicReady::Recording {
+                                        level,
+                                        signal,
+                                        mode,
+                                        live,
+                                    } => {
                                         if let Some(feed) = live
                                             && let Err(mpsc::SendError(job)) =
                                                 stt_ready.send(pipeline::SttJob::Live { feed })
@@ -299,7 +304,7 @@ fn main() -> ExitCode {
                                         // (inkl. aufgelöstem Modus); das Tray leitet
                                         // sein Icon daraus ab (Ticket-0035).
                                         if let Ok(mut ind) = ind_ready.lock() {
-                                            ind.start_recording(Instant::now(), level, mode);
+                                            ind.mic_started(level, signal, mode);
                                         }
                                     }
                                     pipeline::MicReady::Failed(e) => {
