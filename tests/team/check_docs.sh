@@ -207,5 +207,10 @@ lacks "C3 orchestrator description: nicht bis zum Draft-PR" .claude/agents/orche
 has "C3 orchestrator description: bis zum Merge" .claude/agents/orchestrator.md '^description:.*bis zum Merge'
 has "C6 release-engineer description: Komma nach Feature-Branch" .claude/agents/release-engineer.md '^description:.*Feature-Branch, öffnet'
 has "C5 ADR-0010 Kontext verweist auf den Änderungsvermerk" docs/adr/adr-0010-agenten-team.md 'automatisch bis zum Draft-PR \(.*Änderungsvermerk'
+has "C7 orchestrator: spawn.sh close <name> aus der bereit-Zeile" .claude/agents/orchestrator.md 'spawn\.sh close <name>.*bereit'
+lacks "C7 orchestrator: close nicht mit <rolle>-<ticket>" .claude/agents/orchestrator.md 'close <rolle>-<ticket>'
+for f in orchestrator code-reviewer performance-engineer security-auditor; do
+  has "T1 $f: agent read mit --source visible" ".claude/agents/$f.md" 'herdr agent read[^`]*--source visible'
+done
 
 th_summary

@@ -45,7 +45,7 @@ Regeln und Ablauf stehen in `AGENTS.md` (Abschnitte „Team", „Ablauf pro Tick
   (die Zustellung mitten im Turn kann den laufenden Auftrag verdrängen), ist die Akte der Rückfall:
   jede Rolle schreibt `fertig …`/`blockiert …` als letzte Zeile ihres Abschnitts. Idle/done ohne Meldung →
   Abschnitt lesen. Reviewer schreiben nicht in die Akte: ihre letzte Ausgabe liest du mit
-  `herdr agent read <name>`. Eine Meldung nie ein zweites Mal senden.
+  `herdr agent read <name> --source visible` (ohne die Option scheitert das Lesen an einem laufenden Agenten mit `agent_not_idle`). Eine Meldung nie ein zweites Mal senden.
 - Ist ein Agent länger als 2 min `blocked` (erneut `herdr agent get` nach 2 min), meldest du das
   dem Menschen: meist ein Dialog, den nur er beantworten kann.
 - Nach einem herdr-Server-Neustart nimmt herdr Claude-Sessions ohne Namen wieder auf:
@@ -53,7 +53,7 @@ Regeln und Ablauf stehen in `AGENTS.md` (Abschnitte „Team", „Ablauf pro Tick
 - Jede Statusänderung mit Uhrzeit und einer Zeile unter `## log`.
 - `blockiert`-Meldungen und Stopp-Punkte aus `AGENTS.md` gehen an den Menschen,
   nicht an eine andere Rolle.
-- Nach `fertig` einer Rolle ihre Pane mit `spawn.sh close <rolle>-<ticket>` schließen.
+- Nach `fertig` einer Rolle ihre Pane mit `spawn.sh close <name>` schließen (Name aus der `bereit`-Zeile von `spawn.sh`, bei weiteren Instanzen mit Suffix).
   Ausnahmen: product-owner bleibt offen, bis der Mensch die Spec-Arbeit beendet;
   release-engineer bleibt bis `done` oder `pr-open`. Bei `blockiert` offen lassen.
 
