@@ -333,9 +333,12 @@ impl SettingsApp {
                     egui::ComboBox::from_id_salt("language")
                         .selected_text(snapshot.language.label())
                         .show_ui(ui, |ui| {
-                            for (lang, label) in language_options() {
+                            for lang in config::Language::ALL {
                                 if ui
-                                    .add(egui::Button::selectable(snapshot.language == lang, label))
+                                    .add(egui::Button::selectable(
+                                        snapshot.language == lang,
+                                        lang.label(),
+                                    ))
                                     .clicked()
                                 {
                                     self.update_config(|c| c.language = lang);
@@ -1192,11 +1195,6 @@ pub(crate) fn set_log_level(
     crate::logging::apply_level(env_override, level)
 }
 
-/// Optionen der Sprach-Auswahl (Reihenfolge und Labels aus `Language`).
-fn language_options() -> [(config::Language, &'static str); 3] {
-    config::Language::ALL.map(|l| (l, l.label()))
-}
-
 fn open_privacy_pane(pane: &str) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     if let Err(e) = Command::new("open").arg(url).spawn() {
@@ -1208,26 +1206,6 @@ fn open_privacy_pane(pane: &str) {
 mod tests {
     use super::*;
     use crate::cleanup::CleanupMode;
-
-    /// AK-9: Auswahl Automatisch/Deutsch/Englisch in dieser Reihenfolge.
-    #[test]
-    fn language_options_list_auto_de_en_with_labels() {
-        assert_eq!(
-            language_options(),
-            [
-                (config::Language::Auto, "Automatisch"),
-                (config::Language::De, "Deutsch"),
-                (config::Language::En, "Englisch"),
-            ]
-        );
-    }
-
-    /// Grenzfall: Feld fehlt in der Config → Auswahl steht auf „Automatisch“.
-    #[test]
-    fn language_selection_defaults_to_the_first_option_for_missing_field() {
-        let cfg = Config::default();
-        assert_eq!(language_options()[0].0, cfg.language);
-    }
 
     #[test]
     fn upsert_rule_adds_new_rules_in_order() {

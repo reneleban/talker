@@ -510,13 +510,13 @@ fn assert_second_sentence_first_word(language: Language) {
         let expected = first_word(&reference(&b)).expect("Referenz ohne Wort");
         let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence, language);
         // REQ-DIAG-033: das erste Wort des zweiten Satzes steht im Text aller Stücke nach dem ersten.
-        let last_first = normalize_words(&pieces.get(1..).unwrap_or_default().concat())
+        let second_sentence_first = normalize_words(&pieces.get(1..).unwrap_or_default().concat())
             .into_iter()
             .next();
-        if pieces.len() < 2 || last_first.as_deref() != Some(expected.as_str()) {
+        if pieces.len() < 2 || second_sentence_first.as_deref() != Some(expected.as_str()) {
             failures.push(format!(
                 "| {first} + {second} | {expected} | {} | {} | {pieces:?} |",
-                last_first.as_deref().unwrap_or("—"),
+                second_sentence_first.as_deref().unwrap_or("—"),
                 pieces.len()
             ));
         }

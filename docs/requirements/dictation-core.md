@@ -83,8 +83,8 @@ Begriffe: [`CONTEXT.md`](../../CONTEXT.md).
   `Outcome::Rejected`)
 - **REQ-DICT-021**: Das System soll dem Streaming-Modell das Audio einer
   Utterance mit 0,4 s Vorlauf und 1,2 s Nachlauf ohne Sprache übergeben —
-  digitale Stille oder leises Rauschen mit festem Seed, je nach A/B-Ergebnis
-  aus Ticket 0039 —, damit weder Satzanfang noch die letzten Wörter fehlen.
+  digitale Stille (ein A/B gegen leises Rauschen in Ticket 0039 hat Nullen
+  bestätigt) —, damit weder Satzanfang noch die letzten Wörter fehlen.
   (`src/stt.rs:pad_with_silence`; ADR-0008, geändert Ticket-0039)
 - **REQ-DICT-024**: Das System soll die Spracherkennung im Batch- und im
   Live-Pfad mit der Sprache aus dem Config-Feld `language` betreiben: `auto`

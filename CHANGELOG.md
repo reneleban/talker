@@ -62,7 +62,6 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
   oder des Formats wird erkannt. Scheitert der Start, versucht talker genau einmal
   mit neu ermitteltem Gerät, dann folgt der sichtbare Fehler. Zwischen zwei
   Aufnahmen bleibt kein Stream offen, kein Gerät wird exklusiv belegt.
-
 - Logs gehen in eine Datei statt auf stderr (beim Start aus dem Terminal erscheinen
   sie weiter dort, wenn die Datei nicht angelegt werden kann). Der Wortlaut der
   Logzeilen ist kein stabiler Vertrag.

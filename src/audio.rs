@@ -536,6 +536,30 @@ impl<B: MicBackend> MicSource<B> {
                 .is_ok_and(|f| f == cached.format)
     }
 
+    /// Öffnet den Stream; bei Fehler wird der Cache geleert.
+    fn start(
+        &self,
+        (device, format, label): (B::Device, MicFormat, String),
+        on_block: OnBlock,
+    ) -> Result<Opened> {
+        match self.backend.open(&device, format, on_block) {
+            Ok(stop) => Ok(Opened {
+                info: SourceInfo {
+                    format: AudioFormat {
+                        channels: format.channels,
+                        sample_rate: format.sample_rate,
+                    },
+                    device: label,
+                },
+                stop,
+            }),
+            Err(e) => {
+                self.cache.clear();
+                Err(e)
+            }
+        }
+    }
+
     fn discover(&self) -> Result<(B::Device, MicFormat, String)> {
         let named = self.device_name.as_deref().and_then(|wanted| {
             let found = self.backend.find_by_name(wanted);
@@ -566,40 +590,18 @@ impl<B: MicBackend> MicSource<B> {
 
 impl<B: MicBackend> AudioSource for MicSource<B> {
     fn open(self: Box<Self>, on_block: OnBlock) -> Result<Opened> {
-        let (hit, (device, format, label)) = match self.cached() {
+        let (hit, found) = match self.cached() {
             Some(c) => (true, c),
             None => (false, self.discover()?),
         };
-        let started = self.backend.open(&device, format, Arc::clone(&on_block));
         // Scheitert der Start, bleibt kein Eintrag stehen; mit Cache-Daten gibt es genau einen Neuversuch.
-        let ((format, label), stop) = match started {
-            Ok(stop) => ((format, label), stop),
-            Err(e) => {
-                self.cache.clear();
-                if !hit {
-                    return Err(e);
-                }
+        match self.start(found, Arc::clone(&on_block)) {
+            Err(e) if hit => {
                 log::warn!("Mikrofon-Start mit gemerktem Gerät gescheitert ({e}) — neu ermitteln.");
-                let (device, format, label) = self.discover()?;
-                match self.backend.open(&device, format, on_block) {
-                    Ok(stop) => ((format, label), stop),
-                    Err(e) => {
-                        self.cache.clear();
-                        return Err(e);
-                    }
-                }
+                self.start(self.discover()?, on_block)
             }
-        };
-        Ok(Opened {
-            info: SourceInfo {
-                format: AudioFormat {
-                    channels: format.channels,
-                    sample_rate: format.sample_rate,
-                },
-                device: label,
-            },
-            stop,
-        })
+            r => r,
+        }
     }
 }
 
