@@ -50,6 +50,8 @@ pub struct NemotronTranscriber {
     committed: String,
     /// Samples seit der letzten Grenze bzw. seit dem Beginn des offenen Segments.
     since_boundary: usize,
+    /// Die Präfix-Warnung kam in diesem Segment schon (einmal je Grenze).
+    warned_unstable: bool,
     /// Nur für den Debug-Mitschnitt gesetzt.
     tap: Option<ModelTap>,
     language: Language,
@@ -138,6 +140,7 @@ impl NemotronTranscriber {
             live: None,
             committed: String::new(),
             since_boundary: 0,
+            warned_unstable: false,
             tap: None,
             language: Language::default(),
         })
@@ -290,6 +293,7 @@ impl StreamingTranscriber for NemotronTranscriber {
         self.accept(&stream, &[0.0; LEAD_SILENCE_SAMPLES]);
         self.committed.clear();
         self.since_boundary = 0;
+        self.warned_unstable = false;
         self.live = Some(stream);
     }
 
@@ -303,7 +307,8 @@ impl StreamingTranscriber for NemotronTranscriber {
             self.since_boundary += pcm_16k_mono.len();
         }
         let total = self.drain(&stream);
-        if !total.starts_with(&self.committed) {
+        if !self.warned_unstable && !total.starts_with(&self.committed) {
+            self.warned_unstable = true;
             log::warn!("Live-Text ist nicht präfixstabil; Segment ab dem gemeinsamen Präfix");
         }
         let text = open_segment(&total, &self.committed).trim().to_string();
@@ -313,6 +318,7 @@ impl StreamingTranscriber for NemotronTranscriber {
         if ended {
             self.committed = total;
             self.since_boundary = 0;
+            self.warned_unstable = false;
         } else if text.is_empty() {
             self.since_boundary = 0;
         }
