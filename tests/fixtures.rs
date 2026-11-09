@@ -20,7 +20,7 @@ fn fleurs_fixtures_are_complete_16k_mono_clips_with_references() {
         })
         .collect();
     wavs.sort();
-    assert_eq!(wavs.len(), 10, "ca. 10 Clips: {wavs:?}");
+    assert_eq!(wavs.len(), 15, "15 Clips: {wavs:?}");
     for wav in wavs {
         let reader = hound::WavReader::open(&wav).unwrap();
         let spec = reader.spec();
@@ -50,7 +50,26 @@ fn attribution_names_creator_title_sources_license_and_changes() {
         assert!(text.contains(needle), "ATTRIBUTION.md ohne: {needle}");
     }
     let clip_ids = text.matches("fleurs-de-").count();
-    assert!(clip_ids >= 10);
+    assert!(clip_ids >= 15);
+}
+
+/// REQ-DIAG-030 (AK-14): die Clips 11 bis 15 sind weibliche Sprecherinnen aus dem Split `train`;
+/// die Attribution nennt Split, Geschlechtsbeleg und jede Clip-ID aus dem Skript.
+#[test]
+fn attribution_documents_split_and_gender_of_the_female_clips() {
+    let text = std::fs::read_to_string(repo_file("tests/fixtures/stt/ATTRIBUTION.md")).unwrap();
+    let script = std::fs::read_to_string(repo_file("scripts/fetch_fleurs_fixtures.sh")).unwrap();
+    assert!(text.contains("`train`") && text.contains("FEMALE"));
+    for n in 11..=15 {
+        let line = script
+            .lines()
+            .find(|l| l.starts_with(&format!("{n}|")))
+            .unwrap_or_else(|| panic!("Clip {n} fehlt im Skript"));
+        let mut parts = line.split('|');
+        let (split, id) = (parts.nth(1).unwrap(), parts.next().unwrap());
+        assert_eq!(split, "train", "Clip {n}");
+        assert!(text.contains(id), "ATTRIBUTION.md ohne Clip-ID {id}");
+    }
 }
 
 /// REQ-DIAG-031: die Lizenz-Doku weist die Fixtures als nicht-MIT aus.
@@ -65,7 +84,7 @@ fn licensing_doc_marks_the_fleurs_fixtures_as_not_mit() {
     assert!(section.contains("nicht unter der MIT-Lizenz"));
 }
 
-/// SEC-5: die eingecheckte Prüfsummenliste deckt genau die 20 FLEURS-Dateien ab und stimmt mit
+/// SEC-5: die eingecheckte Prüfsummenliste deckt genau die 30 FLEURS-Dateien ab und stimmt mit
 /// ihnen überein; das Fetch-Skript prüft nach dem Download gegen dieselbe Liste.
 #[test]
 fn checksum_list_matches_the_committed_fleurs_files() {
@@ -78,7 +97,7 @@ fn checksum_list_matches_the_committed_fleurs_files() {
         assert_eq!(hash, actual, "{name}");
         listed.push(name.to_string());
     }
-    let mut expected: Vec<String> = (1..=10)
+    let mut expected: Vec<String> = (1..=15)
         .flat_map(|n| {
             [
                 format!("fleurs-de-{n:02}.wav"),

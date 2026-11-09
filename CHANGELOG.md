@@ -10,6 +10,16 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Added
 
+- **Einstellung „Sprache“:** In den Settings wählst du Automatisch, Deutsch oder
+  Englisch; die Wahl gilt ab dem nächsten Diktat ohne Neustart, im Am-Ende- wie im
+  Live-Modus. Neues Config-Feld `language` (`"auto"`, `"de"`, `"en"`, Default `"auto"`);
+  bestehende Configs bleiben unverändert gültig, ein unbekannter Wert wird wie ein
+  ungültiger `insert_mode` behandelt (Hinweis, Defaults, Datei unverändert). Die
+  Messzeile nennt die Sprache (`· Sprache: …`) direkt hinter dem Modus.
+- `make latency-eval LANGUAGE=auto|de|en` misst mit der gewählten Sprache (Default
+  `auto`, die Tabelle nennt sie); ein ungültiger Wert bricht mit Hinweis ab.
+- Fünf weitere FLEURS-Testclips von Sprecherinnen (CC-BY-4.0) neben den zehn
+  bisherigen; `scripts/fetch_fleurs_fixtures.sh` erzeugt sie reproduzierbar.
 - **Logdatei mit Rotation und einstellbarem Detailgrad:** talker schreibt nach
   `~/Library/Logs/talker/talker.log` (Start aus Terminal, Finder oder als Login-Item);
   ab 1 MB wird rotiert, höchstens 4 ältere Dateien bleiben (zusammen ≤ 5 MB). In den
@@ -47,6 +57,11 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Changed
 
+- Der Mikrofon-Start nutzt das gemerkte Gerät samt Format und zählt die Geräte nicht
+  bei jedem Tastendruck neu auf; ein Wechsel von `mic_device`, des Standardgeräts
+  oder des Formats wird erkannt. Scheitert der Start, versucht talker genau einmal
+  mit neu ermitteltem Gerät, dann folgt der sichtbare Fehler. Zwischen zwei
+  Aufnahmen bleibt kein Stream offen, kein Gerät wird exklusiv belegt.
 - Logs gehen in eine Datei statt auf stderr (beim Start aus dem Terminal erscheinen
   sie weiter dort, wenn die Datei nicht angelegt werden kann). Der Wortlaut der
   Logzeilen ist kein stabiler Vertrag.
@@ -87,6 +102,13 @@ Versionierung: [SemVer 2.0.0](https://semver.org/lang/de/) — Policies siehe
 
 ### Fixed
 
+- Satzanfang im Live-Modus: Nach einer Sprechpause gehen die ersten Wörter des
+  nächsten Satzes nicht mehr verloren. Der Recognizer läuft ohne Reset durch, die
+  Segmente entstehen aus dem Textzuwachs (ADR-0015); führende Satzzeichen hängen am
+  vorigen Segment statt als eigener Satz zu beginnen.
+- Das Overlay zeigt die Wellen erst, wenn tatsächlich Audio ankommt (erstes Signal);
+  davor bleibt der Balken. Kommt nach 5 s kein Signal, erscheint „Mikrofon antwortet
+  nicht“, die Aufnahme läuft weiter.
 - Vokabular-Korrektur greift nicht mehr zu hart: häufige Wörter werden nicht
   mehr fälschlich durch klanglich nur grob ähnliche Vokabular-Begriffe ersetzt
   (z. B. „kaputt" → „Kyroth", „Tunnel" → „TOML"). Der unscharfe

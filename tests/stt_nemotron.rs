@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use talker::config::Language;
 use talker::stt::{NemotronTranscriber, StreamingTranscriber, Transcriber};
 
 fn read_wav_16k_mono(path: &str) -> Vec<f32> {
@@ -51,6 +52,90 @@ fn transcribes_english_sample() {
     for expected in ["test", "speech recognition", "computer"] {
         assert!(text.contains(expected), "»{expected}« fehlt in: {text:?}");
     }
+}
+
+const DE_WORDS: [&str; 3] = ["test", "spracherkennung", "rechner"];
+const EN_WORDS: [&str; 3] = ["test", "speech recognition", "computer"];
+
+fn batch_with(language: Language, fixture: &str) -> String {
+    let pcm = read_wav_16k_mono(fixture);
+    let mut t = transcriber();
+    t.set_language(language);
+    t.transcribe(&pcm).unwrap().to_lowercase()
+}
+
+fn live_with(language: Language, fixture: &str) -> String {
+    let pcm = read_wav_16k_mono(fixture);
+    let mut t = transcriber();
+    t.set_language(language);
+    let (updates, rest) = stream(&mut t, &pcm);
+    let finals = updates
+        .iter()
+        .filter(|u| u.endpoint)
+        .map(|u| u.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{finals} {rest}").to_lowercase()
+}
+
+fn assert_contains_all(text: &str, words: [&str; 3]) {
+    for expected in words {
+        assert!(text.contains(expected), "»{expected}« fehlt in: {text:?}");
+    }
+}
+
+/// AK-7 / REQ-DICT-024: Sprache je Pfad (Batch + Live) und je Wert.
+#[test]
+fn set_language_de_recognizes_german_in_batch_and_live() {
+    assert_contains_all(
+        &batch_with(Language::De, "tests/fixtures/de_test.wav"),
+        DE_WORDS,
+    );
+    assert_contains_all(
+        &live_with(Language::De, "tests/fixtures/de_test.wav"),
+        DE_WORDS,
+    );
+}
+
+#[test]
+fn set_language_auto_and_en_recognize_english_in_batch_and_live() {
+    for language in [Language::Auto, Language::En] {
+        assert_contains_all(
+            &batch_with(language, "tests/fixtures/en_test.wav"),
+            EN_WORDS,
+        );
+        assert_contains_all(&live_with(language, "tests/fixtures/en_test.wav"), EN_WORDS);
+    }
+}
+
+/// „Darf nicht passieren“: `De` fällt nicht still auf `auto` zurück – ein anderer Code
+/// (`en`) auf deutschem Audio liefert nachweislich einen anderen Text als `de`.
+#[test]
+fn set_language_value_reaches_the_model_not_silently_auto() {
+    let de = batch_with(Language::De, "tests/fixtures/de_test.wav");
+    let en = batch_with(Language::En, "tests/fixtures/de_test.wav");
+    println!("de: {de:?}\nen: {en:?}");
+    assert_ne!(de, en, "Sprachcode wirkt nicht auf das Modell");
+}
+
+/// Eine laufende Live-Utterance behält die Sprache ihres `begin`.
+#[test]
+fn live_utterance_keeps_the_language_of_its_begin() {
+    let pcm = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let mut t = transcriber();
+    t.set_language(Language::De);
+    t.begin();
+    t.set_language(Language::En);
+    let mut text = String::new();
+    for c in pcm.chunks(8_960) {
+        let u = t.feed(c).unwrap();
+        if u.endpoint {
+            text.push_str(&u.text);
+            text.push(' ');
+        }
+    }
+    text.push_str(&t.finish().unwrap());
+    assert_contains_all(&text.to_lowercase(), DE_WORDS);
 }
 
 /// 560-ms-Chunks wie im Live-Betrieb einspeisen.
@@ -196,9 +281,11 @@ fn dictate(
     pcm: Vec<f32>,
     start_delay_ms: u64,
     insert_mode: InsertMode,
+    language: Language,
 ) -> (Vec<String>, DictationTrace) {
     let cfg = Config {
         insert_mode,
+        language,
         cleanup_mode: CleanupMode::Raw,
         ..Config::default()
     };
@@ -284,15 +371,70 @@ fn since_press(trace: &DictationTrace, at: Option<HostInstant>) -> String {
 /// `e2e_no_sample_is_lost_for_any_start_delay_and_format` (AK-20).
 /// Schlägt mit einer Tabelle (erwartet / erkannt / →erstes Signal) fehl, wenn nicht.
 fn assert_first_word_present(insert_mode: InsertMode, set: FixtureSet) {
+    let report: Vec<String> = [Language::De, Language::Auto]
+        .into_iter()
+        .filter_map(|language| first_word_failures(insert_mode, set, language))
+        .collect();
+    assert!(report.is_empty(), "{}", report.join("\n\n"));
+}
+
+/// Benannte Ausnahmen: laufen mit und werden ausgegeben, aber nicht geprüft (Entscheidung A1).
+const FIRST_WORD_EXEMPTIONS: [(Language, &str, &str); 2] = [
+    (
+        Language::Auto,
+        "dev-java",
+        "Sprachwahl des Modells bei auto, belegt Runde 3",
+    ),
+    (
+        Language::Auto,
+        "fleurs-de-03",
+        "Sprachwahl des Modells bei auto, belegt Runde 3",
+    ),
+];
+
+fn exemption(language: Language, clip: &str) -> Option<&'static str> {
+    FIRST_WORD_EXEMPTIONS
+        .iter()
+        .find(|(l, name, _)| *l == language && *name == clip)
+        .map(|(_, _, reason)| *reason)
+}
+
+#[test]
+fn exemptions_apply_only_to_the_named_clip_under_auto() {
+    assert!(exemption(Language::Auto, "dev-java").is_some());
+    assert!(exemption(Language::Auto, "fleurs-de-03").is_some());
+    // Unter `de` bleiben beide scharf, ebenso `en`, andere Clips und fleurs-de-13.
+    for language in [Language::De, Language::En] {
+        assert!(exemption(language, "dev-java").is_none());
+        assert!(exemption(language, "fleurs-de-03").is_none());
+    }
+    assert!(exemption(Language::Auto, "fleurs-de-13").is_none());
+    assert!(exemption(Language::Auto, "dev-node").is_none());
+    assert!(exemption(Language::Auto, "").is_none());
+}
+
+/// `Some(Tabelle)` mit den Fehlfällen, `None` wenn alle Clips das erste Wort haben.
+fn first_word_failures(
+    insert_mode: InsertMode,
+    set: FixtureSet,
+    language: Language,
+) -> Option<String> {
     let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut worker = worker();
     let mut failures = Vec::new();
     for (name, wav) in fixtures(set) {
         let expected = first_word(&reference(&wav)).expect("Referenz ohne Wort");
-        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), 0, insert_mode);
+        let (pieces, trace) = dictate(&mut worker, read_pcm(&wav), 0, insert_mode, language);
         let result = pieces.concat();
         let got = normalize_words(&result).into_iter().next();
         if got.as_deref() != Some(expected.as_str()) {
+            if let Some(reason) = exemption(language, &name) {
+                println!(
+                    "ausgenommen ({reason}): {name} · {language:?}: {expected} → {} · {result:?}",
+                    got.as_deref().unwrap_or("—")
+                );
+                continue;
+            }
             failures.push(format!(
                 "| {name} | {expected} | {} | {} | {result:?} |",
                 got.as_deref().unwrap_or("—"),
@@ -300,12 +442,16 @@ fn assert_first_word_present(insert_mode: InsertMode, set: FixtureSet) {
             ));
         }
     }
-    println!("{set:?} · {insert_mode:?}: {} Fehlfälle", failures.len());
-    assert!(
-        failures.is_empty(),
-        "erstes Wort fehlt ({insert_mode:?}, {set:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
-        failures.join("\n")
+    println!(
+        "{set:?} · {insert_mode:?} · {language:?}: {} Fehlfälle",
+        failures.len()
     );
+    (!failures.is_empty()).then(|| {
+        format!(
+            "erstes Wort fehlt ({insert_mode:?}, {set:?}, {language:?}):\n| Fixture | erwartet | erkannt | →erstes Signal | Ergebnis |\n|---|---|---|---|---|\n{}",
+            failures.join("\n")
+        )
+    })
 }
 
 macro_rules! first_word_case {
@@ -315,45 +461,35 @@ macro_rules! first_word_case {
             assert_first_word_present($mode, $set);
         }
     };
-    ($name:ident, $mode:expr, $set:expr, ignore = $reason:expr) => {
-        #[test]
-        #[ignore = $reason]
-        fn $name() {
-            assert_first_word_present($mode, $set);
-        }
-    };
 }
 
-first_word_case!(
-    first_word_at_end_say,
-    InsertMode::AtEnd,
-    FixtureSet::Say,
-    ignore = "bekannt: dev-java »Die« als »The« erkannt (1 von 24), →erstes Signal 90 ms, Behebung in 0039"
-);
+first_word_case!(first_word_at_end_say, InsertMode::AtEnd, FixtureSet::Say);
 first_word_case!(
     first_word_at_end_fleurs,
     InsertMode::AtEnd,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: fleurs-de-03 »Die mallorquinische Küche basiert« als »Дема ряд и базит« erkannt (1 von 10), →erstes Signal 30 ms, Behebung in 0039"
+    FixtureSet::Fleurs
 );
 first_word_case!(
     first_word_per_sentence_say,
     InsertMode::PerSentence,
-    FixtureSet::Say,
-    ignore = "bekannt: 3 von 24: dev-node »Der Node Server crasht beim npm install« fehlt, dev-react Ergebnis leer, dev-java »Die« als »The«, →erstes Signal 90 ms, Behebung in 0039"
+    FixtureSet::Say
 );
 first_word_case!(
     first_word_per_sentence_fleurs,
     InsertMode::PerSentence,
-    FixtureSet::Fleurs,
-    ignore = "bekannt: 6 von 10 Clips ohne richtiges erstes Wort (z. B. fleurs-de-01 »Er sagte, dass« fehlt), →erstes Signal 30 ms, Behebung in 0039"
+    FixtureSet::Fleurs
 );
 
 /// REQ-DIAG-033: zwei Sätze mit kurzer Pause, Satzweise → das erste Wort des zweiten Satzes
-/// steht am Anfang des zuletzt eingefügten Stücks.
+/// steht am Anfang des Textes aller Stücke nach dem ersten.
 #[test]
-#[ignore = "bekannt: erste Wörter des zweiten Satzes fehlen nach der Pause (3 von 3 Paaren, z. B. »Hast du schon« fehlt), Behebung in 0039"]
 fn first_word_of_the_second_sentence_survives_the_pause() {
+    for language in [Language::De, Language::Auto] {
+        assert_second_sentence_first_word(language);
+    }
+}
+
+fn assert_second_sentence_first_word(language: Language) {
     let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut worker = worker();
     let pairs = [
@@ -372,21 +508,22 @@ fn first_word_of_the_second_sentence_survives_the_pause() {
         pcm.extend(std::iter::repeat_n(0.0, 19_200)); // 1,2 s Pause
         pcm.extend(read_pcm(&b));
         let expected = first_word(&reference(&b)).expect("Referenz ohne Wort");
-        let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence);
-        let last_first = pieces
-            .last()
-            .and_then(|p| normalize_words(p).into_iter().next());
-        if pieces.len() < 2 || last_first.as_deref() != Some(expected.as_str()) {
+        let (pieces, _) = dictate(&mut worker, pcm, 0, InsertMode::PerSentence, language);
+        // REQ-DIAG-033: das erste Wort des zweiten Satzes steht im Text aller Stücke nach dem ersten.
+        let second_sentence_first = normalize_words(&pieces.get(1..).unwrap_or_default().concat())
+            .into_iter()
+            .next();
+        if pieces.len() < 2 || second_sentence_first.as_deref() != Some(expected.as_str()) {
             failures.push(format!(
                 "| {first} + {second} | {expected} | {} | {} | {pieces:?} |",
-                last_first.as_deref().unwrap_or("—"),
+                second_sentence_first.as_deref().unwrap_or("—"),
                 pieces.len()
             ));
         }
     }
     assert!(
         failures.is_empty(),
-        "erstes Wort des zweiten Satzes fehlt:\n| Paar | erwartet | erkannt | Stücke | Ergebnis |\n|---|---|---|---|---|\n{}",
+        "erstes Wort des zweiten Satzes fehlt ({language:?}):\n| Paar | erwartet | erkannt | Stücke | Ergebnis |\n|---|---|---|---|---|\n{}",
         failures.join("\n")
     );
 }
@@ -415,26 +552,111 @@ fn model_tap_holds_exactly_the_model_input_including_silence() {
     t.transcribe(&[]).unwrap();
     assert!(tap.take().is_empty());
 
-    // Live mit Pause: Vorlauf, alle Chunks, 6400 Nullen nach dem Endpoint-Reset, Nachlauf.
+    // Live mit Pause: Vorlauf, alle Chunks lückenlos (keine Stille nach dem Reset), Nachlauf.
     let mut pcm = sentence.clone();
     pcm.extend(std::iter::repeat_n(0.0, 24_000));
     pcm.extend_from_slice(&sentence);
     let (updates, _) = stream(&mut t, &pcm);
-    let endpoints = updates.iter().filter(|u| u.endpoint).count();
-    assert_eq!(endpoints, 1);
-    let live = tap.take();
-    // Jeder Reset (auch einer ohne Text) hängt 6400 Nullen an — mindestens einer je Endpoint.
-    let extra = live.len() - (LEAD + pcm.len() + TAIL);
-    assert_eq!(extra % LEAD, 0, "Rest {extra}");
-    assert!(
-        extra / LEAD >= endpoints,
-        "{} Resets, {endpoints} Endpoints",
-        extra / LEAD
-    );
-    assert!(live[..LEAD].iter().all(|s| *s == 0.0));
-    assert!(live[live.len() - TAIL..].iter().all(|s| *s == 0.0));
+    assert_eq!(updates.iter().filter(|u| u.endpoint).count(), 1);
+    assert_tap_gapless(&tap.take(), &pcm);
 
     // Ohne Tap bleibt alles beim Alten (kein Mitschnitt, gleiche Erkennung).
     let mut plain = transcriber();
     assert!(!plain.transcribe(&sentence).unwrap().is_empty());
+}
+
+/// REQ-STREAM-016 (AK-11): Tap = Vorlauf ‖ Eingang ‖ Nachlauf, der Mittelteil bitgleich.
+fn assert_tap_gapless(tap: &[f32], input: &[f32]) {
+    const LEAD: usize = 6_400;
+    const TAIL: usize = 19_200;
+    assert_eq!(tap.len(), LEAD + input.len() + TAIL, "Länge");
+    assert!(tap[..LEAD].iter().all(|s| *s == 0.0));
+    assert!(
+        tap[LEAD..LEAD + input.len()] == *input,
+        "Mittelteil weicht vom Eingang ab"
+    );
+    assert!(tap[LEAD + input.len()..].iter().all(|s| *s == 0.0));
+}
+
+fn live_tap(pcm: &[f32], chunk: usize) -> (Vec<talker::stt::StreamUpdate>, Vec<f32>) {
+    let tap = talker::stt::ModelTap::default();
+    let mut t = transcriber().with_model_tap(tap.clone());
+    t.begin();
+    let updates = pcm.chunks(chunk).map(|c| t.feed(c).unwrap()).collect();
+    t.finish().unwrap();
+    (updates, tap.take())
+}
+
+/// AK-11 Grenzfälle: Endpoint direkt nach dem Vorlauf (Stille am Anfang), zwei Endpoints
+/// kurz nacheinander, Endpoint unmittelbar vor dem Loslassen, Pause genau `endpoint_silence_ms`.
+#[test]
+fn live_tap_stays_gapless_at_segment_ends() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let silence = |n: usize| std::iter::repeat_n(0.0f32, n);
+    let silence_ms = talker::config::DEFAULT_ENDPOINT_SILENCE_MS as usize * 16;
+
+    // Stille direkt nach dem Vorlauf, dann Satz.
+    let mut a: Vec<f32> = silence(24_000).collect();
+    a.extend_from_slice(&s);
+    // Zwei Endpoints kurz nacheinander.
+    let mut b = s.clone();
+    b.extend(silence(24_000));
+    b.extend_from_slice(&s);
+    b.extend(silence(24_000));
+    b.extend_from_slice(&s);
+    // Endpoint unmittelbar vor dem Loslassen: Pause am Ende.
+    let mut c = s.clone();
+    c.extend(silence(24_000));
+    // Pause genau endpoint_silence_ms.
+    let mut d = s.clone();
+    d.extend(silence(silence_ms));
+    d.extend_from_slice(&s);
+
+    for (name, pcm) in [("start", a), ("zwei", b), ("ende", c), ("genau", d)] {
+        let (_, tap) = live_tap(&pcm, 8_960);
+        println!("{name}: {} Samples", pcm.len());
+        assert_tap_gapless(&tap, &pcm);
+    }
+}
+
+/// AK-11 Grenzfall Zwangs-Endpoint: Utterance über 60 s ohne Pause.
+#[test]
+fn live_tap_stays_gapless_at_the_forced_endpoint() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let pcm: Vec<f32> = s.iter().copied().cycle().take(16_000 * 62).collect();
+    let (updates, tap) = live_tap(&pcm, 8_960);
+    assert_tap_gapless(&tap, &pcm);
+    let endpoints = updates.iter().filter(|u| u.endpoint).count();
+    assert_eq!(endpoints, 1, "Zwangs-Segment-Ende nach 60 s genau einmal");
+}
+
+/// AK-11: Stille vor dem ersten Wort erzeugt kein Segment und kostet kein Wort.
+#[test]
+fn silence_before_the_first_word_gives_no_segment_and_loses_nothing() {
+    let _lock = MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let s = read_wav_16k_mono("tests/fixtures/de_test.wav");
+    let mut pcm = vec![0.0f32; 48_000]; // 3 s Stille
+    pcm.extend_from_slice(&s);
+    let mut t = transcriber();
+    let (updates, rest) = stream(&mut t, &pcm);
+    assert!(
+        updates.iter().all(|u| !u.endpoint || !u.text.is_empty()),
+        "Segment ohne Text"
+    );
+    let text = format!(
+        "{} {rest}",
+        updates
+            .iter()
+            .filter(|u| u.endpoint)
+            .map(|u| u.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+    .to_lowercase();
+    assert!(
+        text.contains("dies ist ein test"),
+        "Satzanfang fehlt: {text:?}"
+    );
 }

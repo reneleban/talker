@@ -324,6 +324,29 @@ impl SettingsApp {
                         });
                 },
             );
+            Self::hairline(ui);
+            Self::row(
+                ui,
+                "Sprache",
+                "Sprache der Diktate: Automatisch erkennt sie je Aufnahme · Deutsch/Englisch legen sie fest.",
+                |ui| {
+                    egui::ComboBox::from_id_salt("language")
+                        .selected_text(snapshot.language.label())
+                        .show_ui(ui, |ui| {
+                            for lang in config::Language::ALL {
+                                if ui
+                                    .add(egui::Button::selectable(
+                                        snapshot.language == lang,
+                                        lang.label(),
+                                    ))
+                                    .clicked()
+                                {
+                                    self.update_config(|c| c.language = lang);
+                                }
+                            }
+                        });
+                },
+            );
             if snapshot.insert_mode != crate::config::InsertMode::AtEnd
                 && self
                     .models_state

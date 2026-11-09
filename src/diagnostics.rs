@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::audio::{Captured, HostInstant, SourceInfo};
 use crate::cleanup::CleanupMode;
-use crate::config::InsertMode;
+use crate::config::{InsertMode, Language};
 use crate::models::ModelId;
 
 /// Wie die Dictation endete.
@@ -42,6 +42,7 @@ pub struct DictationTrace {
     pub device: Option<SourceInfo>,
     pub insert_mode: InsertMode,
     pub cleanup_mode: CleanupMode,
+    pub language: Language,
     pub cold_start: bool,
     pub result: DictationResult,
 }
@@ -177,6 +178,7 @@ impl DictationTrace {
         pressed_at: HostInstant,
         insert_mode: InsertMode,
         cleanup_mode: CleanupMode,
+        language: Language,
     ) -> Self {
         Self {
             nr,
@@ -196,6 +198,7 @@ impl DictationTrace {
             device: None,
             insert_mode,
             cleanup_mode,
+            language,
             cold_start: nr == 1,
             result: DictationResult::Discarded("abgebrochen"),
         }
@@ -277,9 +280,10 @@ impl fmt::Display for DictationTrace {
         };
         write!(
             f,
-            " · Gerät: {device} · Einfügen: {} · Modus: {} · Kaltstart: {} · Ergebnis: {result}",
+            " · Gerät: {device} · Einfügen: {} · Modus: {} · Sprache: {} · Kaltstart: {} · Ergebnis: {result}",
             self.insert_mode.label(),
             cleanup_name(self.cleanup_mode),
+            self.language.label(),
             if self.cold_start { "ja" } else { "nein" },
         )
     }
@@ -326,6 +330,7 @@ mod tests {
             }),
             insert_mode: InsertMode::AtEnd,
             cleanup_mode: CleanupMode::Casual,
+            language: Language::Auto,
             cold_start: false,
             result: DictationResult::Inserted,
         }
@@ -336,7 +341,7 @@ mod tests {
     fn example_line_matches_the_ticket_verbatim() {
         assert_eq!(
             example().to_string(),
-            "Diktat #17: Taste→Mikro bereit 120 ms · →erster Block 380 ms · →erstes Signal 640 ms · gehalten 4,2 s · aufgenommen 3,6 s · Loslassen→Text 780 ms (STT 520 ms · Cleanup 240 ms) · →eingefügt 35 ms · Gerät: AirPods (48 kHz, 1 Kanal) · Einfügen: Am Ende · Modus: Natürlich · Kaltstart: nein · Ergebnis: eingefügt"
+            "Diktat #17: Taste→Mikro bereit 120 ms · →erster Block 380 ms · →erstes Signal 640 ms · gehalten 4,2 s · aufgenommen 3,6 s · Loslassen→Text 780 ms (STT 520 ms · Cleanup 240 ms) · →eingefügt 35 ms · Gerät: AirPods (48 kHz, 1 Kanal) · Einfügen: Am Ende · Modus: Natürlich · Sprache: Automatisch · Kaltstart: nein · Ergebnis: eingefügt"
         );
     }
 
@@ -437,7 +442,7 @@ mod tests {
         let line = nothing_reached(DictationResult::Error("Mikrofon fehlt".into())).to_string();
         assert_eq!(
             line,
-            "Diktat #17: Taste→Mikro bereit — · →erster Block — · →erstes Signal — · gehalten — · aufgenommen — · Loslassen→Text — (STT — · Cleanup —) · →eingefügt — · Gerät: — · Einfügen: Am Ende · Modus: Natürlich · Kaltstart: nein · Ergebnis: Fehler (Mikrofon fehlt)"
+            "Diktat #17: Taste→Mikro bereit — · →erster Block — · →erstes Signal — · gehalten — · aufgenommen — · Loslassen→Text — (STT — · Cleanup —) · →eingefügt — · Gerät: — · Einfügen: Am Ende · Modus: Natürlich · Sprache: Automatisch · Kaltstart: nein · Ergebnis: Fehler (Mikrofon fehlt)"
         );
     }
 
@@ -513,6 +518,30 @@ mod tests {
         assert!(!example().to_string().contains('\n'));
     }
 
+    /// REQ-DIAG-012: `Sprache` steht direkt hinter `Modus`, je Wert das Label; sonst nichts verschoben.
+    #[test]
+    fn language_field_follows_mode_for_each_value() {
+        for (language, label) in [
+            (Language::Auto, "Automatisch"),
+            (Language::De, "Deutsch"),
+            (Language::En, "Englisch"),
+        ] {
+            let mut t = example();
+            t.language = language;
+            let line = t.to_string();
+            assert!(
+                line.contains(&format!(
+                    " · Modus: Natürlich · Sprache: {label} · Kaltstart: nein · Ergebnis: eingefügt"
+                )),
+                "{line}"
+            );
+            assert_eq!(
+                line.replace(&format!(" · Sprache: {label}"), ""),
+                example().to_string().replace(" · Sprache: Automatisch", ""),
+            );
+        }
+    }
+
     /// `new`: Kaltstart nur bei Nr. 1, nichts gemessen, Ergebnis noch „abgebrochen".
     #[test]
     fn new_trace_has_no_marks_and_cold_start_only_for_the_first() {
@@ -521,6 +550,7 @@ mod tests {
             HostInstant::from_nanos(T0),
             InsertMode::AtEnd,
             CleanupMode::Raw,
+            Language::Auto,
         );
         assert!(first.cold_start);
         assert!(first.mic_ready_at.is_none() && first.device.is_none());
@@ -530,6 +560,7 @@ mod tests {
             HostInstant::from_nanos(T0),
             InsertMode::AtEnd,
             CleanupMode::Raw,
+            Language::Auto,
         );
         assert!(!second.cold_start);
     }
@@ -556,6 +587,7 @@ mod tests {
             HostInstant::from_nanos(T0),
             InsertMode::AtEnd,
             CleanupMode::Raw,
+            Language::Auto,
         );
         t.apply_capture(at(2_000).unwrap(), &captured);
         assert_eq!(t.released_at, at(2_000));

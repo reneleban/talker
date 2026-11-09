@@ -20,6 +20,8 @@ use crate::{audio, vocab_match};
 
 /// Hinweis, wenn kein Text erkannt wurde.
 const NOTHING_RECOGNIZED: &str = "Nichts erkannt";
+/// Satzzeichen, mit denen ein Live-Segment beginnen kann (ADR-0015).
+const LEADING_PUNCTUATION: &[char] = &['.', ',', '?', '!', ';', ':'];
 /// Wie die Messzeile „kein Text" nennt.
 const NOTHING_RECOGNIZED_REASON: &str = "nichts erkannt";
 
@@ -214,6 +216,7 @@ impl<T: Transcriber, C: LlmCleaner> DictationWorker<T, C> {
         let Some(transcriber) = self.transcriber.as_mut() else {
             return Outcome::Rejected("Kein STT-Modell");
         };
+        transcriber.set_language(cfg.language);
         // Cleaner nur im LLM-Modus übergeben: aufgelöstes Raw darf einen
         // (für andere Apps) geladenen Cleaner nicht anwenden.
         let cleaner_ref = resolved
@@ -315,6 +318,7 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
         let Some(transcriber) = self.transcriber.as_mut() else {
             return LiveStart::Unavailable;
         };
+        transcriber.set_language(cfg.language);
         transcriber.begin();
         if resolved.uses_llm() && self.cleaner.is_none() && !self.cleaner_failed {
             self.load_cleaner_timed();
@@ -388,35 +392,51 @@ impl<T: Transcriber + StreamingTranscriber, C: LlmCleaner> DictationWorker<T, C>
     }
 
     /// Ein erkanntes Segment → Vokabular-Korrektur + Cleanup → Einfüge-Auftrag.
-    /// Leere Segmente erzeugen keinen; ab dem zweiten steht ein Leerzeichen davor.
+    /// Leere Segmente erzeugen keinen; ab dem zweiten steht ein Leerzeichen davor (außer vor Satzzeichen).
     fn live_segment(&mut self, raw: &str) -> Option<Outcome> {
         let live = self.live.as_mut()?;
         let raw = raw.trim();
         if raw.is_empty() {
             return None;
         }
-        let cleaner = live
-            .cfg
-            .cleanup_mode
-            .uses_llm()
-            .then_some(self.cleaner.as_mut())
-            .flatten()
-            .map(|c| {
-                c.set_mode(live.cfg.cleanup_mode);
-                c.set_vocab(&live.cfg.vocabulary);
-                c as &mut dyn LlmCleaner
-            });
-        let (text, cleanup_fell_back, cleanup_time) =
-            postprocess(raw.to_string(), &live.cfg, cleaner, self.cleaner_failed);
-        if let Some(t) = cleanup_time {
-            add_time(&mut self.timing.cleanup, t);
-        }
-        log::debug!("Live-Segment: {} Zeichen", text.chars().count());
-        let text = if live.emitted_any {
-            format!(" {text}")
+        // Führende Satzzeichen (Segment nach »Satz.« beginnt oft mit ».« oder »,«) hängen ohne
+        // Leerzeichen an und gehen nicht ans LLM (ADR-0015).
+        let rest_at = raw
+            .find(|c: char| !LEADING_PUNCTUATION.contains(&c))
+            .unwrap_or(raw.len());
+        let (punctuation, rest) = raw.split_at(rest_at);
+        let rest = rest.trim();
+        let mut cleanup_fell_back = false;
+        let cleaned = if rest.is_empty() {
+            None
         } else {
-            text
+            let cleaner = live
+                .cfg
+                .cleanup_mode
+                .uses_llm()
+                .then_some(self.cleaner.as_mut())
+                .flatten()
+                .map(|c| {
+                    c.set_mode(live.cfg.cleanup_mode);
+                    c.set_vocab(&live.cfg.vocabulary);
+                    c as &mut dyn LlmCleaner
+                });
+            let (cleaned, fell_back, cleanup_time) =
+                postprocess(rest.to_string(), &live.cfg, cleaner, self.cleaner_failed);
+            if let Some(t) = cleanup_time {
+                add_time(&mut self.timing.cleanup, t);
+            }
+            cleanup_fell_back = fell_back;
+            Some(cleaned)
         };
+        // Leerzeichen nur vor Text: nach einem Satzzeichen-Präfix immer, sonst ab dem zweiten Segment.
+        let text = match cleaned {
+            Some(cleaned) if !punctuation.is_empty() => format!("{punctuation} {cleaned}"),
+            Some(cleaned) if live.emitted_any => format!(" {cleaned}"),
+            Some(cleaned) => cleaned,
+            None => punctuation.to_string(),
+        };
+        log::debug!("Live-Segment: {} Zeichen", text.chars().count());
         live.emitted_any = true;
         Some(Outcome::Inject {
             text,
@@ -656,6 +676,15 @@ where
     C: LlmCleaner,
 {
     let mut delivery = Delivery::default();
+    // Die Sprache gilt vom Tastendruck (`DictationTrace.language`), nicht von der Config beim Job.
+    let language = match &job {
+        SttJob::Utterance { trace, .. } => trace.language,
+        SttJob::Live { feed } => feed.trace.language,
+    };
+    let cfg = &Config {
+        language,
+        ..cfg.clone()
+    };
     // Reste eines früheren, nicht abgeholten Auftrags verwerfen.
     if let Some((_, tap)) = debug {
         tap.take();
@@ -801,6 +830,8 @@ pub enum MicReady {
     /// Aufnahme läuft, mit dem für diese Utterance aufgelösten Modus.
     Recording {
         level: audio::LevelHandle,
+        /// Erstes Signal der Aufnahme (REQ-DICT-016): schaltet das Overlay auf Wellen.
+        signal: audio::SignalHandle,
         mode: CleanupMode,
         /// Gesetzt bei Live-Diktat: Strom für den STT-Worker (`run_live`).
         live: Option<LiveFeed>,
@@ -930,7 +961,13 @@ impl PttSession {
         on_ready: impl FnOnce(MicReady) + Send + 'static,
     ) -> PressOutcome {
         self.nr += 1;
-        let mut trace = DictationTrace::new(self.nr, pressed_at, cfg.insert_mode, cfg.cleanup_mode);
+        let mut trace = DictationTrace::new(
+            self.nr,
+            pressed_at,
+            cfg.insert_mode,
+            cfg.cleanup_mode,
+            cfg.language,
+        );
         if let Some(hint) = models.get(ModelId::Stt).setup_hint() {
             trace.result = DictationResult::Blocked;
             (self.report)(trace);
@@ -967,6 +1004,7 @@ impl PttSession {
                     let format = rec.info().format;
                     on_ready(MicReady::Recording {
                         level: rec.level(),
+                        signal: rec.signal(),
                         mode,
                         live: live.then(|| LiveFeed {
                             trace: Box::new(snapshot),
@@ -1255,7 +1293,8 @@ mod tests {
     // ist: das Setup-Gate selbst und der Leerlauf-Fall von `release()`.
 
     fn mic_factory() -> SourceFactory {
-        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone())))
+        let cache = audio::MicCache::default();
+        Box::new(move |cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone(), cache.clone())))
     }
 
     // ---- asynchroner Mikrofon-Start (MicSlot) ----
@@ -1430,6 +1469,45 @@ mod tests {
                 .iter()
                 .all(|t| t.result == DictationResult::Discarded("zu kurz"))
         );
+    }
+
+    /// REQ-DICT-016: `MicReady::Recording` trägt ein Signal-Handle, das bei
+    /// führenden Null-Blöcken erst mit dem ersten Block ≠ 0 wahr wird.
+    #[test]
+    fn mic_ready_signal_arrives_only_with_the_first_nonzero_block() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done = Mutex::new(done_tx);
+        let factory: SourceFactory = Box::new(move |_| {
+            let mut samples = vec![0.0; 3_200];
+            samples.extend(vec![0.1; 1_600]);
+            let mut opts = wav_opts(1_600, 0);
+            opts.pace = audio::Pace::RealTime;
+            let (source, signal) = audio::WavSource::from_samples(samples, opts);
+            let _ = done.lock().unwrap().send(signal);
+            Box::new(source)
+        });
+        let mut session = PttSession::new(factory, Arc::new(|_| {}));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        session.press(
+            audio::HostInstant::now(),
+            &Config::default(),
+            &stt_ready(),
+            move |ready| {
+                if let MicReady::Recording { signal, .. } = ready {
+                    let _ = ready_tx.send(signal);
+                }
+            },
+        );
+        let signal = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!signal.arrived(), "Null-Blöcke sind kein Signal");
+        let source_done = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(source_done.wait(std::time::Duration::from_secs(5)));
+        assert!(signal.arrived());
+        session.release(audio::HostInstant::now());
     }
 
     /// Messpunkte bis zum Loslassen: Mikro bereit, Blöcke, Signal, Gerät, Dauer.
@@ -1806,6 +1884,69 @@ mod tests {
         assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["Erster Satz."]);
         assert!(w.live_chunk(&[0.0; 160]).is_empty());
         assert_eq!(texts(w.live_end()), [" Zweiter Satz."]);
+    }
+
+    /// REQ-STREAM-016 (T8c): ein Segment, das mit Satzzeichen beginnt, hängt ohne Leerzeichen an.
+    #[test]
+    fn live_leading_punctuation_is_attached_without_space() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || {
+                FakeStreaming::new(
+                    &[
+                        ("Satz eins", true),
+                        (".", true),
+                        ("Er sagte", true),
+                        (", dass …", true),
+                    ],
+                    "",
+                )
+            },
+            &log,
+        );
+        w.live_begin(None, &cfg);
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.extend(texts(w.live_chunk(&[0.0; 160])));
+        }
+        assert_eq!(got, ["Satz eins", ".", " Er sagte", ", dass …"]);
+    }
+
+    /// Grenzfälle T8c: erstes Segment beginnt mit Satzzeichen, Satzzeichen + Text in einem
+    /// Segment, mehrere Satzzeichen, Rest aus `finish`; das Satzzeichen geht nicht an das LLM.
+    #[test]
+    fn live_leading_punctuation_edge_cases_and_cleanup_skips_it() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Business);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(
+            &cfg,
+            || FakeStreaming::new(&[(". Danach", true), ("?!", true)], ", Rest"),
+            &log,
+        );
+        w.live_begin(None, &cfg);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), [". [Danach]"]);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["?!"]);
+        assert_eq!(texts(w.live_end()), [", [Rest]"]);
+        assert!(
+            log.borrow()
+                .iter()
+                .all(|l| !l.contains(['.', '?', '!', ','])),
+            "Satzzeichen im Cleanup: {:?}",
+            log.borrow()
+        );
+    }
+
+    /// Ohne Satzzeichen-Präfix bleibt alles beim Alten (Satzzeichen mitten im Text bleiben drin).
+    #[test]
+    fn live_text_without_leading_punctuation_is_unchanged() {
+        let cfg = live_cfg(InsertMode::PerSentence, CleanupMode::Raw);
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut w = live_worker(&cfg, || FakeStreaming::new(&[("A, b.", true)], "c"), &log);
+        w.live_begin(None, &cfg);
+        assert_eq!(texts(w.live_chunk(&[0.0; 160])), ["A, b."]);
+        assert_eq!(texts(w.live_end()), [" c"]);
     }
 
     /// REQ-STREAM-011: Geschäftlich/Natürlich korrigieren jedes Segment einzeln.
@@ -2378,6 +2519,7 @@ mod tests {
             audio::HostInstant::from_nanos(1_000),
             cfg.insert_mode,
             cfg.cleanup_mode,
+            cfg.language,
         ))
     }
 
@@ -3564,7 +3706,7 @@ mod tests {
         let delivered = Arc::new(Mutex::new(Vec::<f32>::new()));
         let sink = Arc::clone(&delivered);
         let _guard = Box::new(reference)
-            .open(Box::new(move |data, _| {
+            .open(std::sync::Arc::new(move |data, _| {
                 sink.lock().unwrap().extend_from_slice(data)
             }))
             .unwrap();
@@ -3672,5 +3814,158 @@ mod tests {
             .expect("Dictation hängt am blockierenden Log-Backend");
         assert_eq!(result, DictationResult::Inserted);
         assert_eq!(injected, ["hallo"]);
+    }
+
+    // ---- Sprache im Worker (0039 T4, REQ-DICT-024/-027) ----
+
+    use crate::config::Language;
+
+    type LanguageLog = Rc<RefCell<Vec<Language>>>;
+
+    /// Transcriber-Fake, der jedes `set_language` protokolliert.
+    struct LanguageStt {
+        seen: LanguageLog,
+    }
+
+    impl Transcriber for LanguageStt {
+        fn transcribe(&mut self, _: &[f32]) -> crate::error::Result<String> {
+            Ok("hallo".into())
+        }
+        fn set_language(&mut self, language: Language) {
+            self.seen.borrow_mut().push(language);
+        }
+    }
+
+    impl StreamingTranscriber for LanguageStt {
+        fn begin(&mut self) {}
+        fn feed(&mut self, _: &[f32]) -> crate::error::Result<crate::stt::StreamUpdate> {
+            Ok(crate::stt::StreamUpdate {
+                text: String::new(),
+                endpoint: false,
+            })
+        }
+        fn finish(&mut self) -> crate::error::Result<String> {
+            Ok("hallo".into())
+        }
+    }
+
+    /// Worker mit Sprach-Fake; liefert Sprach-Log und Zähler der `load_transcriber`-Aufrufe.
+    fn language_worker(
+        cfg: &Config,
+    ) -> (
+        DictationWorker<LanguageStt, ScriptedCleaner>,
+        LanguageLog,
+        Rc<RefCell<usize>>,
+    ) {
+        let seen = LanguageLog::default();
+        let loads = Rc::new(RefCell::new(0usize));
+        let (s, l) = (Rc::clone(&seen), Rc::clone(&loads));
+        let w = DictationWorker::new(
+            cfg,
+            models_with_gemma(ModelState::Ready),
+            Box::new(move |_: &Path| {
+                *l.borrow_mut() += 1;
+                Ok(LanguageStt {
+                    seen: Rc::clone(&s),
+                })
+            }),
+            Box::new(|| (None::<ScriptedCleaner>, false)),
+        );
+        (w, seen, loads)
+    }
+
+    fn language_cfg(insert_mode: InsertMode, language: Language) -> Config {
+        Config {
+            insert_mode,
+            cleanup_mode: CleanupMode::Raw,
+            language,
+            ..Config::default()
+        }
+    }
+
+    /// AK-7/AK-9: Batch (`handle`) und Live (`live_begin`) übergeben je Wert die Sprache der Config.
+    #[test]
+    fn worker_passes_the_configured_language_on_batch_and_live() {
+        for language in [Language::Auto, Language::De, Language::En] {
+            let cfg = language_cfg(InsertMode::AtEnd, language);
+            let (mut w, seen, _) = language_worker(&cfg);
+            w.handle(&[0.0; 1600], None, &cfg);
+            assert_eq!(*seen.borrow(), vec![language], "Batch {language:?}");
+
+            let cfg = language_cfg(InsertMode::PerSentence, language);
+            let (mut w, seen, _) = language_worker(&cfg);
+            assert_eq!(w.live_begin(None, &cfg), LiveStart::Started);
+            assert_eq!(*seen.borrow(), vec![language], "Live {language:?}");
+        }
+    }
+
+    /// AK-9: Sprachwechsel zwischen zwei Jobs wirkt im 2. Job, ohne das Modell neu zu laden.
+    #[test]
+    fn language_change_between_jobs_applies_without_reloading() {
+        let cfg = language_cfg(InsertMode::AtEnd, Language::De);
+        let (mut w, seen, loads) = language_worker(&cfg);
+        w.handle(&[0.0; 1600], None, &cfg);
+        let cfg = Config {
+            language: Language::En,
+            ..cfg
+        };
+        w.handle(&[0.0; 1600], None, &cfg);
+        assert_eq!(*seen.borrow(), vec![Language::De, Language::En]);
+        assert_eq!(*loads.borrow(), 1, "kein Neuladen bei Sprachwechsel");
+    }
+
+    /// AK-9: Ändert sich die Config zwischen Press und Job, zählt die Sprache vom Press
+    /// (`DictationTrace.language`) — Batch und Live.
+    #[test]
+    fn process_job_uses_the_language_of_the_press() {
+        let press = language_cfg(InsertMode::AtEnd, Language::De);
+        let later = Config {
+            language: Language::En,
+            ..press.clone()
+        };
+        let (mut w, seen, _) = language_worker(&press);
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&press),
+            &later,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(*seen.borrow(), vec![Language::De]);
+        assert_eq!(trace.language, Language::De);
+
+        let press = language_cfg(InsertMode::PerSentence, Language::De);
+        let later = Config {
+            language: Language::En,
+            ..press.clone()
+        };
+        let (mut w, seen, _) = language_worker(&press);
+        process_job(
+            &mut w,
+            live_job(&press, 1),
+            &later,
+            &mut recording_inject(&injected),
+            None,
+        );
+        assert_eq!(*seen.borrow(), vec![Language::De]);
+    }
+
+    /// REQ-DIAG-018: kein Transcript in der Messzeile, auch nicht mit Sprache.
+    #[test]
+    fn trace_line_with_language_has_no_transcript() {
+        let cfg = language_cfg(InsertMode::AtEnd, Language::En);
+        let (mut w, _, _) = language_worker(&cfg);
+        let injected: Injected = Rc::default();
+        let (_, trace) = process_job(
+            &mut w,
+            utterance_job(&cfg),
+            &cfg,
+            &mut recording_inject(&injected),
+            None,
+        );
+        let line = trace.to_string();
+        assert!(line.contains("Sprache: Englisch"), "{line}");
+        assert!(!line.contains("hallo"), "{line}");
     }
 }

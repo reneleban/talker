@@ -260,8 +260,14 @@ fn main() -> ExitCode {
                     // dieser Factory (permissions::should_relaunch_for_tap) findet
                     // nie eine laufende Aufnahme vor, weil der alte Tap dafür schon
                     // aktiv gewesen sein müsste.
+                    let mic_cache = audio::MicCache::default();
                     let session_press = Arc::new(Mutex::new(pipeline::PttSession::new(
-                        Box::new(|cfg| Box::new(audio::MicSource::new(cfg.mic_device.clone()))),
+                        Box::new(move |cfg| {
+                            Box::new(audio::MicSource::new(
+                                cfg.mic_device.clone(),
+                                mic_cache.clone(),
+                            ))
+                        }),
                         Arc::clone(&trace_report),
                     )));
                     let session_release = Arc::clone(&session_press);
@@ -283,7 +289,12 @@ fn main() -> ExitCode {
                             );
                             let on_ready = move |ready: pipeline::MicReady| {
                                 match ready {
-                                    pipeline::MicReady::Recording { level, mode, live } => {
+                                    pipeline::MicReady::Recording {
+                                        level,
+                                        signal,
+                                        mode,
+                                        live,
+                                    } => {
                                         if let Some(feed) = live
                                             && let Err(mpsc::SendError(job)) =
                                                 stt_ready.send(pipeline::SttJob::Live { feed })
@@ -299,7 +310,7 @@ fn main() -> ExitCode {
                                         // (inkl. aufgelöstem Modus); das Tray leitet
                                         // sein Icon daraus ab (Ticket-0035).
                                         if let Ok(mut ind) = ind_ready.lock() {
-                                            ind.start_recording(Instant::now(), level, mode);
+                                            ind.mic_started(level, signal, mode);
                                         }
                                     }
                                     pipeline::MicReady::Failed(e) => {

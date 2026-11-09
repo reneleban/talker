@@ -2,7 +2,8 @@
 //! Roh/Natürlich, ohne echte Injection, durch dieselbe Pipeline wie die App
 //! (`WavSource` → `audio::start` → `process_job`). Ausgabe: Markdown mit p50/p95.
 //! Aufruf: `make latency-eval` (Variablen `N` = Läufe je Fall, Default 10; `LATENCY_OUT=<datei>`
-//! schreibt die Tabelle zusätzlich in eine Datei). Braucht das Nemotron-Modell; ohne Gemma laufen
+//! schreibt die Tabelle zusätzlich in eine Datei; `LANGUAGE=auto|de|en` = Erkennungssprache,
+//! Default und leer = auto, Ungültiges bricht ab). Braucht das Nemotron-Modell; ohne Gemma laufen
 //! nur die Roh-Fälle, die Natürlich-Fälle stehen unter „Übersprungen“.
 
 use std::cell::RefCell;
@@ -18,7 +19,7 @@ use talker::audio::{
     self, AudioFormat, HostInstant, Pace, TARGET_SAMPLE_RATE, WavOptions, WavSource,
 };
 use talker::cleanup::{CleanupMode, GemmaCleaner, LlmCleaner};
-use talker::config::{Config, InsertMode};
+use talker::config::{Config, InsertMode, Language};
 use talker::diagnostics::{DictationTrace, cleanup_name};
 use talker::error::TalkerError;
 use talker::models::{ModelState, ModelsState};
@@ -85,6 +86,16 @@ fn parse_runs(value: Option<&str>) -> Result<usize, String> {
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| format!("N=\"{v}\" ungültig — erwartet eine positive Zahl")),
+    }
+}
+
+/// `LANGUAGE` aus der Umgebung: nicht gesetzt oder leer (das Makefile reicht `LANGUAGE=""` durch)
+/// → `Auto`; sonst `auto|de|en`; alles andere → Hinweis (kein stiller Default).
+fn parse_language(value: Option<&str>) -> Result<Language, String> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(Language::Auto),
+        Some(v) => Language::parse_env(v)
+            .ok_or_else(|| format!("LANGUAGE=\"{v}\" ungültig — erwartet auto, de, en")),
     }
 }
 
@@ -201,6 +212,7 @@ struct Combo {
 
 /// Alles, was die Tabelle braucht.
 struct Report {
+    language: Language,
     combos: Vec<Combo>,
     runs: usize,
     cold_loads: Vec<(&'static str, Duration)>,
@@ -227,8 +239,12 @@ fn render_table(report: &Report) -> String {
     let mut out = String::new();
     out.push_str("# Latenz-Messreihe\n\n");
     out.push_str(&format!(
-        "- Commit: `{}`\n- Datum: {}\n- Gerät: {}\n- Läufe je Fall: {} (+1 verworfener Aufwärmlauf)\n",
-        report.commit, report.date, report.device, report.runs
+        "- Commit: `{}`\n- Datum: {}\n- Gerät: {}\n- Sprache: {}\n- Läufe je Fall: {} (+1 verworfener Aufwärmlauf)\n",
+        report.commit,
+        report.date,
+        report.device,
+        report.language.label(),
+        report.runs
     ));
     for (model, took) in &report.cold_loads {
         out.push_str(&format!(
@@ -287,6 +303,7 @@ fn run_once<T, C>(
     fixture: &Fixture,
     insert: InsertMode,
     cleanup: CleanupMode,
+    language: Language,
 ) -> Result<RunResult, String>
 where
     T: Transcriber + StreamingTranscriber,
@@ -295,6 +312,7 @@ where
     let cfg = Config {
         insert_mode: insert,
         cleanup_mode: cleanup,
+        language,
         ..Config::default()
     };
     let live = insert != InsertMode::AtEnd;
@@ -317,7 +335,7 @@ where
     let (tx, rx) = channel();
     let recording =
         audio::start(Box::new(source), live.then_some(tx)).map_err(|e| e.to_string())?;
-    let mut trace = DictationTrace::new(1, pressed_at, insert, cleanup);
+    let mut trace = DictationTrace::new(1, pressed_at, insert, cleanup, language);
     trace.mic_ready_at = Some(HostInstant::now());
 
     let mut injected = String::new();
@@ -368,6 +386,7 @@ fn measure<T, C>(
     fixtures: &[Fixture],
     runs: usize,
     cleanups: &[CleanupMode],
+    language: Language,
     progress: &mut dyn FnMut(&str),
 ) -> (Vec<Combo>, Vec<(String, String)>)
 where
@@ -395,7 +414,7 @@ where
             ));
             let mut failure = None;
             let results = collect_runs(runs, || {
-                match run_once(worker, fixture, combo.insert, combo.cleanup) {
+                match run_once(worker, fixture, combo.insert, combo.cleanup, language) {
                     Ok(run) => run,
                     Err(e) => {
                         failure.get_or_insert(e);
@@ -443,6 +462,7 @@ struct EvalConfig {
     gemma_path: PathBuf,
     fixtures_dir: PathBuf,
     runs: usize,
+    language: Language,
     out: Option<PathBuf>,
 }
 
@@ -582,10 +602,12 @@ fn run(cfg: &EvalConfig, stdout: &mut dyn Write) -> Result<(), String> {
         &fixtures,
         cfg.runs,
         &cleanup_modes(has_cleaner),
+        cfg.language,
         &mut progress,
     );
     skipped.extend(run_skipped);
     let report = Report {
+        language: cfg.language,
         combos,
         runs: cfg.runs,
         cold_loads,
@@ -606,11 +628,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let language = match parse_language(std::env::var("LANGUAGE").ok().as_deref()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("latency-eval: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let cfg = EvalConfig {
         nemotron_dir: NemotronTranscriber::default_model_dir(),
         gemma_path: GemmaCleaner::default_model_path(),
         fixtures_dir: PathBuf::from("tests/fixtures/stt"),
         runs,
+        language,
         out: std::env::var_os("LATENCY_OUT")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from),
@@ -715,6 +745,7 @@ mod tests {
             &[fixture],
             1,
             &cleanup_modes(false),
+            Language::Auto,
             &mut |_| {},
         );
         assert_eq!(combos.len(), 2);
@@ -733,6 +764,37 @@ mod tests {
         assert!(parse_runs(Some("-2")).is_err());
     }
 
+    /// REQ-DIAG-035: `LANGUAGE` — nicht gesetzt oder leer (Makefile reicht `LANGUAGE=""` durch) =
+    /// `auto`; de/en/auto (ohne Groß-/Kleinschreibung) gelten; alles andere → Hinweis, kein Default.
+    #[test]
+    fn language_arg_defaults_to_auto_and_rejects_unknown_values() {
+        assert_eq!(parse_language(None), Ok(Language::Auto));
+        assert_eq!(parse_language(Some("")), Ok(Language::Auto));
+        assert_eq!(parse_language(Some("  ")), Ok(Language::Auto));
+        assert_eq!(parse_language(Some("auto")), Ok(Language::Auto));
+        assert_eq!(parse_language(Some("de")), Ok(Language::De));
+        assert_eq!(parse_language(Some(" EN ")), Ok(Language::En));
+        let err = parse_language(Some("fr")).unwrap_err();
+        assert!(err.contains("fr") && err.contains("auto, de, en"), "{err}");
+        assert!(parse_language(Some("deutsch")).is_err());
+    }
+
+    /// REQ-DIAG-035: die Kopfzeile der Tabelle nennt die Sprache.
+    #[test]
+    fn table_header_names_the_language() {
+        for (language, label) in [
+            (Language::Auto, "Automatisch"),
+            (Language::De, "Deutsch"),
+            (Language::En, "Englisch"),
+        ] {
+            let table = render_table(&Report {
+                language,
+                ..sample_report()
+            });
+            assert!(table.contains(&format!("- Sprache: {label}\n")), "{table}");
+        }
+    }
+
     fn sample_report() -> Report {
         let mut stats = ComboStats::default();
         stats.add_run(&RunResult {
@@ -745,6 +807,7 @@ mod tests {
         });
         stats.wers.push(0.125);
         Report {
+            language: Language::Auto,
             combos: vec![
                 Combo {
                     insert: InsertMode::PerSentence,
@@ -823,6 +886,7 @@ mod tests {
             gemma_path: PathBuf::from("/nicht/vorhanden/gemma.gguf"),
             fixtures_dir: PathBuf::from("tests/fixtures/stt"),
             runs: 1,
+            language: Language::Auto,
             out: None,
         };
         let err = run(&cfg, &mut Vec::new()).unwrap_err();
@@ -891,9 +955,13 @@ mod tests {
     struct EvalStt {
         updates: VecDeque<StreamUpdate>,
         reply: &'static str,
+        languages: Rc<RefCell<Vec<Language>>>,
     }
 
     impl Transcriber for EvalStt {
+        fn set_language(&mut self, language: Language) {
+            self.languages.borrow_mut().push(language);
+        }
         fn transcribe(&mut self, _: &[f32]) -> talker::error::Result<String> {
             Ok(self.reply.to_string())
         }
@@ -926,11 +994,18 @@ mod tests {
     fn fake_worker_with<C: LlmCleaner>(
         load_cleaner: CleanerLoader<C>,
     ) -> DictationWorker<EvalStt, C> {
+        fake_worker_recording(load_cleaner, Rc::default())
+    }
+
+    fn fake_worker_recording<C: LlmCleaner>(
+        load_cleaner: CleanerLoader<C>,
+        languages: Rc<RefCell<Vec<Language>>>,
+    ) -> DictationWorker<EvalStt, C> {
         let cfg = Config::default();
         DictationWorker::new(
             &cfg,
             Arc::new(ModelsState::new(ModelState::Ready, ModelState::Ready)),
-            Box::new(|_| {
+            Box::new(move |_| {
                 Ok(EvalStt {
                     updates: [("a", false), ("Erster Satz.", true)]
                         .iter()
@@ -940,6 +1015,7 @@ mod tests {
                         })
                         .collect(),
                     reply: "hallo welt",
+                    languages: Rc::clone(&languages),
                 })
             }),
             load_cleaner,
@@ -954,7 +1030,14 @@ mod tests {
         fx.wav("clip", &[1_000; 19_200], Some("hallo welt"));
         let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
         let mut worker = fake_worker();
-        let batch = run_once(&mut worker, &fixture, InsertMode::AtEnd, CleanupMode::Raw).unwrap();
+        let batch = run_once(
+            &mut worker,
+            &fixture,
+            InsertMode::AtEnd,
+            CleanupMode::Raw,
+            Language::Auto,
+        )
+        .unwrap();
         assert_eq!(batch.text, "hallo welt");
         assert!(batch.release_to_text.is_some() && batch.stt.is_some());
         assert!(batch.per_audio_second.is_some());
@@ -967,6 +1050,7 @@ mod tests {
             &fixture,
             InsertMode::PerSentence,
             CleanupMode::Raw,
+            Language::Auto,
         )
         .unwrap();
         assert!(live.text.contains("Erster Satz."), "{}", live.text);
@@ -978,10 +1062,39 @@ mod tests {
             &fixture,
             InsertMode::AtEnd,
             CleanupMode::Casual,
+            Language::Auto,
         )
         .unwrap();
         assert_eq!(cleaned.text, "hallo welt!");
         assert!(cleaned.cleanup.is_some());
+    }
+
+    /// REQ-DIAG-035: die gewählte Sprache erreicht den Transcriber (Batch und Live) und die Messzeile.
+    #[test]
+    fn language_reaches_the_transcriber_in_batch_and_live() {
+        let fx = TempFixtures::new("sprache");
+        fx.wav("clip", &[1_000; 19_200], Some("hallo welt"));
+        let fixture = load_fixture(&fx.0.join("clip.wav")).unwrap();
+        for insert in [InsertMode::AtEnd, InsertMode::PerSentence] {
+            let languages = Rc::default();
+            let mut worker = fake_worker_recording(
+                Box::new(|| (Some(BracketCleaner), false)),
+                Rc::clone(&languages),
+            );
+            run_once(
+                &mut worker,
+                &fixture,
+                insert,
+                CleanupMode::Raw,
+                Language::De,
+            )
+            .unwrap();
+            let seen = languages.borrow();
+            assert!(
+                !seen.is_empty() && seen.iter().all(|l| *l == Language::De),
+                "{insert:?}: {seen:?}"
+            );
+        }
     }
 
     /// AK-22 (PERF-5), REQ-DIAG-034 AK-2: Natürlich-Fälle haben Cleanup-Werte, auch nachdem Roh
@@ -997,6 +1110,7 @@ mod tests {
             &[fixture],
             2,
             &cleanup_modes(true),
+            Language::Auto,
             &mut |_: &str| {},
         );
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -1068,6 +1182,7 @@ mod tests {
             &loaded,
             runs,
             &cleanup_modes(true),
+            Language::Auto,
             &mut |_: &str| {},
         );
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -1115,6 +1230,7 @@ mod tests {
             &[fixture],
             2,
             &cleanup_modes(true),
+            Language::Auto,
             &mut |_: &str| {},
         );
         assert_eq!(
@@ -1143,6 +1259,7 @@ mod tests {
             &[fixture],
             2,
             &cleanup_modes(false),
+            Language::Auto,
             &mut |_: &str| {},
         );
         assert!(skipped.is_empty(), "{skipped:?}");
@@ -1188,6 +1305,7 @@ mod tests {
             &[good, vanished],
             1,
             &cleanup_modes(true),
+            Language::Auto,
             &mut progress,
         );
         assert_eq!(combos.len(), 4);
@@ -1206,6 +1324,7 @@ mod tests {
         assert_eq!(at_end_raw.wers, [0.0]);
         let table = render_table(&Report {
             combos,
+            language: Language::Auto,
             runs: 1,
             cold_loads: vec![],
             skipped,
