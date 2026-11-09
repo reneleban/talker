@@ -49,7 +49,7 @@ Gemma Terms of Use).
 
 ## Testdaten: FLEURS-Fixtures, NICHT MIT
 
-`tests/fixtures/stt/fleurs-de-*.{wav,ref.txt}` (zehn deutsche Clips) stammen aus dem Datensatz
+`tests/fixtures/stt/fleurs-de-*.{wav,ref.txt}` (fünfzehn deutsche Clips, davon fünf von Sprecherinnen aus dem Split train) stammen aus dem Datensatz
 FLEURS (Google, Conneau et al.) und stehen unter **CC-BY-4.0**, nicht unter der MIT-Lizenz
 dieses Repos. Urheber, Quelle, Lizenzlink und Änderungen: `tests/fixtures/stt/ATTRIBUTION.md`.
 Die Clips werden nur in Tests und in `make latency-eval` verwendet und sind nicht Teil des

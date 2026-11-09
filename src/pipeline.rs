@@ -19,9 +19,9 @@ use crate::stt::{ModelTap, PhraseCommitter, StreamingTranscriber, Transcriber};
 use crate::{audio, vocab_match};
 
 /// Hinweis, wenn kein Text erkannt wurde.
+const NOTHING_RECOGNIZED: &str = "Nichts erkannt";
 /// Satzzeichen, mit denen ein Live-Segment beginnen kann (ADR-0015).
 const LEADING_PUNCTUATION: &[char] = &['.', ',', '?', '!', ';', ':'];
-const NOTHING_RECOGNIZED: &str = "Nichts erkannt";
 /// Wie die Messzeile „kein Text" nennt.
 const NOTHING_RECOGNIZED_REASON: &str = "nichts erkannt";
 
