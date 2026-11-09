@@ -467,6 +467,15 @@ mod tests {
         );
     }
 
+    /// 0039 Out of Scope: Dauer von Vor- und Nachlauf bleibt 0,4 s / 1,2 s (16 kHz) — nicht verkürzen (→ 0041).
+    #[test]
+    fn padding_durations_stay_0_4_s_lead_and_1_2_s_tail() {
+        assert_eq!(LEAD_SILENCE_SAMPLES, 6_400);
+        assert_eq!(TAIL_SILENCE_SAMPLES, 19_200);
+        assert_eq!(pad_with_silence(&[]).len(), 6_400 + 19_200);
+        assert_eq!(pad_with_silence(&[0.25]).len(), 6_400 + 1 + 19_200);
+    }
+
     #[test]
     fn padding_of_empty_audio_is_only_silence() {
         assert_eq!(
