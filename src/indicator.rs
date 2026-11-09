@@ -42,9 +42,9 @@ pub struct Indicator {
     phase_since: Instant,
     level: Option<LevelHandle>,
     smoothed_level: f32,
-    /// Aufnahme läuft (`mic_started` lief, noch kein `transcribing`/`cancel`):
-    /// ein Fehler blendet sich dann nicht aus (REQ-DICT-023).
-    open: bool,
+    /// Der Start-Timeout hat gefeuert, der Start ist noch offen (bis
+    /// `transcribing`/`cancel`/`fail`): der Fehler bleibt stehen (REQ-DICT-023).
+    start_timed_out: bool,
     signal: Option<SignalHandle>,
     mode: CleanupMode,
 }
@@ -56,7 +56,7 @@ impl Default for Indicator {
             phase_since: Instant::now(),
             level: None,
             smoothed_level: 0.0,
-            open: false,
+            start_timed_out: false,
             signal: None,
             mode: CleanupMode::Raw,
         }
@@ -94,7 +94,7 @@ impl Indicator {
         self.phase_since = now;
         self.level = None;
         self.signal = None;
-        self.open = false;
+        self.start_timed_out = false;
     }
 
     /// Mikrofon läuft: Balken bleiben bis zum ersten Signal (REQ-DICT-016).
@@ -103,7 +103,6 @@ impl Indicator {
         if !matches!(self.phase, Phase::Starting | Phase::Error(_)) {
             return;
         }
-        self.open = true;
         self.level = Some(level);
         self.signal = Some(signal);
         self.mode = mode;
@@ -127,7 +126,7 @@ impl Indicator {
         self.phase_since = now;
         self.level = None;
         self.signal = None;
-        self.open = false;
+        self.start_timed_out = false;
     }
 
     pub fn finish_ok(&mut self, now: Instant) {
@@ -136,6 +135,7 @@ impl Indicator {
     }
 
     pub fn fail(&mut self, now: Instant, msg: impl Into<String>) {
+        self.start_timed_out = false;
         self.phase = Phase::Error(msg.into());
         self.phase_since = now;
     }
@@ -145,7 +145,7 @@ impl Indicator {
         self.phase = Phase::Hidden;
         self.level = None;
         self.signal = None;
-        self.open = false;
+        self.start_timed_out = false;
     }
 
     /// Zeitgesteuerte Übergänge (done/error blenden automatisch aus; ein
@@ -156,10 +156,12 @@ impl Indicator {
                 && now.duration_since(self.phase_since) >= STARTING_TIMEOUT
             {
                 self.fail(now, "Mikrofon antwortet nicht");
+                self.start_timed_out = true;
             }
             return;
         }
-        if self.open && matches!(self.phase, Phase::Error(_)) {
+        if (self.signal.is_some() || self.start_timed_out) && matches!(self.phase, Phase::Error(_))
+        {
             return;
         }
         let timeout = match self.phase {
@@ -467,6 +469,21 @@ mod tests {
         assert!(matches!(ind.phase(), Phase::Error(_)));
         ind.tick(t0 + STARTING_TIMEOUT + Duration::from_secs(60));
         assert!(ind.visible());
+    }
+
+    #[test]
+    fn timeout_error_stays_visible_until_a_late_mic_start() {
+        let t0 = now();
+        let mut ind = Indicator::default();
+        ind.starting(t0);
+        ind.tick(t0 + STARTING_TIMEOUT);
+        ind.tick(t0 + STARTING_TIMEOUT + ERROR_SHOW + Duration::from_secs(1));
+        assert!(matches!(ind.phase(), Phase::Error(_)));
+        let signal = SignalHandle::pending();
+        signal.fire();
+        ind.mic_started(LevelHandle::default(), signal, CleanupMode::Raw);
+        ind.tick(t0 + Duration::from_secs(8));
+        assert!(matches!(ind.phase(), Phase::Error(_)));
     }
 
     #[test]
