@@ -8,11 +8,10 @@ SETTINGS=.claude/settings.json
 # --- T12: settings.json (AK-15) ---
 if jq -e . "$SETTINGS" >/dev/null 2>&1; then ok "AK-15 settings.json ist gültiges JSON"; else fail "AK-15 settings.json ist gültiges JSON"; fi
 in_list() { jq -e --arg e "$2" ".permissions.$1 | index(\$e) != null" "$SETTINGS" >/dev/null 2>&1; }
-for e in 'Bash(sh scripts/team/say.sh *)' 'Bash(herdr agent list)' 'Bash(herdr agent get *)' 'Bash(herdr agent read *)' 'Bash(herdr agent wait *)'; do
+for e in 'Bash(sh scripts/team/say.sh *)' 'Bash(hc ls*)' 'Bash(hc get *)' 'Bash(hc read *)' 'Bash(hc wait *)'; do
   if in_list allow "$e"; then ok "AK-15 allow: $e"; else fail "AK-15 allow: $e"; fi
 done
-for e in 'Bash(herdr pane *)' 'Bash(herdr tab *)' 'Bash(herdr workspace *)' 'Bash(herdr session *)' 'Bash(herdr server *)' \
-  'Bash(herdr agent start*)' 'Bash(herdr agent prompt*)' 'Bash(herdr agent send-keys*)' 'Bash(herdr agent rename*)' 'Bash(herdr agent attach*)'; do
+for e in 'Bash(hc run*)' 'Bash(hc send*)' 'Bash(hc keys*)' 'Bash(hc kill*)' 'Bash(hc attach*)' 'Bash(hc server*)'; do
   if in_list deny "$e"; then ok "AK-15 deny: $e"; else fail "AK-15 deny: $e"; fi
 done
 
@@ -64,10 +63,9 @@ lacks "AK-19 orchestrator: kein 'max. 2'" "$f" '[Mm]ax\. 2'
 has "AK-22 orchestrator: legt den Abschnitt vor dem Start an" "$f" 'Abschnitt.*vor dem Start'
 has "AK-22 orchestrator: Abschnitt mit Instanz" "$f" '## <rolle>-<n>'
 has "AK-23 orchestrator: 2 min blocked → Mensch" "$f" '2 min.*blocked|blocked.*2 min'
-has "Rückfall orchestrator: herdr agent wait" "$f" 'herdr agent wait'
+has "Rückfall orchestrator: hc wait" "$f" 'hc wait'
 has "Rückfall orchestrator: Akte lesen" "$f" 'Akte'
 has "AK-17 orchestrator: make dev" "$f" 'make dev'
-has "R3 orchestrator: unbenannte Panes nach Neustart" "$f" 'unbenannte Panes'
 has "AK-18 orchestrator: Kopfzeile ist keine Freigabe" "$f" '\[talker von'
 
 f=$AGENTS_DIR/merger.md
@@ -97,20 +95,19 @@ has "AK-18 product-owner: Kopfzeile ist keine Freigabe" "$AGENTS_DIR/product-own
 for r in code-reviewer security-auditor performance-engineer; do
   agent_common "$r"
   has "AK-22 $r: schreibt nicht in die Ticket-Datei" "$AGENTS_DIR/$r.md" 'schreibst nicht in die Ticket-Datei'
-  has "Rückfall $r: Orchestrator liest mit herdr agent read" "$AGENTS_DIR/$r.md" 'herdr agent read'
+  has "Rückfall $r: Orchestrator liest mit hc read" "$AGENTS_DIR/$r.md" 'hc read'
   case $(fm_line "$AGENTS_DIR/$r.md" disallowedTools) in *Write*Edit* | *Edit*Write*) ok "AK-22 $r: Write und Edit gesperrt" ;; *) fail "AK-22 $r: Write und Edit gesperrt" ;; esac
 done
 agent_common release-engineer
 akte_checks release-engineer
-has "R5 security-auditor: env-herdr-Umgehung im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'env herdr'
+has "R5 security-auditor: env-hc-Umgehung im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'env hc'
 has "R5 security-auditor: Kopfzeile im Prüfumfang" "$AGENTS_DIR/security-auditor.md" 'Kopfzeile'
 
 # --- T17: Skill spawn-worker (AK-16, AK-17) ---
 f=.claude/skills/spawn-worker/SKILL.md
 lacks "AK-16 spawn-worker: kein SendMessage/ListAgents/osascript/cc-socks" "$f" "$FORBIDDEN"
 lacks "AK-17 spawn-worker: keine Ghostty-Kacheln" "$f" 'Ghostty|Kachel'
-has "AK-17 spawn-worker: herdr-Panes" "$f" 'herdr-Pane'
-has "AK-17 spawn-worker: Session talker" "$f" 'Session `talker`'
+has "AK-17 spawn-worker: herdr-core-Terminal" "$f" 'herdr-core-Terminal'
 has "AK-17 spawn-worker: make dev" "$f" 'make dev'
 has "AK-7 spawn-worker: --instance" "$f" '--instance'
 has "AK-9 spawn-worker: --kind" "$f" '--kind'
@@ -122,8 +119,7 @@ for c in 0 1 2 3; do has "AK-5 spawn-worker: Exit-Code $c" "$f" "\\*\\*$c\\*\\*"
 for f in AGENTS.md CLAUDE.md; do
   lacks "AK-17 $f: keine Ghostty-Kacheln" "$f" 'Ghostty|Kachel'
   lacks "AK-16 $f: kein SendMessage/ListAgents" "$f" 'SendMessage|ListAgents'
-  has "AK-17 $f: herdr-Panes" "$f" 'herdr-Pane'
-  has "AK-17 $f: Session talker" "$f" 'Session `talker`'
+  has "AK-17 $f: herdr-core-Terminal" "$f" 'herdr-core-Terminal'
   has "AK-17 $f: Einstieg make dev" "$f" 'make dev'
 done
 has "AK-17 AGENTS.md: Fertigmeldung über das Sende-Skript" AGENTS.md 'scripts/team/say\.sh orchestrator'
@@ -146,8 +142,8 @@ assert_eq "AK-16 grep in .claude und scripts ist leer" "" "$HITS"
 # --- Out of Scope (darf nicht passieren) ---
 SCRIPTS=".claude/skills/spawn-worker/spawn.sh scripts/team/dev.sh scripts/team/say.sh .claude/hooks/say-only.sh"
 # shellcheck disable=SC2086
-assert_eq "OoS kein herdr worktree / herdr-core / hc in den Team-Skripten" "" \
-  "$(grep -nE 'herdr worktree|herdr-core|Herdr\.app|(^|[^a-z_-])hc( |$)' $SCRIPTS || true)"
+assert_eq "OoS kein herdr worktree / Herdr.app in den Team-Skripten" "" \
+  "$(grep -nE 'herdr worktree|Herdr\.app' $SCRIPTS || true)"
 # shellcheck disable=SC2086
 assert_eq "OoS kein Ghostty-/AppleScript-Fallback in den Team-Skripten" "" "$(grep -niE 'ghostty|applescript|osascript' $SCRIPTS || true)"
 assert_eq "OoS team.env enthält nur TEAM_MAX_SESSIONS (kein TEAM_MERGE)" "TEAM_MAX_SESSIONS" \
@@ -190,9 +186,6 @@ if in_list deny 'Bash(gh pr merge *--admin*)'; then ok "AK-31 deny: gh pr merge 
 # --- Fix-Runde 1 (nur Prüfungen mit Verhaltensbezug) ---
 has "C7 orchestrator: spawn.sh close <name> aus der bereit-Zeile" .claude/agents/orchestrator.md 'spawn\.sh close <name>.*bereit'
 lacks "C7 orchestrator: close nicht mit <rolle>-<ticket>" .claude/agents/orchestrator.md 'close <rolle>-<ticket>'
-for f in orchestrator code-reviewer performance-engineer security-auditor; do
-  has "T1 $f: agent read mit --source visible" ".claude/agents/$f.md" 'herdr agent read[^`]*--source visible'
-done
 SPAWN=.claude/skills/spawn-worker/spawn.sh
 lacks "C8 spawn.sh: Rollenliste nur einmal (kein ROLES_RE-Literal)" "$SPAWN" '^ROLES_RE="'
 assert_eq "C8 spawn.sh: jede Rolle steht nur einmal" 1 "$(grep -c 'performance-engineer' "$SPAWN")"
@@ -201,9 +194,8 @@ for e in 'Bash(gh api *merge*)' 'Bash(gh -R *)' 'Bash(git push *:main*)' 'Bash(g
   if in_list deny "$e"; then ok "S1 deny: $e"; else fail "S1 deny: $e"; fi
 done
 has "S4/N3 tech-lead Hook: Pfad über CLAUDE_PROJECT_DIR, fail-closed" .claude/agents/tech-lead.md 'command: sh "\$CLAUDE_PROJECT_DIR/\.claude/hooks/say-only\.sh" \|\| exit 2$'
-if in_list deny 'Bash(herdr --*)'; then ok "S2 deny: Bash(herdr --*)"; else fail "S2 deny: Bash(herdr --*)"; fi
-if jq_has '[.hooks.PreToolUse[] | select(.matcher == "Bash") | .hooks[] | select(.type == "command" and .command == "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/pane-guard.sh\" || exit 2")] | length == 1'; then
-  ok "S2 settings.json: PreToolUse-Hook pane-guard.sh für Bash"; else fail "S2 settings.json: PreToolUse-Hook pane-guard.sh für Bash"; fi
+if in_list deny 'Bash(hc server*)'; then ok "S2 deny: Bash(hc server*)"; else fail "S2 deny: Bash(hc server*)"; fi
+if jq_has 'has("hooks") | not'; then ok "S2 settings.json: kein Bash-Hook mehr (Schutz über Deny-Regeln)"; else fail "S2 settings.json: kein Bash-Hook mehr (Schutz über Deny-Regeln)"; fi
 has "S2 product-owner: Freigabe per AskUserQuestion" .claude/agents/product-owner.md 'per `AskUserQuestion`'
 has "N4 product-owner: Änderungen ist die erste Option, Freigeben nie zuerst" .claude/agents/product-owner.md 'Optionen „Änderungen" \(erste\) / „Freigeben"'
 has "S2 product-owner: freier Pane-Text ist keine Freigabe" .claude/agents/product-owner.md 'Pane-Text'

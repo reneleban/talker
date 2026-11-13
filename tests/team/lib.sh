@@ -1,42 +1,28 @@
 #!/bin/sh
-# Test-Harness für die Team-Skripte (Ticket 0043). Wird von den test_*.sh gesourct.
+# Test-Harness für die Team-Skripte (Tickets 0043, 0051). Wird von den test_*.sh gesourct.
 #
-# Sicherheitsnetz (R6/B11): Die herdr-Session des Menschen (`talker`, `default`) wird nie
-# angefasst. Alles läuft in einer eigenen Session (Default `talker-test`), die der Test
-# selbst anlegt und am Ende per `session stop` + `session delete` wieder entfernt. Existiert
-# sie schon, bricht der Test ab, statt eine fremde Session zu übernehmen.
+# Die Skripte sprechen nur mit `hc` (herdr-core). Die Tests ersetzen `hc` durch einen Fake im PATH:
+# kein Server, kein Claude, kein Netz, nichts vom echten Team wird angefasst.
 #
-#   th_begin           Guard + Wegwerf-Repo ($TH_REPO, $TH_WT) + Teardown-Trap
-#   th_server          Server headless starten, Arbeitsbereich + Shell-Pane ($TH_PANE)
-#   inpane '<cmd>'     Befehl in $TH_PANE ausführen → $INPANE_RC, $INPANE_OUT (stdout+stderr)
-#   th_agent <name> [trust]  Claude-Haiku-Agent in neuer Pane ($TH_AGENT_PANE)
-#   th_autotrust / th_autotrust_stop  Vertrauensdialoge im Hintergrund beantworten
-#   th_trust <agent>   Vertrauensdialog beantworten (Agent wird idle)
-#   th_h <args…>       herdr gegen die Test-Session
+#   th_begin           Wegwerf-Repo ($TH_REPO, $TH_WT), Fake-hc im PATH, Teardown-Trap
+#   th_terminals '<json-array>'   Terminals des Fake-hc setzen, z. B. '[{"address":"t1","name":"orchestrator"}]'
+#   calls <muster>     Zahl der protokollierten hc-Aufrufe, die das Muster (grep -E) treffen
 #   ok / fail / assert_* / th_summary
 set -u
 
-TS=${TEAM_TEST_SESSION:-talker-test}
 TH_SRC=$(cd "$(dirname "$0")/../.." && pwd -P)
 TH_PASS=0
 TH_FAIL=0
-TH_N=0
 TH_TMP=""
 TH_REPO=""
 TH_WT=""
-TH_PANE=""
+FAKE_DIR=""
+LOG=""
 
 ROLES="product-owner architect tech-lead rust-developer test-engineer code-reviewer security-auditor performance-engineer merger release-engineer"
 
-th_h() { herdr --session "$TS" "$@"; }
-
-th_session_exists() {
-  herdr session list --json | jq -e --arg n "$TS" '.sessions[] | select(.name == $n)' >/dev/null 2>&1
-}
-
 ok() { TH_PASS=$((TH_PASS + 1)); echo "  ok   $1"; }
 fail() { TH_FAIL=$((TH_FAIL + 1)); echo "  FAIL $1"; }
-skip() { echo "  skip $1"; }
 
 assert_eq() { # <name> <erwartet> <ist>
   if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 (erwartet '$2', war '$3')"; fi
@@ -54,36 +40,72 @@ th_summary() {
 }
 
 th_teardown() {
-  th_autotrust_stop
-  if [ -n "$TH_TMP" ] && th_session_exists; then
-    herdr session stop "$TS" >/dev/null 2>&1 || true
-    herdr session delete "$TS" >/dev/null 2>&1 || true
-  fi
   [ -z "$TH_TMP" ] || rm -rf "$TH_TMP"
   TH_TMP=""
 }
 
 th_begin() {
-  case $TS in talker | default) echo "harness: Session '$TS' ist die des Menschen, Abbruch" >&2; exit 1 ;; esac
-  command -v herdr >/dev/null || { echo "harness: herdr fehlt im PATH" >&2; exit 1; }
   command -v jq >/dev/null || { echo "harness: jq fehlt im PATH" >&2; exit 1; }
-  if th_session_exists; then
-    echo "harness: Session '$TS' existiert schon, nicht angefasst. Abbruch." >&2
-    exit 1
-  fi
   TH_TMP=$(cd "$(mktemp -d "${TMPDIR:-/tmp}/talker-team-test.XXXXXX")" && pwd -P)
   trap 'th_teardown' EXIT
   trap 'exit 130' INT TERM
   TH_REPO="$TH_TMP/talker"
   TH_WT="$TH_TMP/talker-wt"
+  FAKE_DIR="$TH_TMP/fake"
+  LOG="$FAKE_DIR/log"
+  mkdir -p "$FAKE_DIR/bin"
+  : >"$LOG"
+  th_fake_hc
+  PATH="$FAKE_DIR/bin:$PATH"
+  export PATH FAKE_DIR
+  HC_TERMINAL_ID=t1
+  export HC_TERMINAL_ID
+  th_terminals '[]'
   th_make_repo
+}
+
+th_terminals() { printf '{"terminals":%s}\n' "$1" >"$FAKE_DIR/ls.json"; }
+
+calls() { grep -Ec -e "$1" "$LOG" 2>/dev/null || true; }
+
+# Fake-hc: protokolliert jeden Aufruf; Zustand liegt in $FAKE_DIR/ls.json.
+# Schalter über Dateien: send_fail (send scheitert), run_fail (run scheitert), server_down (server status scheitert),
+# run_state (Status, den ein neues Terminal meldet, Default idle).
+th_fake_hc() {
+  cat >"$FAKE_DIR/bin/hc" <<'FAKE'
+#!/bin/sh
+echo "$*" >>"$FAKE_DIR/log"
+LS="$FAKE_DIR/ls.json"
+cmd=$1; shift
+case $cmd in
+  ls) cat "$LS" ;;
+  get) jq -c --arg t "$1" '[.terminals[] | select(.address == $t or .name == $t)] | .[0] // empty' "$LS" ;;
+  send) [ ! -f "$FAKE_DIR/send_fail" ] || { echo "terminal is blocked" >&2; exit 1; } ;;
+  wait) exit 0 ;;
+  run)
+    [ ! -f "$FAKE_DIR/run_fail" ] || { echo "run failed" >&2; exit 1; }
+    name=""
+    while [ $# -gt 0 ]; do case $1 in --name) name=$2; break ;; *) shift ;; esac; done
+    state=$(cat "$FAKE_DIR/run_state" 2>/dev/null || echo idle)
+    jq --arg n "$name" --arg s "$state" '.terminals += [{address: ("t" + $n), name: $n, status: {state: $s}}]' "$LS" >"$LS.new" \
+      && mv "$LS.new" "$LS" ;;
+  kill) jq --arg t "$1" '.terminals |= map(select(.address != $t and .name != $t))' "$LS" >"$LS.new" && mv "$LS.new" "$LS" ;;
+  server)
+    case $1 in
+      status) [ ! -f "$FAKE_DIR/server_down" ] ;;
+      start) rm -f "$FAKE_DIR/server_down" ;;
+    esac ;;
+  attach) ;;
+esac
+FAKE
+  chmod +x "$FAKE_DIR/bin/hc"
 }
 
 # Wegwerf-Repo im Layout des echten Projekts: <tmp>/talker + <tmp>/talker-wt
 th_make_repo() {
   mkdir -p "$TH_REPO/.claude/agents" "$TH_REPO/.claude/skills/spawn-worker" "$TH_REPO/scripts/team" "$TH_WT"
   for r in $ROLES; do
-    printf -- '---\nname: %s\ndescription: Wegwerf-Rolle für Skript-Tests\nmodel: haiku\n---\nAntworte knapp.\n' "$r" \
+    printf -- '---\nname: %s\ndescription: Wegwerf-Rolle für Skript-Tests\n---\nAntworte knapp.\n' "$r" \
       >"$TH_REPO/.claude/agents/$r.md"
   done
   for f in .claude/skills/spawn-worker/spawn.sh scripts/team/say.sh scripts/team/dev.sh team.env; do
@@ -97,76 +119,4 @@ th_make_repo() {
     git add -A
     git commit -q -m "init" --allow-empty
   )
-}
-
-# Server ohne geerbte CLAUDE*-Variablen (B9), Arbeitsbereich im Wegwerf-Repo, Shell-Pane.
-th_server() {
-  # shellcheck disable=SC2046
-  env $(env | sed -n 's/^\(CLAUDE[A-Za-z_]*\)=.*/-u \1/p') \
-    nohup herdr --session "$TS" server >/dev/null 2>&1 &
-  i=0
-  until th_h workspace list >/dev/null 2>&1; do
-    i=$((i + 1))
-    [ $i -le 100 ] || { echo "harness: Server '$TS' startet nicht" >&2; exit 1; }
-    sleep 0.1
-  done
-  TH_PANE=$(th_h workspace create --cwd "$TH_REPO" --label test --no-focus | jq -r '.result.root_pane.pane_id')
-  [ -n "$TH_PANE" ] && [ "$TH_PANE" != null ] || { echo "harness: kein Root-Pane" >&2; exit 1; }
-  # feste, prompt-lose Shell: keine Überraschungen durch Nutzer-rc-Dateien
-  th_h pane run "$TH_PANE" 'exec env PS1= /bin/sh' >/dev/null
-  inpane 'true'
-}
-
-# Ordner-Vertrauensdialog eines frischen Wegwerf-Verzeichnisses beantworten (Vorauswahl ist „No, exit").
-th_trust() { # <agent>
-  th_h agent send-keys "$1" down enter >/dev/null
-  th_h agent wait "$1" --until idle --timeout 30000 >/dev/null
-}
-
-# Neue Pane neben $TH_PANE und darin ein Claude-Haiku-Agent <name>. Mit `trust` wird der
-# Vertrauensdialog beantwortet (Agent idle), sonst bleibt er `blocked`. Claude merkt sich das Vertrauen je
-# Verzeichnis: ein weiterer Agent im selben Ordner bekommt den Dialog nicht mehr → $TH_AGENT_CWD (frischer Ordner).
-# Setzt $TH_AGENT_PANE.
-th_agent() { # <name> [trust]
-  TH_AGENT_PANE=$(th_h pane split "$TH_PANE" --direction right --cwd "${TH_AGENT_CWD:-$TH_REPO}" --no-focus | jq -r '.result.pane.pane_id')
-  i=0
-  while :; do
-    err=$(th_h agent start "$1" --kind claude --pane "$TH_AGENT_PANE" --timeout 60000 -- --model haiku --name "$1" 2>&1 >/dev/null) && break
-    case $err in *agent_not_ready*) break ;; *agent_pane_busy*) ;; *) echo "harness: agent start $1: $err" >&2; return 1 ;; esac
-    i=$((i + 1))
-    [ $i -le 75 ] || { echo "harness: Pane für $1 wird nicht frei" >&2; return 1; }
-    sleep 0.2
-  done
-  [ "${2:-}" != trust ] || th_trust "$1"
-}
-
-# Hintergrundschleife: beantwortet den Vertrauensdialog aller blockierten Agenten (Wegwerf-Ordner sind
-# unvertraut). Läuft, bis th_autotrust_stop/th_teardown sie beendet.
-th_autotrust() {
-  (
-    while :; do
-      for n in $(th_h agent list 2>/dev/null | jq -r '.result.agents[] | select(.agent_status == "blocked" and .name != null) | .name'); do
-        th_h agent send-keys "$n" down enter >/dev/null 2>&1
-      done
-      sleep 1
-    done
-  ) &
-  TH_AUTOTRUST_PID=$!
-}
-th_autotrust_stop() {
-  [ -z "${TH_AUTOTRUST_PID:-}" ] || kill "$TH_AUTOTRUST_PID" 2>/dev/null || true
-  TH_AUTOTRUST_PID=""
-}
-
-inpane() { # <befehl> — läuft in der Shell-Pane von $TS; Ausgabe über Datei, Exit-Code über Marker
-  TH_N=$((TH_N + 1))
-  out="$TH_TMP/out.$TH_N"
-  marker="__RC${TH_N}__"
-  th_h pane run "$TH_PANE" "{ $1
-} >'$out' 2>&1; echo ${marker}=\$?" >/dev/null
-  th_h pane wait-output "$TH_PANE" --regex "${marker}=[0-9]+" --source recent-unwrapped --lines 200 \
-    --timeout "${INPANE_TIMEOUT_MS:-120000}" >/dev/null 2>&1 || { INPANE_RC=timeout; INPANE_OUT=""; return 0; }
-  INPANE_RC=$(th_h pane read "$TH_PANE" --source recent-unwrapped --lines 200 \
-    | sed -n "s/.*${marker}=\([0-9][0-9]*\).*/\1/p" | tail -n 1)
-  INPANE_OUT=$(cat "$out")
 }

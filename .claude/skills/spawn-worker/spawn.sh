@@ -1,10 +1,10 @@
 #!/bin/sh
-# Startet eine Rollen-Session als herdr-Pane (ADR-0013).
+# Startet eine Rollen-Session als herdr-core-Terminal (ADR-0013).
 #   spawn.sh init <ticket> <feature-branch>
 #   spawn.sh [--kind claude|codex] [--instance] <rolle> <ticket> <feature-branch>
 #   spawn.sh close <name>
-# Exit: 0 bereit · 1 Abbruch vor jeder Änderung · 2 Aufruf · 3 nach einer Änderung nicht bereit/herdr-Fehler.
-# SPAWN_READY_TIMEOUT_MS (Default 60000): Bereit-Frist (Test-Naht).
+# Exit: 0 bereit · 1 Abbruch vor jeder Änderung · 2 Aufruf · 3 nach einer Änderung nicht bereit/hc-Fehler.
+# SPAWN_READY_TIMEOUT_S (Default 60): Bereit-Frist (Test-Naht).
 set -eu
 
 die() { echo "spawn: $1" >&2; exit "${2:-1}"; }
@@ -12,7 +12,7 @@ die() { echo "spawn: $1" >&2; exit "${2:-1}"; }
 MAIN=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 WT_ROOT="$(dirname "$MAIN")/talker-wt"
 INTEGRATION="$WT_ROOT/integration"
-READY_MS=${SPAWN_READY_TIMEOUT_MS:-60000}
+READY_S=${SPAWN_READY_TIMEOUT_S:-60}
 # Einzige Rollenliste: eigener Worktree bzw. Integrations-Worktree; ROLES_RE und die Prüfung per in_roles leiten sich daraus ab.
 OWN_ROLES="product-owner architect rust-developer test-engineer release-engineer"
 SHARED_ROLES="tech-lead code-reviewer security-auditor performance-engineer merger"
@@ -29,8 +29,8 @@ require_clean() {
 }
 
 USAGE="Aufruf: spawn.sh init <ticket> <feature-branch> | [--kind claude|codex] [--instance] <rolle> <ticket> <feature-branch> | close <name>"
-need_herdr() {
-  [ "${HERDR_ENV:-}" = 1 ] || die "außerhalb von herdr (HERDR_ENV ist nicht 1), Einstieg: make dev"
+need_hc() {
+  [ -n "${HC_TERMINAL_ID:-}" ] || die "außerhalb von herdr-core (HC_TERMINAL_ID fehlt), Einstieg: make dev"
 }
 
 INSTANCE=0
@@ -50,11 +50,11 @@ case $KIND in claude|codex) ;; *) die "unbekannter --kind: $KIND (erlaubt: claud
 
 if [ "${1:-}" = close ]; then
   [ $# -eq 2 ] || die "$USAGE" 2
-  need_herdr
+  need_hc
   [ "$2" != orchestrator ] || die "orchestrator wird nicht über spawn.sh beendet"
-  PANE=$(herdr agent get "$2" 2>/dev/null | jq -r '.result.agent.pane_id // empty') || true
-  [ -n "$PANE" ] || die "keine laufende Session $2"
-  herdr pane close "$PANE" >/dev/null
+  hc ls --json | jq -e --arg n "$2" '.terminals[] | select(.name == $n)' >/dev/null \
+    || die "keine laufende Session $2"
+  hc kill "$2" >/dev/null
   echo "$2 beendet"
   exit 0
 fi
@@ -78,8 +78,8 @@ if [ "$ROLE" = init ]; then
   exit 0
 fi
 
-# Prüfungen, alle vor jeder Änderung (kein Worktree, keine Pane)
-need_herdr
+# Prüfungen, alle vor jeder Änderung (kein Worktree, kein Terminal)
+need_hc
 case $TICKET in [0-9][0-9][0-9][0-9]) ;; *) die "Ticket muss vierstellig sein: $TICKET" ;; esac
 check_feature
 if in_roles "$ROLE" "$OWN_ROLES"; then OWN=1; DIR="$WT_ROOT/$ROLE"
@@ -95,8 +95,8 @@ else
   MAX=$(sed -n 's/^TEAM_MAX_SESSIONS=//p' "$MAIN/team.env" 2>/dev/null | head -n 1)
 fi
 case $MAX in ''|0*|*[!0-9]*) die "TEAM_MAX_SESSIONS ungültig: '$MAX'" ;; esac
-AGENTS=$(herdr agent list)
-ACTIVE=$(printf '%s' "$AGENTS" | jq --arg re "^($ROLES_RE)-[0-9]{4}(-[0-9]+)?\$" '[.result.agents[] | select((.name // "") | test($re))] | length')
+TERMS=$(hc ls --json)
+ACTIVE=$(printf '%s' "$TERMS" | jq --arg re "^($ROLES_RE)-[0-9]{4}(-[0-9]+)?\$" '[.terminals[] | select((.name // "") | test($re))] | length')
 [ $((ACTIVE + 1)) -le "$MAX" ] || die "Obergrenze erreicht: $ACTIVE Rollen-Sessions aktiv, TEAM_MAX_SESSIONS=$MAX"
 
 [ "$INSTANCE" = 0 ] || [ "$OWN" = 1 ] || die "--instance gibt es nur für Rollen mit eigenem Worktree, nicht für $ROLE"
@@ -105,7 +105,7 @@ ACTIVE=$(printf '%s' "$AGENTS" | jq --arg re "^($ROLES_RE)-[0-9]{4}(-[0-9]+)?\$"
 BASE="$ROLE-$TICKET"
 BRANCH="wt/$ROLE"
 NAME=$BASE
-NAMES=$(printf '%s' "$AGENTS" | jq -r '[.result.agents[].name // empty] | join(" ")')
+NAMES=$(printf '%s' "$TERMS" | jq -r '[.terminals[].name // empty] | join(" ")')
 running() { case " $NAMES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 if running "$BASE"; then
   [ "$INSTANCE" = 1 ] || die "Session $BASE läuft bereits (weitere Instanz der Rolle: --instance)"
@@ -113,7 +113,7 @@ if running "$BASE"; then
   while running "$BASE-$n"; do n=$((n + 1)); done
   NAME="$BASE-$n"; DIR="$WT_ROOT/$ROLE-$n"; BRANCH="wt/$ROLE-$n"
 fi
-[ ${#NAME} -le 32 ] || die "Name länger als 32 Zeichen (herdr): $NAME"
+[ ${#NAME} -le 32 ] || die "Name länger als 32 Zeichen: $NAME"
 [ "$OWN" = 0 ] || [ ! -d "$DIR" ] || require_clean "$DIR"
 
 if [ "$OWN" = 1 ]; then
@@ -124,58 +124,23 @@ if [ "$OWN" = 1 ]; then
   fi
 fi
 
-# Pane-ID immer aus der JSON-Antwort von herdr, nie geraten.
-new_pane() {
-  if [ "$ROLE" = product-owner ]; then
-    # Neben den Orchestrator: seine Pane ist die des Aufrufers.
-    herdr pane split "$HERDR_PANE_ID" --direction right --cwd "$DIR" --no-focus | jq -r '.result.pane.pane_id'
-  else
-    # Tabs <ticket>, <ticket>-2, …: der erste mit Platz (max. 4 Panes), sonst ein neuer.
-    TABS=$(herdr tab list --workspace "$HERDR_WORKSPACE_ID")
-    TAB=$(printf '%s' "$TABS" | jq -r --arg l "$TICKET" \
-      '[.result.tabs[] | select((.label | test("^" + $l + "(-[0-9]+)?$")) and .pane_count < 4)] | sort_by(.number) | .[0].tab_id // empty')
-    if [ -z "$TAB" ]; then
-      LABEL=$(printf '%s' "$TABS" | jq -r --arg l "$TICKET" \
-        '[.result.tabs[].label] as $ls | [range(1; 100)] | map(if . == 1 then $l else "\($l)-\(.)" end) | map(select(. as $c | $ls | index($c) | not)) | .[0]')
-      herdr tab create --workspace "$HERDR_WORKSPACE_ID" --label "$LABEL" --cwd "$DIR" --no-focus | jq -r '.result.root_pane.pane_id'
-    else
-      # 2. Pane rechts von 1, 3. unter 1, 4. unter 2 (Reihenfolge = Anlegereihenfolge, nicht Layout-Reihenfolge; Pane-IDs zählen hexadezimal: p9, pA, …, pF, p10)
-      TPANES=$(herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -c --arg t "$TAB" '[.result.panes[] | select(.tab_id == $t) | .pane_id] | sort_by(split(":")[1][1:] | [length, .])')
-      case $(printf '%s' "$TPANES" | jq 'length') in
-        1) AT=$(printf '%s' "$TPANES" | jq -r '.[0]'); DIRN=right ;;
-        2) AT=$(printf '%s' "$TPANES" | jq -r '.[0]'); DIRN=down ;;
-        *) AT=$(printf '%s' "$TPANES" | jq -r '.[1]'); DIRN=down ;;
-      esac
-      herdr pane split "$AT" --direction "$DIRN" --cwd "$DIR" --no-focus | jq -r '.result.pane.pane_id'
-    fi
-  fi
-}
-
-PANE=$(new_pane) || die "Pane konnte nicht angelegt werden (Worktree $DIR besteht bereits)" 3
-[ -n "$PANE" ] || die "keine Pane angelegt (Worktree $DIR besteht bereits)" 3
-
 # Claude bekommt Rolle, Name, Modus und Haupt-Checkout; Codex startet ohne Argumente (Codex-Setup ist ein Folgeticket).
 if [ "$KIND" = claude ]; then
-  set -- -- --agent "$ROLE" --name "$NAME" --permission-mode auto --add-dir "$MAIN"
+  set -- claude --agent "$ROLE" --name "$NAME" --permission-mode auto --add-dir "$MAIN"
 else
-  set --
+  set -- codex
 fi
 
-# Eine frische Pane ist kurz „busy", bis ihre Shell den Prompt zeigt: agent_pane_busy wiederholen.
-START=$(date +%s)
-i=0
-while :; do
-  err=$(herdr agent start "$NAME" --kind "$KIND" --pane "$PANE" --timeout "$READY_MS" "$@" 2>&1 >/dev/null) && break
-  case $err in
-    *agent_pane_busy*) i=$((i + 1)); [ $i -le 75 ] || die "Pane $PANE wird nicht frei (Worktree $DIR und Pane bestehen)" 3; sleep 0.2 ;;
-    *agent_not_ready*)
-      REST=$((READY_MS - ($(date +%s) - START) * 1000))
-      [ $REST -gt 0 ] || REST=1
-      herdr agent wait "$NAME" --until idle --until done --timeout "$REST" >/dev/null 2>&1 \
-        || die "$NAME nach $((READY_MS / 1000)) s nicht bereit (Pane $PANE bleibt offen, Worktree $DIR besteht)" 3
-      break ;;
-    *) die "herdr agent start: $err (Pane $PANE und Worktree $DIR bestehen)" 3 ;;
-  esac
-done
+# Kein Parent-Bezug: Die Rolle überlebt den Orchestrator und tippt keine Notizen in ihn (Meldung nur per say.sh).
+hc run --bg --name "$NAME" --cwd "$DIR" --label "ticket=$TICKET" --label "role=$ROLE" \
+  --no-parent --no-notify "$@" >/dev/null \
+  || die "Terminal $NAME konnte nicht gestartet werden (Worktree $DIR besteht bereits)" 3
+
+# Bereit = der Agent hat sein Warten beendet und ist nicht blockiert (z. B. Ordner-Vertrauensdialog).
+hc wait "$NAME" --timeout "$READY_S" >/dev/null 2>&1 || true
+STATUS=$(hc get "$NAME" --json | jq -r '.status.state // "none"')
+case $STATUS in
+  blocked | none) die "$NAME nach ${READY_S} s nicht bereit (Status $STATUS; Terminal bleibt offen, Worktree $DIR besteht)" 3 ;;
+esac
 
 echo "$NAME bereit in $DIR"
