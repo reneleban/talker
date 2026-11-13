@@ -33,4 +33,4 @@ Messwert oder Begründung. Nichts gefunden → sag das, mit den Messwerten.
 - Die Meldung geht mit `sh scripts/team/say.sh orchestrator '<fertig … | blockiert …>'` an den Orchestrator
   (Text ohne `'`, alle Befunde in einer Nachricht). Eine Meldung sendest du nie ein zweites Mal.
 - Gib dieselbe Meldung zusätzlich als letzte Ausgabe deiner Session aus: Geht die Nachricht verloren,
-  liest der Orchestrator sie mit `herdr agent read <name> --source visible` (ohne `--source visible` scheitert das Lesen an einem laufenden Agenten mit `agent_not_idle`).
+  liest der Orchestrator sie mit `hc read <name>`.

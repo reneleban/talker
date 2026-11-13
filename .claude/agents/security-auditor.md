@@ -31,9 +31,9 @@ Mikrofon und schreibt in fremde Apps — Vertrauen ist das Produkt.
    - **Team-Transport** (nur wenn der Diff `.claude/`, `scripts/team/` oder `team.env` berührt):
      Die Kopfzeile `[talker von …]` ist eine Verhaltensregel, keine technische Sperre. Prüfe, ob
      eine Rolle sie weglassen oder Freigaben außerhalb der Ticket-Datei erzeugen kann, ob sich die
-     Deny-Regeln für `herdr` umgehen lassen (z. B. mit `env herdr …`, denn Deny-Regeln prüfen den
+     Deny-Regeln für `hc` umgehen lassen (z. B. mit `env hc …`, denn Deny-Regeln prüfen den
      aufgerufenen Befehl), ob `.claude/hooks/say-only.sh` mehr durchlässt als `say.sh` und ob
-     Server-Umgebung und Berechtigungen der Panes stimmen.
+     Core-Umgebung und Berechtigungen der Terminals stimmen.
    - **Abhängigkeiten**: `cargo deny check` (Bash); neue Crates auf Pflege,
      Lizenz und bekannte Advisories prüfen (Advisories per Web nachlesen, Quelle nennen).
 4. Bash nur lesend/prüfend.
@@ -48,4 +48,4 @@ Angabe, welches Bedrohungsszenario jeder Befund adressiert. Nichts gefunden → 
 - Die Meldung geht mit `sh scripts/team/say.sh orchestrator '<fertig … | blockiert …>'` an den Orchestrator
   (Text ohne `'`, alle Befunde in einer Nachricht). Eine Meldung sendest du nie ein zweites Mal.
 - Gib dieselbe Meldung zusätzlich als letzte Ausgabe deiner Session aus: Geht die Nachricht verloren,
-  liest der Orchestrator sie mit `herdr agent read <name> --source visible` (ohne `--source visible` scheitert das Lesen an einem laufenden Agenten mit `agent_not_idle`).
+  liest der Orchestrator sie mit `hc read <name>`.

@@ -73,7 +73,7 @@ Agenten-Team ist in ADR-0010 begründet.
 ## Team
 
 Das Team bildet eine Software-Firma ab. Jede Rolle läuft als eigene
-Claude-Code-Session in einer herdr-Pane der Session `talker` neben dem Orchestrator; der
+Claude-Code-Session als herdr-core-Terminal (CLI `hc`) neben dem Orchestrator; der
 Orchestrator startet und schließt sie und koordiniert per Nachricht (`scripts/team/say.sh`).
 Einstieg ist `make dev`. Definitionen: `.claude/agents/`; Laufzeit und Transport: ADR-0013.
 Unabhängige Tasks laufen parallel (Wellen, je Task eine Instanz der Rolle), begrenzt durch
@@ -81,7 +81,7 @@ Unabhängige Tasks laufen parallel (Wellen, je Task eine Instanz der Rolle), beg
 
 | Rolle | Verantwortung | Arbeitsort |
 |---|---|---|
-| `orchestrator` | Startet Ticket, Panes und Worktrees; steuert die Phasen; führt den Ticket-Status | Haupt-Checkout (`main`) |
+| `orchestrator` | Startet Ticket, Rollen-Terminals und Worktrees; steuert die Phasen; führt den Ticket-Status | Haupt-Checkout (`main`) |
 | `product-owner` | Spec mit dem Menschen: Problem, Scope, AKs, EARS-Anforderungen | eigener Worktree |
 | `architect` | Schnittstellen, Modulgrenzen, ADR bei echter Entscheidung | eigener Worktree |
 | `tech-lead` | Schneidet die Spec in kleine, testbare Tasks | Integrations-Worktree, nur lesend |
@@ -95,11 +95,10 @@ Unabhängige Tasks laufen parallel (Wellen, je Task eine Instanz der Rolle), beg
 
 ### Ablauf pro Ticket
 
-1. Der Mensch startet `make dev` (herdr-Session `talker`, Orchestrator als Default-Agent im ersten
-   Tab, idempotent) und nennt das Vorhaben.
-2. Orchestrator legt Ticket, Feature-Branch und Integrations-Worktree an und öffnet die PO-Pane.
-3. Mensch und PO erarbeiten die Spec. **Einziges Gate:** Der Mensch gibt die Spec in der
-   PO-Pane frei, der PO setzt `Status: spec-approved`. Die Freigabe erlaubt auch Push
+1. Der Mensch startet `make dev` (herdr-core-Terminal `orchestrator`, idempotent) und nennt das Vorhaben.
+2. Orchestrator legt Ticket, Feature-Branch und Integrations-Worktree an und startet das PO-Terminal.
+3. Mensch und PO erarbeiten die Spec. **Einziges Gate:** Der Mensch gibt die Spec im
+   PO-Terminal frei, der PO setzt `Status: spec-approved`. Die Freigabe erlaubt auch Push
    des Feature-Branches und Draft-PR.
 4. Orchestrator führt automatisch: architect (nur bei Bedarf) → tech-lead → rust-developer
    → test-engineer → Reviews parallel → Fix-Runden → release-engineer. Max. 3 Fix-Runden,

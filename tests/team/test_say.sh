@@ -1,85 +1,60 @@
 #!/bin/sh
-# T4: say.sh — Aufruffehler (Exit 2), Umgebung/Absender/Ziel (Exit 1), Zustellung mit Kopfzeile (AK-12),
-# blockiertes Ziel mit Wiederholungen (AK-13).
+# say.sh gegen Fake-hc: Aufruffehler (Exit 2), Umgebung/Absender/Ziel (Exit 1), Zustellung mit Kopfzeile, Wiederholungen.
 . "$(dirname "$0")/lib.sh"
 
 th_begin
-th_server
-
-# herdr-Shim protokolliert jeden Aufruf (prüft u. a. „kein --wait" und die Zahl der Versuche)
-SHIM="$TH_TMP/shim"
-mkdir -p "$SHIM"
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/herdr.log"\nexec "%s" "$@"\n' "$TH_TMP" "$(command -v herdr)" >"$SHIM/herdr"
-chmod +x "$SHIM/herdr"
-LOG="$TH_TMP/herdr.log"
-calls() { grep -c "$1" "$LOG" 2>/dev/null || true; }
-
+cd "$TH_REPO" || exit 1
 SAY='sh scripts/team/say.sh'
-run() { : >"$LOG"; inpane "PATH=$SHIM:\$PATH HERDR_LOG=$LOG $*"; }
+export SAY_RETRY_TIMEOUT_S=1
+th_terminals '[{"address":"t1","name":"sender"},{"address":"t2","name":"empfaenger"}]'
 
-# --- Aufruffehler → Exit 2 (vor jeder Umgebungsprüfung) ---
-run "$SAY"
-assert_eq "AK-12 kein Argument: Exit 2" 2 "$INPANE_RC"
-if printf '%s' "$INPANE_OUT" | grep -Eq ' 2$'; then fail "C2 Meldung enthält nicht den Exit-Code"; else ok "C2 Meldung enthält nicht den Exit-Code"; fi
-run "$SAY ziel"
-assert_eq "AK-12 ein Argument: Exit 2" 2 "$INPANE_RC"
-run "$SAY ziel text extra"
-assert_eq "AK-12 drei Argumente: Exit 2" 2 "$INPANE_RC"
-run "$SAY Foo 'text'"
-assert_eq "AK-12 Ziel mit Großbuchstaben: Exit 2" 2 "$INPANE_RC"
-run "$SAY aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'text'"
-assert_eq "AK-12 Ziel mit 33 Zeichen: Exit 2" 2 "$INPANE_RC"
-run "$SAY aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 'text'"
-assert_eq "AK-12 Ziel mit 32 Zeichen ist gültig (weiter bis Exit 1)" 1 "$INPANE_RC"
-run "$SAY ziel ''"
-assert_eq "AK-12 leerer Text: Exit 2" 2 "$INPANE_RC"
-assert_eq "AK-12 Aufruffehler rufen herdr nicht auf" 0 "$(calls prompt)"
+run() { : >"$LOG"; OUT=$("$@" 2>&1); RC=$?; }
+
+# --- Aufruffehler → Exit 2, hc wird nicht aufgerufen ---
+run $SAY;                                     assert_eq "kein Argument: Exit 2" 2 "$RC"
+run $SAY ziel;                                assert_eq "ein Argument: Exit 2" 2 "$RC"
+run $SAY ziel text extra;                     assert_eq "drei Argumente: Exit 2" 2 "$RC"
+run $SAY Foo text;                            assert_eq "Ziel mit Großbuchstaben: Exit 2" 2 "$RC"
+run $SAY aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa text; assert_eq "Ziel mit 33 Zeichen: Exit 2" 2 "$RC"
+run $SAY aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa text;  assert_eq "Ziel mit 32 Zeichen ist gültig (weiter bis Exit 1)" 1 "$RC"
+run $SAY ziel '';                             assert_eq "leerer Text: Exit 2" 2 "$RC"
+run $SAY Foo text
+assert_eq "Aufruffehler rufen hc nicht auf" 0 "$(calls .)"
 
 # --- Umgebung ---
-run "HERDR_ENV= $SAY ziel 'text'"
-assert_eq "AK-12 HERDR_ENV leer: Exit 1" 1 "$INPANE_RC"
-run "env -u HERDR_PANE_ID $SAY ziel 'text'"
-assert_eq "AK-12 HERDR_PANE_ID fehlt: Exit 1" 1 "$INPANE_RC"
+run env -u HC_TERMINAL_ID $SAY empfaenger text
+assert_eq "HC_TERMINAL_ID fehlt: Exit 1" 1 "$RC"
+assert_eq "ohne Umgebung kein hc-Aufruf" 0 "$(calls .)"
 
-# --- Absender = Agent der eigenen Pane ---
-# Der blockierte Agent muss der erste Claude sein: Nur der erste zeigt im frischen Ordner den
-# Vertrauensdialog (geprüft: ein später gestarteter Claude ist sofort idle).
-mkdir -p "$TH_TMP/frisch"
-TH_AGENT_CWD=$TH_TMP/frisch th_agent blockiert
-assert_eq "AK-13 Vorbedingung: Ziel ist blocked" blocked "$(th_h agent get blockiert | jq -r '.result.agent.agent_status')"
-th_agent sender
-SENDER_PANE=$TH_AGENT_PANE
-run "$SAY ziel 'text'"
-assert_eq "AK-12 Pane ohne Agent: kein Absender, Exit 1" 1 "$INPANE_RC"
-assert_contains "AK-12 Meldung nennt den fehlenden Absender" "Absender" "$INPANE_OUT"
-assert_eq "AK-12 ohne Absender wird nichts gesendet" 0 "$(calls 'agent prompt')"
+# --- Absender = Name des eigenen Terminals ---
+run env HC_TERMINAL_ID=t9 $SAY empfaenger text
+assert_eq "eigenes Terminal unbekannt: Exit 1" 1 "$RC"
+th_terminals '[{"address":"t1"},{"address":"t2","name":"empfaenger"}]'
+run $SAY empfaenger text
+assert_eq "eigenes Terminal ohne Namen: Exit 1" 1 "$RC"
+assert_contains "Meldung nennt den fehlenden Absender" "Absender" "$OUT"
+assert_eq "ohne Absender wird nichts gesendet" 0 "$(calls '^send')"
+th_terminals '[{"address":"t1","name":"sender"},{"address":"t2","name":"empfaenger"}]'
 
-# --- unbekanntes Ziel → sofort Exit 1 ---
-run "HERDR_PANE_ID=$SENDER_PANE $SAY nirgendwo 'text'"
-assert_eq "AK-13 unbekanntes Ziel: Exit 1" 1 "$INPANE_RC"
-assert_contains "AK-13 Meldung nennt das Ziel" nirgendwo "$INPANE_OUT"
-assert_eq "AK-13 unbekanntes Ziel: kein prompt-Aufruf" 0 "$(calls 'agent prompt')"
+# --- unbekanntes Ziel ---
+run $SAY nirgendwo text
+assert_eq "unbekanntes Ziel: Exit 1" 1 "$RC"
+assert_contains "Meldung nennt das Ziel" nirgendwo "$OUT"
+assert_eq "unbekanntes Ziel: kein send" 0 "$(calls '^send')"
 
-# --- Zustellung mit Kopfzeile, ohne --wait ---
-th_agent empfaenger trust
-run "HERDR_PANE_ID=$SENDER_PANE $SAY empfaenger 'Antworte nur mit dem Wort OK.'"
-assert_eq "AK-12 Zustellung: Exit 0" 0 "$INPANE_RC"
-assert_eq "AK-12 ein prompt-Aufruf" 1 "$(calls 'agent prompt')"
-assert_eq "AK-12 prompt ohne --wait" 0 "$(grep 'agent prompt' "$LOG" | grep -c -e '--wait' || true)"
-i=0
-while [ $i -lt 40 ]; do
-  SEEN=$(th_h agent read empfaenger --source recent-unwrapped --lines 100 | tr -s ' \n' ' ')
-  case $SEEN in *"[talker von sender] Antworte nur mit dem Wort OK."*) break ;; esac
-  i=$((i + 1)); sleep 0.5
-done
-assert_contains "AK-12 Empfänger sieht Kopfzeile mit Absender-Name" "[talker von sender] Antworte nur mit dem Wort OK." "$SEEN"
+# --- Zustellung mit Kopfzeile ---
+run $SAY empfaenger 'Antworte nur mit OK.'
+assert_eq "Zustellung: Exit 0" 0 "$RC"
+assert_eq "genau ein send" 1 "$(calls '^send')"
+assert_eq "send an den Empfänger mit Kopfzeile" 1 "$(calls '^send empfaenger \[talker von sender\] Antworte nur mit OK\.$')"
+assert_eq "kein Warten bei erster Zustellung" 0 "$(calls '^wait')"
 
-# --- blockiertes Ziel (Vertrauensdialog): 3 Versuche, dann Exit 1 ---
-run "SAY_RETRY_TIMEOUT_MS=500 HERDR_PANE_ID=$SENDER_PANE $SAY blockiert 'text'"
-assert_eq "AK-13 blockiertes Ziel: Exit 1" 1 "$INPANE_RC"
-assert_contains "AK-13 Meldung" "blockiert nach 3 Versuchen" "$INPANE_OUT"
-assert_eq "AK-13 genau 3 Versuche" 3 "$(calls 'agent prompt')"
-assert_eq "AK-13 zwischen den Versuchen wird gewartet" 2 "$(calls 'agent wait')"
-assert_eq "AK-13 Wartezeit kommt aus SAY_RETRY_TIMEOUT_MS" 2 "$(grep 'agent wait' "$LOG" | grep -c -e '--timeout 500' || true)"
+# --- nicht zustellbar: 3 Versuche, dazwischen gewartet, dann Exit 1 ---
+: >"$FAKE_DIR/send_fail"
+run $SAY empfaenger text
+assert_eq "nicht zustellbar: Exit 1" 1 "$RC"
+assert_contains "Meldung nennt 3 Versuche" "3 Versuchen" "$OUT"
+assert_eq "genau 3 Versuche" 3 "$(calls '^send')"
+assert_eq "zwischen den Versuchen wird gewartet" 2 "$(calls '^wait empfaenger --timeout 1$')"
 
 th_summary

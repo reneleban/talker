@@ -49,10 +49,10 @@ pipeline-ab: ## Pipeline-Vergleich A/B/C (EVAL-0003): Nemotron vs +Gemma vs Gemm
 latency-eval: ## Latenz-Messreihe (Ticket 0038): N=10 Läufe/Fall (N=3 = Schnelllauf), LATENCY_OUT=<datei>, LANGUAGE=auto|de|en (Default auto); ohne Gemma nur Roh
 	N="$(N)" LATENCY_OUT="$(LATENCY_OUT)" LANGUAGE="$(LANGUAGE)" cargo run --release --example latency_eval
 
-dev: ## Team-Einstieg: herdr-Session talker starten (Orchestrator), verbinden (ADR-0013)
+dev: ## Team-Einstieg: herdr-core: Orchestrator starten und verbinden (ADR-0013)
 	sh scripts/team/dev.sh
 
-team-test: ## Team-Skript-Tests (Ticket 0043): braucht herdr, claude, jq; eigene Session talker-test
+team-test: ## Team-Skript-Tests (Ticket 0043): braucht nur jq (Fake-hc, kein Server)
 	sh tests/team/run.sh
 
 run: ## App aus dem Quellbaum starten
